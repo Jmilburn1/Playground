@@ -22,16 +22,21 @@ A Farming Simulator mod manager written in Rust, similar to Farm Sim Hub.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-2. Navigate to project directory and build:
-```bash
-cd E:\Playground
+2. Navigate to the project directory and build the release executable:
+```bat
+cd /d E:\Playground
 cargo build --release
 ```
 
-3. Run:
-```bash
-cargo run --release
+3. Launch the executable (no Cargo command needed after the build):
+```bat
+target\release\fs-mod-manager.exe
 ```
+
+You can double-click `fs-mod-manager.exe` in `target\release`, create a
+desktop shortcut to it, or use `Launch-FS-Mod-Manager.bat` in this folder.
+The launcher builds the release executable the first time if it is missing,
+then starts the `.exe` directly on later runs.
 
 ## Project Structure
 - `src/main.rs` - Application entry point

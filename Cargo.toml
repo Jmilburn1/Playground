@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # GUI
-iced = { version = "0.13", features = ["tokio"] }
+iced = { version = "0.13", features = ["tokio", "image"] }
 iced_aw = "0.11"
 iced_runtime = "0.13"
 
@@ -39,6 +39,7 @@ rayon = "1.7"
 once_cell = "1.19"
 serde_bytes = "0.11"
 quick-xml = "0.36"
+image_dds = { version = "0.6", default-features = false, features = ["ddsfile", "image"] }
 
 [profile.release]
 opt-level = 3

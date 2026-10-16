@@ -45,12 +45,44 @@ pub struct Settings {
     pub favorites: Vec<String>,
 }
 
+/// Expand a leading `~` in a configured path. Configs written by other
+/// tools sometimes carry the tilde literally, which otherwise becomes a
+/// real folder named "~" under whatever directory the app launched from.
+pub fn expand_tilde(path: &PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        return dirs::home_dir().unwrap_or_else(|| path.clone());
+    }
+    for prefix in ["~/", "~\\"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(rest);
+            }
+        }
+    }
+    path.clone()
+}
+
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let config_path = Self::config_path()?;
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
-            let config: Config = toml::from_str(&content)?;
+            let mut config: Config = toml::from_str(&content)?;
+            config.settings.archive_directory =
+                expand_tilde(&config.settings.archive_directory);
+            config.settings.active_directory =
+                expand_tilde(&config.settings.active_directory);
+            for dir in [
+                &mut config.game_directories.fs17,
+                &mut config.game_directories.fs19,
+                &mut config.game_directories.fs22,
+                &mut config.game_directories.fs25,
+            ] {
+                if let Some(d) = dir {
+                    *d = expand_tilde(d);
+                }
+            }
             Ok(config)
         } else {
             let config = Self::default();

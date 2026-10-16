@@ -1,12 +1,14 @@
 use crate::mod_manager::conflict::{Conflict, ConflictDetector};
+use crate::mod_manager::icons::{load_icon, LoadedIcon};
 use crate::mod_manager::types::{Mod, ModState};
 use crate::mod_manager::ModManager;
 use crate::ui::components::{format_size, mod_card, Message, Tab};
+use iced::widget::image::Handle as ImageHandle;
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Element, Length, Size, Subscription, Task, Theme};
+use std::collections::HashMap;
 
-const CARD_W: f32 = 212.0;
-const CARD_H: f32 = 178.0;
+const CARD_H: f32 = 250.0;
 const GRID_SPACING: f32 = 12.0;
 const DETAILS_W: f32 = 344.0;
 
@@ -18,6 +20,9 @@ pub struct App {
     selected_mod: Option<String>,
     pending_remove: Option<String>,
     conflicts: Vec<Conflict>,
+    icons: HashMap<String, ImageHandle>,
+    active_dir_input: String,
+    archive_dir_input: String,
     status: String,
     window_size: Size,
 }
@@ -25,6 +30,8 @@ pub struct App {
 impl App {
     pub fn new(mod_manager: ModManager) -> Self {
         let count = mod_manager.get_mods().len();
+        let active_dir_input = mod_manager.get_active_dir().display().to_string();
+        let archive_dir_input = mod_manager.get_archive_dir().display().to_string();
         let mut app = Self {
             mod_manager,
             current_tab: Tab::Browse,
@@ -33,11 +40,32 @@ impl App {
             selected_mod: None,
             pending_remove: None,
             conflicts: Vec::new(),
+            icons: HashMap::new(),
+            active_dir_input,
+            archive_dir_input,
             status: format!("Ready — {} mods loaded.", count),
             window_size: Size::new(1280.0, 800.0),
         };
         app.recompute_conflicts();
+        app.rebuild_icons();
         app
+    }
+
+    fn rebuild_icons(&mut self) {
+        self.icons.clear();
+        for m in self.mod_manager.get_mods() {
+            if let Some(icon) = load_icon(&m.path, m.icon_filename.as_deref()) {
+                let handle = match icon {
+                    LoadedIcon::Rgba {
+                        width,
+                        height,
+                        pixels,
+                    } => ImageHandle::from_rgba(width, height, pixels),
+                    LoadedIcon::Encoded(bytes) => ImageHandle::from_bytes(bytes),
+                };
+                self.icons.insert(m.id.clone(), handle);
+            }
+        }
     }
 
     fn recompute_conflicts(&mut self) {
@@ -81,6 +109,7 @@ impl App {
             Message::Scan => match self.mod_manager.scan_all() {
                 Ok(()) => {
                     self.recompute_conflicts();
+                    self.rebuild_icons();
                     if let Some(id) = &self.selected_mod {
                         if self.mod_manager.get_mod(id).is_none() {
                             self.selected_mod = None;
@@ -105,7 +134,7 @@ impl App {
                 if let Some(m) = self.mod_manager.get_mod(&id).cloned() {
                     let key = m.favorite_key();
                     match self.mod_manager.toggle_favorite(&key) {
-                        Ok(true) => self.status = format!("★ {} added to favorites.", m.name),
+                        Ok(true) => self.status = format!("{} added to favorites.", m.name),
                         Ok(false) => {
                             self.status = format!("{} removed from favorites.", m.name)
                         }
@@ -161,6 +190,33 @@ impl App {
                     );
                 }
             }
+            Message::ActiveDirChanged(value) => self.active_dir_input = value,
+            Message::ArchiveDirChanged(value) => self.archive_dir_input = value,
+            Message::SaveDirectories => {
+                let active = std::path::PathBuf::from(self.active_dir_input.trim());
+                let archive = std::path::PathBuf::from(self.archive_dir_input.trim());
+                match self.mod_manager.set_directories(active, archive) {
+                    Ok(()) => {
+                        self.recompute_conflicts();
+                        self.rebuild_icons();
+                        if let Some(id) = &self.selected_mod {
+                            if self.mod_manager.get_mod(id).is_none() {
+                                self.selected_mod = None;
+                            }
+                        }
+                        // Show the folders as saved (tilde expanded).
+                        self.active_dir_input =
+                            self.mod_manager.get_active_dir().display().to_string();
+                        self.archive_dir_input =
+                            self.mod_manager.get_archive_dir().display().to_string();
+                        self.status = format!(
+                            "Folders updated — {} mods found.",
+                            self.mod_manager.get_mods().len()
+                        );
+                    }
+                    Err(e) => self.status = format!("Could not change folders: {}", e),
+                }
+            }
             Message::WindowResized(size) => self.window_size = size,
             Message::Exit => return iced::exit(),
         }
@@ -182,6 +238,10 @@ impl App {
 
     fn browse_view(&self) -> Element<'_, Message> {
         let mods = self.filtered_mods();
+        let pane_open = self
+            .selected_mod
+            .as_ref()
+            .map_or(false, |id| self.mod_manager.get_mod(id).is_some());
 
         let content: Element<'_, Message> = if mods.is_empty() {
             container(
@@ -198,14 +258,24 @@ impl App {
             .center_y(Length::Fill)
             .into()
         } else {
-            let pane_w = if self.selected_mod.is_some() {
-                DETAILS_W + GRID_SPACING
+            // Layout rule (John): 5 cards per row with no details pane,
+            // still 4 per row with the fly-out open. Card width flexes to
+            // make the count exact; on very narrow windows the count steps
+            // down so a card never gets narrower than readable.
+            let target_cols: usize = if pane_open { 4 } else { 5 };
+            let content_w = (self.window_size.width - 24.0).max(150.0);
+            let grid_w = if pane_open {
+                (content_w - DETAILS_W - GRID_SPACING).max(150.0)
             } else {
-                0.0
+                content_w
             };
-            let avail = (self.window_size.width - pane_w - 64.0).max(CARD_W);
-            let cols = (((avail + GRID_SPACING) / (CARD_W + GRID_SPACING)).floor() as usize)
-                .max(1);
+            let mut cols = target_cols;
+            while cols > 1
+                && (grid_w - (cols as f32 - 1.0) * GRID_SPACING) / (cols as f32) < 150.0
+            {
+                cols -= 1;
+            }
+            let card_w = (grid_w - (cols as f32 - 1.0) * GRID_SPACING) / cols as f32;
 
             let mut grid = column![].spacing(GRID_SPACING);
             for chunk in mods.chunks(cols) {
@@ -214,7 +284,15 @@ impl App {
                     let fav = self.mod_manager.is_favorite(&m.favorite_key());
                     let selected = self.selected_mod.as_deref() == Some(m.id.as_str());
                     let conflict = self.mod_has_conflict(&m.name);
-                    r = r.push(mod_card(m, fav, selected, conflict, CARD_W, CARD_H));
+                    r = r.push(mod_card(
+                        m,
+                        self.icons.get(&m.id),
+                        fav,
+                        selected,
+                        conflict,
+                        card_w,
+                        CARD_H,
+                    ));
                 }
                 grid = grid.push(r);
             }
@@ -225,7 +303,10 @@ impl App {
         };
 
         if let Some(details) = self.details_view() {
-            row![content, details].spacing(GRID_SPACING).into()
+            row![content, details]
+                .spacing(GRID_SPACING)
+                .height(Length::Fill)
+                .into()
         } else {
             content
         }
@@ -237,20 +318,33 @@ impl App {
 
         let fav = self.mod_manager.is_favorite(&m.favorite_key());
         let fav_label = if fav {
-            "★ Favorited"
+            "Favorited"
         } else {
-            "☆ Add to favorites"
+            "Add to favorites"
         };
 
         let mut col = column![
             row![
                 text(&m.name).size(20),
                 Space::with_width(Length::Fill),
-                button(text("✕").size(14)).on_press(Message::CloseDetails),
+                button(text("X").size(14)).on_press(Message::CloseDetails),
             ],
             text(format!("Version {}", m.version)).size(14),
         ]
         .spacing(8);
+
+        if let Some(handle) = self.icons.get(&m.id) {
+            col = col.push(
+                container(
+                    iced::widget::image(handle.clone())
+                        .width(180)
+                        .height(180)
+                        .content_fit(iced::ContentFit::Contain),
+                )
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            );
+        }
 
         if let Some(author) = &m.author {
             col = col.push(text(format!("by {}", author)).size(14));
@@ -284,7 +378,7 @@ impl App {
             for c in my_conflicts {
                 let other = if c.mod1 == m.name { &c.mod2 } else { &c.mod1 };
                 col = col.push(
-                    text(format!("⚠ {} — {:?}", other, c.conflict_type)).size(12),
+                    text(format!("{} — {:?}", other, c.conflict_type)).size(12),
                 );
             }
         }
@@ -347,7 +441,7 @@ impl App {
         .spacing(8);
         for c in &self.conflicts {
             col = col.push(text(format!(
-                "⚠ {}  ×  {}  —  {:?}",
+                "{}  ×  {}  —  {:?}",
                 c.mod1, c.mod2, c.conflict_type
             )));
         }
@@ -369,20 +463,21 @@ impl App {
             .len();
         column![
             text("Settings").size(20),
-            text(format!(
-                "Archive folder: {}",
-                self.mod_manager.get_archive_dir().display()
-            )),
-            text(format!(
-                "Active folder: {}",
-                self.mod_manager.get_active_dir().display()
-            )),
+            text("Active folder (mods in the game):"),
+            text_input("Active folder path", &self.active_dir_input)
+                .on_input(Message::ActiveDirChanged)
+                .padding(8),
+            text("Archive folder (stored mods):"),
+            text_input("Archive folder path", &self.archive_dir_input)
+                .on_input(Message::ArchiveDirChanged)
+                .padding(8),
+            button(text("Save folders")).on_press(Message::SaveDirectories),
             text(format!(
                 "Mods: {} total — {} active, {} archived",
                 total, active, archived
             )),
             text(format!("Favorites: {}", self.mod_manager.favorites_count())),
-            text("Folder paths are stored in config.toml (fs-mod-manager folder in your user config directory). GUI path editing is a later addition.")
+            text("Paths are saved to config.toml when you click Save folders.")
                 .size(12),
             button(text("Rescan folders")).on_press(Message::Scan),
         ]
@@ -419,7 +514,7 @@ impl App {
             ),
             self.tab_button("Settings".to_string(), Tab::Settings),
             Space::with_width(Length::Fill),
-            button(text("★ Favorites only"))
+            button(text("Favorites only"))
                 .style(fav_style)
                 .on_press(Message::ToggleFavoritesOnly),
         ]
@@ -434,12 +529,18 @@ impl App {
         let status = row![
             text(&self.status).size(13),
             Space::with_width(Length::Fill),
-            text(format!("★ {}", self.mod_manager.favorites_count())).size(13),
+            text(format!("Favorites: {}", self.mod_manager.favorites_count())).size(13),
         ];
 
+        // The root column MUST be bounded to the window. Without an
+        // explicit Fill size it grows with its content, the scrollable
+        // inside then has no real viewport to clip to — scrolled rows
+        // draw over the header and the status bar is pushed off-screen.
         column![header, tabs, content, status]
             .spacing(10)
             .padding(12)
+            .width(Length::Fill)
+            .height(Length::Fill)
             .into()
     }
 

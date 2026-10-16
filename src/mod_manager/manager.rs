@@ -139,6 +139,24 @@ impl ModManager {
         Ok(())
     }
 
+    /// Point the manager at new active/archive folders (Settings tab).
+    /// Expands a leading `~`, creates the folders if needed, persists
+    /// them to the config file, and rescans.
+    pub fn set_directories(&mut self, active_dir: PathBuf, archive_dir: PathBuf) -> Result<()> {
+        let active_dir = crate::config::expand_tilde(&active_dir);
+        let archive_dir = crate::config::expand_tilde(&archive_dir);
+        std::fs::create_dir_all(&active_dir)
+            .with_context(|| format!("Failed to create active directory: {:?}", active_dir))?;
+        std::fs::create_dir_all(&archive_dir)
+            .with_context(|| format!("Failed to create archive directory: {:?}", archive_dir))?;
+        self.active_dir = active_dir.clone();
+        self.archive_dir = archive_dir.clone();
+        self.config.settings.active_directory = active_dir;
+        self.config.settings.archive_directory = archive_dir;
+        self.config.save()?;
+        self.scan_all()
+    }
+
     pub fn add_directory(&mut self, path: PathBuf) -> Result<()> {
         if !path.exists() {
             std::fs::create_dir_all(&path)?;

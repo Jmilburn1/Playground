@@ -21,6 +21,9 @@ pub enum Message {
     MoveToArchive(String),
     MoveToActive(String),
     RemoveMod(String),
+    ActiveDirChanged(String),
+    ArchiveDirChanged(String),
+    SaveDirectories,
     WindowResized(iced::Size),
     Exit,
 }
@@ -41,8 +44,7 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Two-letter monogram for the card's icon tile (real icon images come from
-/// the mod's icon file; until those are converted from DDS, a tile stands in).
+/// Two-letter monogram used when a mod has no loadable icon image.
 fn initials(name: &str) -> String {
     name.split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
@@ -62,27 +64,47 @@ fn state_color(state: &ModState) -> Color {
 }
 
 /// One mod card for the browse grid. The whole card is the click target for
-/// opening the details fly-out. `has_conflict` shows a warning line, and
-/// favorites get a star in the header line.
+/// opening the details fly-out. Favorites and conflicts get plain-text
+/// labels beneath the title.
 pub fn mod_card<'a>(
     mod_data: &'a Mod,
+    icon: Option<&iced::widget::image::Handle>,
     is_favorite: bool,
     is_selected: bool,
     has_conflict: bool,
     width: f32,
     height: f32,
 ) -> Element<'a, Message> {
-    let star = if is_favorite { "★ " } else { "" };
-    let icon_tile = container(text(initials(&mod_data.name)).size(26))
+    // Fixed-size icon block (John's spec: about half the old full-width
+    // strip, at least double its 58px height). FS icons are square, so a
+    // 120x120 block fits them without the old dynamic stretching. The
+    // monogram fallback uses the same fixed size so cards stay uniform.
+    // (Symbol glyphs like stars are avoided in this UI — they render as
+    // boxes in the default font on Windows, so favorites/conflicts use
+    // plain text labels instead.)
+    const ICON_SIZE: f32 = 120.0;
+    let icon_box: Element<'a, Message> = match icon {
+        Some(handle) => iced::widget::image(handle.clone())
+            .width(ICON_SIZE)
+            .height(ICON_SIZE)
+            .content_fit(iced::ContentFit::Cover)
+            .into(),
+        None => container(text(initials(&mod_data.name)).size(26))
+            .width(ICON_SIZE)
+            .height(ICON_SIZE)
+            .center_x(ICON_SIZE)
+            .center_y(ICON_SIZE)
+            .style(container::bordered_box)
+            .into(),
+    };
+    let icon_area: Element<'a, Message> = container(icon_box)
         .width(Length::Fill)
-        .height(58)
         .center_x(Length::Fill)
-        .center_y(58)
-        .style(container::bordered_box);
+        .into();
 
     let mut lines = column![
-        icon_tile,
-        text(format!("{}{}", star, mod_data.name)).size(15),
+        icon_area,
+        text(mod_data.name.clone()).size(15),
         row![
             text(format!("v{}", mod_data.version)).size(12),
             text(format!("{:?}", mod_data.state))
@@ -96,9 +118,16 @@ pub fn mod_card<'a>(
     if let Some(author) = &mod_data.author {
         lines = lines.push(text(format!("by {}", author)).size(12));
     }
+    if is_favorite {
+        lines = lines.push(
+            text("Favorite")
+                .size(12)
+                .color(Color::from_rgb(0.95, 0.8, 0.35)),
+        );
+    }
     if has_conflict {
         lines = lines.push(
-            text("⚠ Has conflicts")
+            text("Has conflicts")
                 .size(12)
                 .color(Color::from_rgb(0.95, 0.45, 0.35)),
         );

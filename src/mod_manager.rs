@@ -2,6 +2,7 @@ pub mod types;
 pub mod manager;
 pub mod conflict;
 pub mod moddesc;
+pub mod icons;
 
 use crate::config::Config;
 

@@ -1,3 +1,11 @@
+// Release builds on Windows use the GUI subsystem, so launching the
+// finished .exe does not leave a console window behind. Debug builds keep
+// the console for diagnostics and CLI work.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod mod_manager;
 mod scanner;
 mod sources;
@@ -91,6 +99,19 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                 }
             }
         }
+        Some("icons") => {
+            for m in mod_manager.get_mods() {
+                match mod_manager::icons::load_icon(&m.path, m.icon_filename.as_deref()) {
+                    Some(mod_manager::icons::LoadedIcon::Rgba { width, height, .. }) => {
+                        println!("- {}: DDS icon decoded ({}x{})", m.name, width, height)
+                    }
+                    Some(mod_manager::icons::LoadedIcon::Encoded(bytes)) => {
+                        println!("- {}: image icon ({} bytes)", m.name, bytes.len())
+                    }
+                    None => println!("- {}: no icon found", m.name),
+                }
+            }
+        }
         Some("conflicts") => {
             let mods = mod_manager.get_mods();
             let mods_vec: Vec<mod_manager::Mod> = mods.into_iter().cloned().collect();
@@ -117,6 +138,7 @@ fn print_help() {
     println!("  cli search <query> - Search mods");
     println!("  cli move <id|name> <target_dir> - Move mod to directory");
     println!("  cli conflicts - Check for mod conflicts");
+    println!("  cli icons - Show icon load status for each mod");
     println!("  cli help - Show this help");
     println!("  (no args) - Launch GUI");
 }
