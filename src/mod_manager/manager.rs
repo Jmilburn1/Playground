@@ -60,8 +60,17 @@ impl ModManager {
             .max_depth(1)
             .into_iter()
             .filter_map(|e| e.ok())
+            // Depth 0 is the scanned directory itself — without this the
+            // archive/active folders themselves show up as "mods".
+            .filter(|e| e.depth() > 0)
             .map(|e| e.path().to_path_buf())
-            .filter(|p| p.is_file() || p.is_dir())
+            // A mod is a folder or a .zip file; stray files are ignored.
+            .filter(|p| {
+                p.is_dir()
+                    || (p.is_file()
+                        && p.extension()
+                            .map_or(false, |e| e.eq_ignore_ascii_case("zip")))
+            })
             .collect();
 
         let mods: Vec<Mod> = paths
@@ -184,5 +193,32 @@ impl ModManager {
 
     pub fn get_active_dir(&self) -> &PathBuf {
         &self.active_dir
+    }
+
+    pub fn is_favorite(&self, favorite_key: &str) -> bool {
+        self.config
+            .settings
+            .favorites
+            .iter()
+            .any(|f| f == favorite_key)
+    }
+
+    /// Toggle a favorite by its key; persists to the config file.
+    /// Returns the new favorite state.
+    pub fn toggle_favorite(&mut self, favorite_key: &str) -> Result<bool> {
+        let favs = &mut self.config.settings.favorites;
+        let now_favorite = if let Some(pos) = favs.iter().position(|f| f == favorite_key) {
+            favs.remove(pos);
+            false
+        } else {
+            favs.push(favorite_key.to_string());
+            true
+        };
+        self.config.save()?;
+        Ok(now_favorite)
+    }
+
+    pub fn favorites_count(&self) -> usize {
+        self.config.settings.favorites.len()
     }
 }

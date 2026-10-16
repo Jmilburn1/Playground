@@ -1,6 +1,7 @@
 pub mod types;
 pub mod manager;
 pub mod conflict;
+pub mod moddesc;
 
 use crate::config::Config;
 

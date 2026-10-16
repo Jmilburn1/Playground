@@ -1,7 +1,6 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
 
 # IDE
 .vscode/
@@ -14,6 +13,8 @@ Thumbs.db
 # Config
 *.toml
 !config.example.toml
+!Cargo.toml
+!Cargo.lock
 
 # Logs
 *.log

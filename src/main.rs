@@ -28,6 +28,17 @@ fn main() -> anyhow::Result<()> {
     ui::run(mod_manager)
 }
 
+fn format_mod_line(m: &mod_manager::Mod) -> String {
+    let short_id = &m.id[..m.id.len().min(8)];
+    match &m.author {
+        Some(author) => format!(
+            "{} v{} by {} ({:?}) [{}]",
+            m.name, m.version, author, m.state, short_id
+        ),
+        None => format!("{} v{} ({:?}) [{}]", m.name, m.version, m.state, short_id),
+    }
+}
+
 fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> {
     match args.get(0).map(|s| s.as_str()) {
         Some("scan") => {
@@ -35,7 +46,7 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
             let mods = mod_manager.get_mods();
             println!("Found {} mods:", mods.len());
             for m in mods {
-                println!("- {} ({:?})", m.name, m.state);
+                println!("- {}", format_mod_line(m));
             }
         }
         Some("list") => {
@@ -43,7 +54,7 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
             println!("Mods in archive: {}", mod_manager.get_mods_by_state(mod_manager::ModState::Archived).len());
             println!("Mods active: {}", mod_manager.get_mods_by_state(mod_manager::ModState::Active).len());
             for m in mods {
-                println!("- {} ({:?})", m.name, m.state);
+                println!("- {}", format_mod_line(m));
             }
         }
         Some("search") => {
@@ -51,16 +62,32 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                 let results = mod_manager.search_mods(query);
                 println!("Found {} matching mods:", results.len());
                 for m in results {
-                    println!("- {}", m.name);
+                    println!("- {}", format_mod_line(m));
                 }
             }
         }
         Some("move") => {
-            if let Some(mod_id) = args.get(1) {
+            if let Some(query) = args.get(1) {
                 if let Some(target) = args.get(2) {
-                    let target_path = std::path::PathBuf::from(target);
-                    mod_manager.move_between_directories(mod_id, &target_path)?;
-                    println!("Moved mod to {:?}", target_path);
+                    // Accept a full ID, the short ID shown by scan/list, or
+                    // the mod's name.
+                    let found = mod_manager
+                        .get_mods()
+                        .into_iter()
+                        .find(|m| {
+                            m.id == *query
+                                || m.id.starts_with(query.as_str())
+                                || m.name.eq_ignore_ascii_case(query)
+                        })
+                        .map(|m| m.id.clone());
+                    match found {
+                        Some(id) => {
+                            let target_path = std::path::PathBuf::from(target);
+                            mod_manager.move_between_directories(&id, &target_path)?;
+                            println!("Moved mod to {:?}", target_path);
+                        }
+                        None => println!("No mod matching '{}'", query),
+                    }
                 }
             }
         }
@@ -88,7 +115,7 @@ fn print_help() {
     println!("  cli scan - Scan all directories for mods");
     println!("  cli list - List all mods");
     println!("  cli search <query> - Search mods");
-    println!("  cli move <mod_id> <target_dir> - Move mod to directory");
+    println!("  cli move <id|name> <target_dir> - Move mod to directory");
     println!("  cli conflicts - Check for mod conflicts");
     println!("  cli help - Show this help");
     println!("  (no args) - Launch GUI");

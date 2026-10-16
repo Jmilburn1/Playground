@@ -39,6 +39,10 @@ pub struct Settings {
     pub check_conflicts: bool,
     pub parallel_scans: usize,
     pub cache_ttl_hours: u64,
+    /// Favorite mods, keyed by Mod::favorite_key (filename|size|version) so a
+    /// favorite survives the mod being moved between archive and active.
+    #[serde(default)]
+    pub favorites: Vec<String>,
 }
 
 impl Config {
@@ -107,6 +111,7 @@ impl Config {
                 check_conflicts: true,
                 parallel_scans: 4,
                 cache_ttl_hours: 24,
+                favorites: Vec::new(),
             },
         }
     }
