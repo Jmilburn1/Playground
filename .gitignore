@@ -1,0 +1,19 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config
+*.toml
+!config.example.toml
+
+# Logs
+*.log
