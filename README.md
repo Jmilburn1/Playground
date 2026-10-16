@@ -1,57 +1,76 @@
-# FS Mod Manager
+<p align="center">
+  <img src="assets/logo.png" alt="Playground logo" width="300">
+</p>
 
-A Farming Simulator mod manager written in Rust, similar to Farm Sim Hub.
+# Playground
+
+A farming simulator mod manager — by Farmer Jay.
+
+Playground keeps a large mod library under control: browse your game
+folder and your archive side by side as a card grid, spot conflicts,
+favourite the mods you always come back to, and stage a different mod
+set for each savegame.
 
 ## Download (no build needed)
 
-Pre-compiled Windows builds are attached to the
+Grab the pre-compiled Windows build from the
 [Releases](https://github.com/Jmilburn1/Playground/releases) page:
-download `FS-Mod-Manager-Windows.zip`, unzip it anywhere, and
-double-click `fs-mod-manager.exe`. No Rust, no terminal.
+
+1. Download `FS-Mod-Manager-Windows.zip` from the latest release.
+2. Unzip it anywhere.
+3. Double-click `Launch-FS-Mod-Manager.bat` (or `fs-mod-manager.exe`).
+
+No Rust, no compiler, no terminal.
+
+## First run
+
+Open the **Settings** tab and point Playground at your folders:
+
+- **Active** — your game's mods folder, e.g.
+  `Documents\My Games\FarmingSimulator2025\mods`
+- **Archive** — wherever you keep the rest of your library, on any drive
+
+Save, and Playground scans both folders.
 
 ## Features
-- Browse, download, and manage mods for FS17, FS19, FS22, FS25
-- Multiple folder support (archive + active directories)
-- Move mods between directories
-- Scan for mod issues and conflicts
-- Search Mod Hub, GitHub, and KingMods for updates
-- Fast scanning and conflict detection
 
-## Prerequisites
-- Rust (1.70+): https://rustup.rs/
-- Cargo (comes with Rust)
+- Card-grid library with each mod's real icon, category, author, and version
+- Browse by category (tractors, trailers, maps, scripts, and more),
+  Active / Archived, or Favourites
+- Star favourites — they survive moving a mod between folders
+- Search across the whole library
+- Conflict detection (duplicate mods, Active/Archive overlaps)
+- Move mods between Active and Archive, including across drives
+- **Configure Save (work in progress)** — build a mod loadout for each
+  savegame slot and apply it; Playground stages the right mods into the
+  game folder and returns the rest to the archive
+- Everything runs locally; your library never leaves your PC
 
-## Setup
+## On the roadmap
 
-1. Install Rust:
-```bash
-# Windows
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+- Update checks against ModHub, GitHub, and KingMods
+- Support for FS17 / FS19 / FS22 profiles alongside FS25
+- Launching the game from Playground
 
-2. Navigate to the project directory and build the release executable:
+## Building from source (developers only)
+
+Normal users should use the Releases download above. To build it
+yourself you need Rust (stable, MSVC) on Windows:
+
 ```bat
-cd /d E:\Playground
 cargo build --release
-```
-
-3. Launch the executable (no Cargo command needed after the build):
-```bat
 target\release\fs-mod-manager.exe
 ```
 
-You can double-click `fs-mod-manager.exe` in `target\release`, create a
-desktop shortcut to it, or use `Launch-FS-Mod-Manager.bat` in this folder.
-The launcher builds the release executable the first time if it is missing,
-then starts the `.exe` directly on later runs.
+## Project structure
 
-## Project Structure
-- `src/main.rs` - Application entry point
-- `src/ui/` - UI modules (TUI/CLI)
-- `src/mod_manager/` - Core mod management logic
-- `src/scanner/` - Mod scanning and conflict detection
-- `src/sources/` - Mod source integrations (Mod Hub, GitHub, KingMods)
-- `src/config/` - Configuration management
+- `src/main.rs` — entry point (GUI, plus a small `cli` diagnostic mode)
+- `src/ui/` — the Iced GUI: card grid, sidebar, save configurator
+- `src/mod_manager/` — scanning, modDesc parsing, categories, conflict
+  detection, cross-drive moves, savegame loadouts
+- `src/sources/` — update-source integrations (in progress)
 
-## Dependencies
-See `Cargo.toml` for the full list.
+## Credits
+
+V1.0.0 © 2026 Farmer Jay.
+Created with the Assistance of Albert — Farmer Jay's Muse AI Agent.
