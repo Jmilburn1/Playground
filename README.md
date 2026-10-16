@@ -18,9 +18,10 @@ Grab the pre-compiled Windows build from the
 
 1. Download `FS-Mod-Manager-Windows.zip` from the latest release.
 2. Unzip it anywhere.
-3. Double-click `Launch-FS-Mod-Manager.bat` (or `fs-mod-manager.exe`).
+3. Double-click `fs-mod-manager.exe`.
 
-No Rust, no compiler, no terminal.
+No Rust, no compiler, no terminal — and nothing to install. The exe is
+portable: run it from the unzipped folder, a USB stick, wherever.
 
 ## First run
 

@@ -30,7 +30,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/fs-mod-manager.exe dist/
-          Copy-Item Launch-FS-Mod-Manager.bat dist/ -ErrorAction SilentlyContinue
           Copy-Item README.md dist/ -ErrorAction SilentlyContinue
           Compress-Archive -Path dist/* -DestinationPath FS-Mod-Manager-Windows.zip -Force
 
