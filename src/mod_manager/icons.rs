@@ -12,6 +12,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 /// A loaded icon, ready to hand to the UI.
+#[derive(Debug, Clone)]
 pub enum LoadedIcon {
     /// Decoded RGBA8 pixels (from a DDS file).
     Rgba {

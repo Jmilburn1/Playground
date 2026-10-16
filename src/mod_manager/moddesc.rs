@@ -17,6 +17,17 @@ pub struct ModDescInfo {
     pub author: Option<String>,
     pub description: Option<String>,
     pub icon_filename: Option<String>,
+    /// xmlFilename of every `<storeItem>` — the purchasable items the
+    /// mod adds (vehicles, placeables, tools). Category detection
+    /// reads each item's own XML for its shop category.
+    pub store_items: Vec<String>,
+    /// True when the modDesc declares a `<maps>` section (a map mod).
+    pub has_map: bool,
+    /// Custom vehicle/placeable type name -> parent type name, from
+    /// `<vehicleTypes>` / `<placeableTypes>`. Lets category detection
+    /// resolve a custom item type to the vanilla family it descends
+    /// from when the item declares no shop category itself.
+    pub type_parents: std::collections::HashMap<String, String>,
 }
 
 /// Read and parse the modDesc.xml for the mod at `path`, if one exists.
@@ -104,6 +115,44 @@ fn apply_text(
     }
 }
 
+pub fn attr_value(e: &quick_xml::events::BytesStart, key: &str) -> Option<String> {
+    for attr in e.attributes().flatten() {
+        if attr.key.local_name().as_ref() == key.as_bytes() {
+            return Some(String::from_utf8_lossy(&attr.value).into_owned());
+        }
+    }
+    None
+}
+
+/// Record the structural facts category detection needs from one
+/// element: store items, maps, and custom type declarations. Called
+/// for both Start and Empty events — storeItem/type elements are
+/// usually self-closing, which quick-xml reports as Empty.
+fn apply_structure(
+    info: &mut ModDescInfo,
+    stack: &[String],
+    e: &quick_xml::events::BytesStart,
+) {
+    let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+    let path = format!("{}/{}", stack.join("/"), name);
+    match path.as_str() {
+        "modDesc/storeItems/storeItem" => {
+            if let Some(file) = attr_value(e, "xmlFilename") {
+                info.store_items.push(file);
+            }
+        }
+        "modDesc/maps/map" => info.has_map = true,
+        "modDesc/vehicleTypes/type" | "modDesc/placeableTypes/type" => {
+            if let (Some(child), Some(parent)) =
+                (attr_value(e, "name"), attr_value(e, "parent"))
+            {
+                info.type_parents.insert(child, parent);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn parse_moddesc(xml: &str) -> Option<ModDescInfo> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -115,7 +164,11 @@ fn parse_moddesc(xml: &str) -> Option<ModDescInfo> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                apply_structure(&mut info, &stack, &e);
                 stack.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
+            }
+            Ok(Event::Empty(e)) => {
+                apply_structure(&mut info, &stack, &e);
             }
             Ok(Event::End(_)) => {
                 stack.pop();
@@ -141,7 +194,12 @@ fn parse_moddesc(xml: &str) -> Option<ModDescInfo> {
     if info.description.is_none() {
         info.description = desc_first;
     }
-    if info.title.is_none() && info.version.is_none() && info.author.is_none() {
+    if info.title.is_none()
+        && info.version.is_none()
+        && info.author.is_none()
+        && info.store_items.is_empty()
+        && !info.has_map
+    {
         None
     } else {
         Some(info)

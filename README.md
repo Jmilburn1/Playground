@@ -2,6 +2,13 @@
 
 A Farming Simulator mod manager written in Rust, similar to Farm Sim Hub.
 
+## Download (no build needed)
+
+Pre-compiled Windows builds are attached to the
+[Releases](https://github.com/Jmilburn1/Playground/releases) page:
+download `FS-Mod-Manager-Windows.zip`, unzip it anywhere, and
+double-click `fs-mod-manager.exe`. No Rust, no terminal.
+
 ## Features
 - Browse, download, and manage mods for FS17, FS19, FS22, FS25
 - Multiple folder support (archive + active directories)

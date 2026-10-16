@@ -1,0 +1,172 @@
+// Release builds on Windows use the GUI subsystem, so launching the
+// finished .exe does not leave a console window behind. Debug builds keep
+// the console for diagnostics and CLI work.
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
+mod mod_manager;
+mod scanner;
+mod sources;
+mod config;
+mod ui;
+
+use config::Config;
+use mod_manager::ModManager;
+use std::env;
+
+fn main() -> anyhow::Result<()> {
+    // Setup logging
+    tracing_subscriber::fmt::init();
+
+    // Load configuration
+    let config = Config::load()?;
+
+    // Check if we should use CLI mode
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 && args[1] == "cli" {
+        let mut mod_manager = ModManager::new(config)?;
+        return run_cli(&mut mod_manager, &args[2..]);
+    }
+
+    // Start GUI — unscanned: the app loads the library in a background
+    // task so the window opens immediately.
+    let mod_manager = ModManager::new_unscanned(config)?;
+    ui::run(mod_manager)
+}
+
+fn format_mod_line(m: &mod_manager::Mod) -> String {
+    let short_id = &m.id[..m.id.len().min(8)];
+    match &m.author {
+        Some(author) => format!(
+            "{} v{} by {} ({:?}) [{}]",
+            m.name, m.version, author, m.state, short_id
+        ),
+        None => format!("{} v{} ({:?}) [{}]", m.name, m.version, m.state, short_id),
+    }
+}
+
+fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> {
+    match args.get(0).map(|s| s.as_str()) {
+        Some("scan") => {
+            mod_manager.scan_all()?;
+            let mods = mod_manager.get_mods();
+            println!("Found {} mods:", mods.len());
+            for m in mods {
+                println!("- {}", format_mod_line(m));
+            }
+        }
+        Some("list") => {
+            let mods = mod_manager.get_mods();
+            println!("Mods in archive: {}", mod_manager.get_mods_by_state(mod_manager::ModState::Archived).len());
+            println!("Mods active: {}", mod_manager.get_mods_by_state(mod_manager::ModState::Active).len());
+            for m in mods {
+                println!("- {}", format_mod_line(m));
+            }
+        }
+        Some("search") => {
+            if let Some(query) = args.get(1) {
+                let results = mod_manager.search_mods(query);
+                println!("Found {} matching mods:", results.len());
+                for m in results {
+                    println!("- {}", format_mod_line(m));
+                }
+            }
+        }
+        Some("move") => {
+            if let Some(query) = args.get(1) {
+                if let Some(target) = args.get(2) {
+                    // Accept a full ID, the short ID shown by scan/list, or
+                    // the mod's name.
+                    let found = mod_manager
+                        .get_mods()
+                        .into_iter()
+                        .find(|m| {
+                            m.id == *query
+                                || m.id.starts_with(query.as_str())
+                                || m.name.eq_ignore_ascii_case(query)
+                        })
+                        .map(|m| m.id.clone());
+                    match found {
+                        Some(id) => {
+                            let target_path = std::path::PathBuf::from(target);
+                            mod_manager.move_between_directories(&id, &target_path)?;
+                            println!("Moved mod to {:?}", target_path);
+                        }
+                        None => println!("No mod matching '{}'", query),
+                    }
+                }
+            }
+        }
+        Some("icons") => {
+            for m in mod_manager.get_mods() {
+                match mod_manager::icons::load_icon(&m.path, m.icon_filename.as_deref()) {
+                    Some(mod_manager::icons::LoadedIcon::Rgba { width, height, .. }) => {
+                        println!("- {}: DDS icon decoded ({}x{})", m.name, width, height)
+                    }
+                    Some(mod_manager::icons::LoadedIcon::Encoded(bytes)) => {
+                        println!("- {}: image icon ({} bytes)", m.name, bytes.len())
+                    }
+                    None => println!("- {}: no icon found", m.name),
+                }
+            }
+        }
+        Some("conflicts") => {
+            let mods = mod_manager.get_mods();
+            let mods_vec: Vec<mod_manager::Mod> = mods.into_iter().cloned().collect();
+            let conflicts = mod_manager::conflict::ConflictDetector::detect_conflicts(&mods_vec);
+            println!("Found {} conflicts:", conflicts.len());
+            for c in conflicts {
+                println!("- {} vs {}: {:?}", c.mod1, c.mod2, c.conflict_type);
+            }
+        }
+        Some("categories") => {
+            let mut counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for m in mod_manager.get_mods() {
+                println!("- {}: {}", m.name, m.categories.join(", "));
+                for c in &m.categories {
+                    *counts.entry(c.as_str()).or_insert(0) += 1;
+                }
+            }
+            let mut summary: Vec<(&str, usize)> = counts.into_iter().collect();
+            summary.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("Category counts:");
+            for (cat, n) in summary {
+                println!("  {}: {}", cat, n);
+            }
+        }
+        Some("help") | _ => {
+            print_help();
+        }
+    }
+
+    Ok(())
+}
+
+fn print_help() {
+    println!("FS Mod Manager - Farming Simulator Mod Manager");
+    println!("Usage: fs-mod-manager [command] [args]");
+    println!("Commands:");
+    println!("  cli scan - Scan all directories for mods");
+    println!("  cli list - List all mods");
+    println!("  cli search <query> - Search mods");
+    println!("  cli move <id|name> <target_dir> - Move mod to directory");
+    println!("  cli conflicts - Check for mod conflicts");
+    println!("  cli icons - Show icon load status for each mod");
+    println!("  cli categories - Show the detected category of each mod");
+    println!("  cli help - Show this help");
+    println!("  (no args) - Launch GUI");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_load() {
+        let config = Config::load();
+        assert!(config.is_ok());
+    }
+}

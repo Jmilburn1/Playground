@@ -22,17 +22,17 @@ fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let config = Config::load()?;
-    
-    // Initialize mod manager
-    let mut mod_manager = ModManager::new(config)?;
 
     // Check if we should use CLI mode
     let args: Vec<String> = env::args().collect();
     if args.len() > 1 && args[1] == "cli" {
+        let mut mod_manager = ModManager::new(config)?;
         return run_cli(&mut mod_manager, &args[2..]);
     }
 
-    // Start GUI
+    // Start GUI — unscanned: the app loads the library in a background
+    // task so the window opens immediately.
+    let mod_manager = ModManager::new_unscanned(config)?;
     ui::run(mod_manager)
 }
 
@@ -121,6 +121,47 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                 println!("- {} vs {}: {:?}", c.mod1, c.mod2, c.conflict_type);
             }
         }
+        Some("categories") => {
+            let mut counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for m in mod_manager.get_mods() {
+                println!("- {}: {}", m.name, m.categories.join(", "));
+                for c in &m.categories {
+                    *counts.entry(c.as_str()).or_insert(0) += 1;
+                }
+            }
+            let mut summary: Vec<(&str, usize)> = counts.into_iter().collect();
+            summary.sort_by(|a, b| b.1.cmp(&a.1));
+            println!("Category counts:");
+            for (cat, n) in summary {
+                println!("  {}: {}", cat, n);
+            }
+        }
+        Some("saves") => {
+            let slots = mod_manager.save_slots();
+            if slots.is_empty() {
+                println!("No save slots found (is the active folder a game's mods folder?).");
+            }
+            for s in &slots {
+                let loadout = mod_manager.save_loadout(&s.dir_name);
+                println!(
+                    "- Slot {} ({}): map {}, saved {}, played {}, money {} — loadout: {} mods",
+                    s.slot,
+                    s.dir_name,
+                    s.map.as_deref().unwrap_or("?"),
+                    s.saved_at.as_deref().unwrap_or("?"),
+                    s.play_time_display().as_deref().unwrap_or("?"),
+                    s.money
+                        .map(|m| format!("${}", m))
+                        .unwrap_or_else(|| "?".to_string()),
+                    if loadout.is_empty() {
+                        "none saved".to_string()
+                    } else {
+                        format!("{} mods", loadout.len())
+                    },
+                );
+            }
+        }
         Some("help") | _ => {
             print_help();
         }
@@ -139,6 +180,8 @@ fn print_help() {
     println!("  cli move <id|name> <target_dir> - Move mod to directory");
     println!("  cli conflicts - Check for mod conflicts");
     println!("  cli icons - Show icon load status for each mod");
+    println!("  cli categories - Show the detected category of each mod");
+    println!("  cli saves - List savegame slots and their saved loadouts");
     println!("  cli help - Show this help");
     println!("  (no args) - Launch GUI");
 }

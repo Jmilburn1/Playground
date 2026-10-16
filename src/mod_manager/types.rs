@@ -41,6 +41,10 @@ pub struct Mod {
     pub hash: Option<String>,
     #[serde(default)]
     pub icon_filename: Option<String>,
+    /// Player-facing category buckets (Tractors, Maps, Scripts, ...)
+    /// detected from the mod's store items at scan time.
+    #[serde(default)]
+    pub categories: Vec<String>,
 }
 
 impl Mod {
@@ -106,11 +110,15 @@ impl Mod {
             download_url: None,
             hash: None,
             icon_filename: None,
+            categories: Vec::new(),
         };
 
         // Real metadata from modDesc.xml, when the mod has one. Missing or
         // unreadable data just leaves the filename-based defaults in place.
         if let Some(info) = moddesc::read_metadata(&m.path) {
+            // Categories first: the fields below are moved out of
+            // `info` one by one, and detection still needs to read it.
+            m.categories = super::categories::detect_categories(&m.path, Some(&info));
             if let Some(title) = info.title {
                 if !title.trim().is_empty() {
                     m.name = title;
@@ -126,6 +134,8 @@ impl Mod {
                 m.description = Some(description);
             }
             m.icon_filename = info.icon_filename;
+        } else {
+            m.categories = vec![super::categories::UNCATEGORIZED.to_string()];
         }
 
         Ok(m)

@@ -43,6 +43,10 @@ pub struct Settings {
     /// favorite survives the mod being moved between archive and active.
     #[serde(default)]
     pub favorites: Vec<String>,
+    /// Per-savegame mod loadouts (Configure Save): savegame folder
+    /// name ("savegame1") -> favorite_keys of the mods that save uses.
+    #[serde(default)]
+    pub save_loadouts: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Expand a leading `~` in a configured path. Configs written by other
@@ -144,6 +148,7 @@ impl Config {
                 parallel_scans: 4,
                 cache_ttl_hours: 24,
                 favorites: Vec::new(),
+                save_loadouts: std::collections::HashMap::new(),
             },
         }
     }

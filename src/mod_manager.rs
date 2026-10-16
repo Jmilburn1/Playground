@@ -3,6 +3,8 @@ pub mod manager;
 pub mod conflict;
 pub mod moddesc;
 pub mod icons;
+pub mod categories;
+pub mod saves;
 
 use crate::config::Config;
 
