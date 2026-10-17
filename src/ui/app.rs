@@ -1531,7 +1531,7 @@ impl App {
             ),
             Space::with_height(Length::Fill),
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
-            text("V1.0.1  © 2026 Farmer Jay.")
+            text("V1.0.2  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
