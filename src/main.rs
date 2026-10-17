@@ -162,12 +162,142 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                 );
             }
         }
+        Some("audit") => {
+            if let Some(root) = args.get(1) {
+                audit_tree(mod_manager, std::path::Path::new(root));
+            } else {
+                println!("Usage: cli audit <folder>");
+                println!("Lists the mods inside <folder> (searched recursively) that");
+                println!("are NOT in the library, so a duplicate folder tree can be");
+                println!("checked before anything in it is deleted.");
+            }
+        }
         Some("help") | _ => {
             print_help();
         }
     }
 
     Ok(())
+}
+
+/// Human-readable byte count for CLI output.
+fn fmt_bytes(n: u64) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < units.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", n, units[i])
+    } else {
+        format!("{:.1} {}", v, units[i])
+    }
+}
+
+/// Recursive folder audit (for John's library consolidation):
+/// walk a folder tree, treat every .zip and every folder holding
+/// a modDesc.xml as one mod, and diff their file stems against
+/// the scanned library. Prints what the tree duplicates (safe to
+/// delete once the uniques are rescued) and what exists ONLY in
+/// the tree. Read-only — nothing is moved or deleted.
+fn audit_tree(mod_manager: &mut ModManager, root: &std::path::Path) {
+    use std::collections::HashSet;
+    if !root.is_dir() {
+        println!("Not a folder: {:?}", root);
+        return;
+    }
+    let library: HashSet<String> = mod_manager
+        .get_mods()
+        .into_iter()
+        .map(|m| mod_stem(&m.path))
+        .collect();
+
+    fn mod_stem(path: &std::path::Path) -> String {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        name.strip_suffix(".zip")
+            .map(|s| s.to_string())
+            .unwrap_or(name)
+    }
+
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.join("modDesc.xml").exists() {
+                    out.push(path); // a folder mod — do not descend
+                } else {
+                    collect(&path, out);
+                }
+            } else if path
+                .extension()
+                .map_or(false, |e| e.eq_ignore_ascii_case("zip"))
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if root.join("modDesc.xml").exists() {
+        candidates.push(root.to_path_buf());
+    } else {
+        collect(root, &mut candidates);
+    }
+    candidates.sort();
+
+    let mut dup_count = 0usize;
+    let mut dup_bytes = 0u64;
+    let mut unique: Vec<(String, String, u64, std::path::PathBuf)> = Vec::new();
+    for path in &candidates {
+        let (label, version, size) = match mod_manager::Mod::new(path.clone()) {
+            Ok(m) => (m.name.clone(), m.version.clone(), m.size),
+            Err(_) => (
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                "?".to_string(),
+                std::fs::metadata(path).map(|md| md.len()).unwrap_or(0),
+            ),
+        };
+        if library.contains(&mod_stem(path)) {
+            dup_count += 1;
+            dup_bytes += size;
+        } else {
+            unique.push((label, version, size, path.clone()));
+        }
+    }
+    let unique_bytes: u64 = unique.iter().map(|u| u.2).sum();
+
+    println!("Audit of {:?}", root);
+    println!("Library holds {} mods.", library.len());
+    println!("Found {} mods in the tree:", candidates.len());
+    println!(
+        "- {} already in the library ({}) — duplicates",
+        dup_count,
+        fmt_bytes(dup_bytes)
+    );
+    println!(
+        "- {} ONLY in this tree ({}) — rescue these before deleting the tree",
+        unique.len(),
+        fmt_bytes(unique_bytes)
+    );
+    for (label, version, size, path) in &unique {
+        println!(
+            "  UNIQUE: {} v{} ({}) at {:?}",
+            label,
+            version,
+            fmt_bytes(*size),
+            path
+        );
+    }
 }
 
 fn print_help() {
@@ -182,6 +312,7 @@ fn print_help() {
     println!("  cli icons - Show icon load status for each mod");
     println!("  cli categories - Show the detected category of each mod");
     println!("  cli saves - List savegame slots and their saved loadouts");
+    println!("  cli audit <folder> - List mods in a folder tree that are NOT in the library");
     println!("  cli help - Show this help");
     println!("  (no args) - Launch GUI");
 }
