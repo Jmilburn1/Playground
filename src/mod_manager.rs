@@ -5,6 +5,7 @@ pub mod moddesc;
 pub mod icons;
 pub mod categories;
 pub mod saves;
+pub mod game_files;
 
 use crate::config::Config;
 

@@ -1,6 +1,6 @@
 [package]
 name = "fs-mod-manager"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2021"
 
 [dependencies]
@@ -23,6 +23,7 @@ zip = "4"
 
 # Utilities
 anyhow = "1.0"
+rfd = "0.15"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"

@@ -47,6 +47,10 @@ pub struct Settings {
     /// name ("savegame1") -> favorite_keys of the mods that save uses.
     #[serde(default)]
     pub save_loadouts: std::collections::HashMap<String, Vec<String>>,
+    /// The game's install folder (where game.xml lives), picked in
+    /// the Settings tab. Powers the console on/off toggle.
+    #[serde(default)]
+    pub game_directory: Option<PathBuf>,
 }
 
 /// Expand a leading `~` in a configured path. Configs written by other
@@ -86,6 +90,9 @@ impl Config {
                 if let Some(d) = dir {
                     *d = expand_tilde(d);
                 }
+            }
+            if let Some(d) = &mut config.settings.game_directory {
+                *d = expand_tilde(d);
             }
             Ok(config)
         } else {
@@ -149,6 +156,7 @@ impl Config {
                 cache_ttl_hours: 24,
                 favorites: Vec::new(),
                 save_loadouts: std::collections::HashMap::new(),
+                game_directory: None,
             },
         }
     }

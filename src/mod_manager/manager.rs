@@ -221,6 +221,19 @@ impl ModManager {
         self.config.save()
     }
 
+    /// The remembered game install folder (Settings tab), where
+    /// game.xml lives. None until the user picks it.
+    pub fn game_directory(&self) -> Option<PathBuf> {
+        self.config.settings.game_directory.clone()
+    }
+
+    /// Remember the game install folder; persists to the config.
+    pub fn set_game_directory(&mut self, dir: PathBuf) -> Result<()> {
+        let dir = crate::config::expand_tilde(&dir);
+        self.config.settings.game_directory = Some(dir);
+        self.config.save()
+    }
+
     pub fn add_directory(&mut self, path: PathBuf) -> Result<()> {
         if !path.exists() {
             std::fs::create_dir_all(&path)?;
@@ -429,6 +442,7 @@ mod tests {
                 cache_ttl_hours: 24,
                 favorites: vec![],
                 save_loadouts: HashMap::new(),
+                game_directory: None,
             },
         };
         let mut manager = ModManager::new(config).unwrap();

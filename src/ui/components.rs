@@ -3,13 +3,27 @@ use crate::mod_manager::icons::LoadedIcon;
 use crate::mod_manager::types::{Mod, ModState};
 use iced::widget::{button, column, container, row, text};
 use iced::{Color, Element, Length};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Browse,
     Conflicts,
     Saves,
+    Log,
     Settings,
+}
+
+/// Which folder a Browse picker is choosing (Settings tab).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderTarget {
+    /// The game's mods folder — the folder switcher; picking one
+    /// also writes the gameSettings.xml override.
+    Active,
+    /// The archive folder — picker convenience only.
+    Archive,
+    /// The game's install folder, where game.xml lives.
+    Game,
 }
 
 /// What the browse grid is showing: everything, one folder's mods,
@@ -43,6 +57,33 @@ pub struct ScanOutcome {
     pub conflicts: Vec<Conflict>,
 }
 
+/// How a game-log line is classified for the Log Reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogKind {
+    Normal,
+    Warning,
+    Error,
+}
+
+/// One classified line of the game's log.txt.
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub text: String,
+    pub kind: LogKind,
+}
+
+/// Result of reading the game log in the background: the last
+/// lines (capped for display), counts over the whole file, and
+/// the names of library mods that error/warning lines mention.
+#[derive(Debug, Clone)]
+pub struct LogOutcome {
+    pub lines: Vec<LogLine>,
+    pub suspects: Vec<String>,
+    pub error_count: usize,
+    pub warning_count: usize,
+    pub total_lines: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Scan,
@@ -66,6 +107,12 @@ pub enum Message {
     ActiveDirChanged(String),
     ArchiveDirChanged(String),
     SaveDirectories,
+    BrowseFolder(FolderTarget),
+    FolderPicked(FolderTarget, Option<PathBuf>),
+    ToggleConsole(bool),
+    RefreshLog,
+    LogLoaded(Result<LogOutcome, String>),
+    LogErrorsOnlyToggled(bool),
     SelectSaveSlot(String),
     DraftToggle(String),
     DraftUseActive,
