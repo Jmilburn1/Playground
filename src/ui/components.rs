@@ -84,6 +84,33 @@ pub struct LogOutcome {
     pub total_lines: usize,
 }
 
+pub mod update_types {
+    /// A newer release found by an update check.
+    #[derive(Debug, Clone)]
+    pub struct UpdateInfo {
+        /// Normalized version of the latest release ("1.2.0").
+        pub version: String,
+        /// The release tag as published ("v1.2.0").
+        pub tag: String,
+        /// Download URL of the chosen mod .zip asset.
+        pub download_url: String,
+        /// The asset's file name.
+        pub asset_name: String,
+        /// The repo the update came from ("owner/repo").
+        pub repo: String,
+    }
+
+    /// Per-mod update-check state, keyed by mod id in the app.
+    #[derive(Debug, Clone)]
+    pub enum UpdateState {
+        Checking,
+        UpToDate,
+        Available(UpdateInfo),
+        Installing,
+        Failed(String),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Scan,
@@ -113,6 +140,41 @@ pub enum Message {
     RefreshLog,
     LogLoaded(Result<LogOutcome, String>),
     LogErrorsOnlyToggled(bool),
+    /// Update checks (GitHub): the details panel's repo field.
+    LinkInputChanged(String),
+    SaveModLink(String),
+    /// Update checks (ModHub): the details panel's ModHub field.
+    ModHubInputChanged(String),
+    SaveModHubLink(String),
+    /// Auto-detect ModHub links for every unlinked .zip mod.
+    DetectModHub,
+    /// The catalog arrived (or not) for a detection pass:
+    /// stem -> mod_id pairs the catalog could answer
+    /// instantly, before any live searching happens.
+    DetectCatalogReady(Vec<(String, String)>),
+    ModHubLinksDetected {
+        found: Vec<(String, String)>,
+        missed: usize,
+    },
+    /// One batch of a chunked detection pass (the pass saves
+    /// every batch, so closing the app mid-pass loses nothing).
+    DetectBatchDone {
+        found: Vec<(String, String)>,
+        missed: usize,
+        processed: usize,
+    },
+    CheckUpdate(String),
+    UpdateChecked(String, Result<Option<update_types::UpdateInfo>, String>),
+    InstallUpdate(String),
+    UpdateInstalled(String, Result<std::path::PathBuf, String>),
+    CheckAllUpdates,
+    /// The catalog arrived (or not) for an update check:
+    /// stem -> catalog entry, so unlinked mods the catalog
+    /// knows can be checked locally with no ModHub traffic.
+    CheckUpdatesCatalogReady(
+        Vec<(String, crate::sources::mod_hub::CatalogEntry)>,
+    ),
+    AllUpdatesChecked(Vec<(String, Result<Option<update_types::UpdateInfo>, String>)>),
     SelectSaveSlot(String),
     DraftToggle(String),
     DraftUseActive,
@@ -185,6 +247,7 @@ pub fn mod_card<'a>(
     is_favorite: bool,
     is_selected: bool,
     has_conflict: bool,
+    update_available: bool,
     width: f32,
     height: f32,
 ) -> Element<'a, Message> {
@@ -342,6 +405,11 @@ pub fn mod_card<'a>(
     if has_conflict {
         pill_items.push(
             pill("Has conflicts".to_string(), Color::from_rgb(0.62, 0.16, 0.13)).into(),
+        );
+    }
+    if update_available {
+        pill_items.push(
+            pill("Update".to_string(), Color::from_rgb(0.25, 0.35, 0.55)).into(),
         );
     }
     if width >= 195.0 {

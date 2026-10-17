@@ -1,6 +1,7 @@
 pub mod mod_hub;
 pub mod github;
 pub mod kingmods;
+pub mod catalog;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

@@ -1,4 +1,4 @@
-use super::types::{Mod, ModState};
+use super::types::{Mod, ModState, ModType};
 use crate::config::Config;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -317,6 +317,187 @@ impl ModManager {
         self.config.settings.favorites.len()
     }
 
+    /// The file stem that keys a mod's update link and audit
+    /// identity: the file/folder name, lowercase, ".zip" removed.
+    pub fn mod_stem(path: &std::path::Path) -> String {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        name.strip_suffix(".zip")
+            .map(|s| s.to_string())
+            .unwrap_or(name)
+    }
+
+    /// The GitHub repo ("owner/repo") this mod is linked to for
+    /// update checks, if any.
+    pub fn mod_link(&self, stem: &str) -> Option<&str> {
+        self.config.settings.mod_links.get(stem).map(|s| s.as_str())
+    }
+
+    /// Link (or, with None, unlink) a mod stem to a GitHub repo;
+    /// persists to the config file.
+    pub fn set_mod_link(&mut self, stem: &str, repo: Option<String>) -> Result<()> {
+        match repo {
+            Some(r) => {
+                self.config.settings.mod_links.insert(stem.to_string(), r);
+            }
+            None => {
+                self.config.settings.mod_links.remove(stem);
+            }
+        }
+        self.config.save()
+    }
+
+    /// Every linked mod (stem -> repo), for "check all" runs.
+    pub fn mod_links(&self) -> Vec<(String, String)> {
+        let mut links: Vec<(String, String)> = self
+            .config
+            .settings
+            .mod_links
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The GIANTS ModHub mod_id this mod is linked to, if any.
+    pub fn modhub_link(&self, stem: &str) -> Option<&str> {
+        self.config
+            .settings
+            .modhub_links
+            .get(stem)
+            .map(|s| s.as_str())
+    }
+
+    /// The catalog URL from settings (the published ModHub
+    /// index the app reads; empty disables fetching).
+    pub fn catalog_url(&self) -> String {
+        self.config.settings.catalog_url.clone()
+    }
+
+    /// Link (or, with None, unlink) a mod stem to a ModHub
+    /// mod_id; persists to the config file.
+    pub fn set_modhub_link(&mut self, stem: &str, mod_id: Option<String>) -> Result<()> {
+        match mod_id {
+            Some(id) => {
+                self.config.settings.modhub_links.insert(stem.to_string(), id);
+            }
+            None => {
+                self.config.settings.modhub_links.remove(stem);
+            }
+        }
+        self.config.save()
+    }
+
+    /// Every ModHub-linked mod (stem -> mod_id).
+    pub fn modhub_links(&self) -> Vec<(String, String)> {
+        let mut links: Vec<(String, String)> = self
+            .config
+            .settings
+            .modhub_links
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        links.sort();
+        links
+    }
+
+    /// The GitHub API endpoint + token from the config's GitHub
+    /// source entry: (base url, token when one is set). The base
+    /// is configurable so tests can use a local mock server.
+    pub fn github_endpoint(&self) -> (String, Option<String>) {
+        let entry = self.config.mod_sources.github.first();
+        let base = entry
+            .map(|e| e.url.trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "https://api.github.com".to_string());
+        let token = entry
+            .and_then(|e| e.api_key.clone())
+            .filter(|k| !k.trim().is_empty());
+        (base, token)
+    }
+
+    /// Install an update: replace a ZIP mod's file with a
+    /// downloaded one, in place (same folder, same filename —
+    /// "overwrite the outdated file"). The download is validated
+    /// as a readable mod BEFORE the old file is touched; the old
+    /// mod's favorite key and loadout entries are migrated to the
+    /// new file's key, so stars and save loadouts survive the
+    /// version bump. Returns "old -> new" version text.
+    pub fn replace_mod_file(&mut self, mod_id: &str, downloaded: &std::path::Path) -> Result<String> {
+        let old = self
+            .mods
+            .get(mod_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Mod not found: {}", mod_id))?;
+        if old.mod_type != ModType::Zip {
+            anyhow::bail!(
+                "Updates install over .zip mods only — {} is a folder mod.",
+                old.name
+            );
+        }
+        // Validate the download under a .zip name next to the mod,
+        // so a bad download never costs the working file.
+        let parent = old
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Mod path has no parent folder"))?
+            .to_path_buf();
+        let probe = parent.join(".playground-update-probe.zip");
+        std::fs::copy(downloaded, &probe)
+            .context("Could not stage the downloaded file for checking")?;
+        let probe_result = Mod::new(probe.clone());
+        let _ = std::fs::remove_file(&probe);
+        probe_result
+            .map_err(|_| anyhow::anyhow!("The downloaded file is not a readable mod — keeping the old file."))?;
+
+        let old_key = old.favorite_key();
+        let old_version = old.version.clone();
+
+        // The swap: same folder, same filename.
+        let staged = parent.join(".playground-update-new.zip");
+        std::fs::copy(downloaded, &staged).context("Could not stage the update")?;
+        std::fs::remove_file(&old.path).context("Could not remove the outdated file")?;
+        if let Err(e) = std::fs::rename(&staged, &old.path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e).context("Could not put the updated file in place");
+        }
+
+        // Re-read the new file at the old path; the id is a hash
+        // of the path, so it survives the swap unchanged.
+        let mut fresh = Mod::new(old.path.clone())
+            .context("The updated file would not re-read after installing")?;
+        fresh.state = old.state;
+        let new_key = fresh.favorite_key();
+        let new_version = fresh.version.clone();
+        self.mods.insert(fresh.id.clone(), fresh);
+
+        // Carry favorites and loadout entries to the new key.
+        let mut dirty = false;
+        let favs = &mut self.config.settings.favorites;
+        if let Some(pos) = favs.iter().position(|f| f == &old_key) {
+            favs[pos] = new_key.clone();
+            dirty = true;
+        }
+        for keys in self.config.settings.save_loadouts.values_mut() {
+            for k in keys.iter_mut() {
+                if *k == old_key {
+                    *k = new_key.clone();
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            self.config.save()?;
+        }
+
+        // The staged download is consumed; report the version
+        // change for the caller's message.
+        Ok(format!("{} -> {}", old_version, new_version))
+    }
+
     /// The game profile folder — the parent of the active folder when
     /// that folder is the game's `mods` directory. Savegame slots
     /// live there, as siblings of `mods`.
@@ -443,6 +624,9 @@ mod tests {
                 favorites: vec![],
                 save_loadouts: HashMap::new(),
                 game_directory: None,
+                mod_links: std::collections::HashMap::new(),
+                modhub_links: std::collections::HashMap::new(),
+                catalog_url: String::new(),
             },
         };
         let mut manager = ModManager::new(config).unwrap();

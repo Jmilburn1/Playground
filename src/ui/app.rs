@@ -4,6 +4,8 @@ use crate::mod_manager::icons::{load_icon, LoadedIcon};
 use crate::mod_manager::saves::SaveSlot;
 use crate::mod_manager::types::{Mod, ModState};
 use crate::mod_manager::ModManager;
+use crate::sources::github::GithubSource;
+use crate::ui::components::update_types::{UpdateInfo, UpdateState};
 use crate::ui::components::{
     format_size, mod_card, BrowseView, FolderTarget, LogKind, LogLine, LogOutcome,
     Message, ScanOutcome, Tab,
@@ -63,6 +65,18 @@ pub struct App {
     log_total_lines: usize,
     log_errors_only: bool,
     log_note: String,
+    /// Update checks (GitHub): per-mod check state by mod id, and
+    /// the details panel's repo link field.
+    update_status: HashMap<String, UpdateState>,
+    link_input: String,
+    modhub_input: String,
+    /// Chunked ModHub detection pass state: remaining
+    /// (stem, file name, title) jobs and running tallies.
+    detect_jobs: Vec<(String, String, String)>,
+    detect_total: usize,
+    detect_done: usize,
+    detect_found: usize,
+    detect_missed: usize,
     window_size: Size,
 }
 
@@ -107,6 +121,14 @@ impl App {
             log_total_lines: 0,
             log_errors_only: false,
             log_note: String::new(),
+            update_status: HashMap::new(),
+            link_input: String::new(),
+            modhub_input: String::new(),
+            detect_jobs: Vec::new(),
+            detect_total: 0,
+            detect_done: 0,
+            detect_found: 0,
+            detect_missed: 0,
             window_size: Size::new(1280.0, 800.0),
         }
     }
@@ -376,6 +398,435 @@ impl App {
                 }
             }
             Message::SavesFilterChanged(filter) => self.saves_filter = filter,
+            Message::LinkInputChanged(value) => self.link_input = value,
+            Message::SaveModLink(id) => {
+                if let Some(m) = self.mod_manager.get_mod(&id).cloned() {
+                    let stem = ModManager::mod_stem(&m.path);
+                    let input = self.link_input.trim().to_string();
+                    if input.is_empty() {
+                        match self.mod_manager.set_mod_link(&stem, None) {
+                            Ok(()) => {
+                                self.update_status.remove(&id);
+                                self.status =
+                                    format!("Update link removed for {}.", m.name);
+                            }
+                            Err(e) => self.status = format!("Saving the link failed: {}", e),
+                        }
+                    } else if let Some(repo) = crate::sources::github::normalize_repo(&input) {
+                        match self.mod_manager.set_mod_link(&stem, Some(repo.clone())) {
+                            Ok(()) => {
+                                self.link_input = repo.clone();
+                                self.status =
+                                    format!("{} linked to GitHub repo {}.", m.name, repo);
+                            }
+                            Err(e) => self.status = format!("Saving the link failed: {}", e),
+                        }
+                    } else {
+                        self.status =
+                            "That doesn't look like a GitHub repo — use owner/repo or the repo's URL."
+                                .to_string();
+                    }
+                }
+            }
+            Message::ModHubInputChanged(value) => self.modhub_input = value,
+            Message::SaveModHubLink(id) => {
+                if let Some(m) = self.mod_manager.get_mod(&id).cloned() {
+                    let stem = ModManager::mod_stem(&m.path);
+                    let input = self.modhub_input.trim().to_string();
+                    if input.is_empty() {
+                        match self.mod_manager.set_modhub_link(&stem, None) {
+                            Ok(()) => {
+                                self.status =
+                                    format!("ModHub link removed for {}.", m.name);
+                            }
+                            Err(e) => self.status = format!("Saving the link failed: {}", e),
+                        }
+                    } else if let Some(mod_id) = crate::sources::mod_hub::normalize_modhub(&input) {
+                        match self.mod_manager.set_modhub_link(&stem, Some(mod_id.clone())) {
+                            Ok(()) => {
+                                self.modhub_input = mod_id.clone();
+                                self.status = format!(
+                                    "{} linked to ModHub mod {}.",
+                                    m.name, mod_id
+                                );
+                            }
+                            Err(e) => self.status = format!("Saving the link failed: {}", e),
+                        }
+                    } else {
+                        self.status =
+                            "That doesn't look like a ModHub link — paste the mod's ModHub page URL or its numeric id."
+                                .to_string();
+                    }
+                }
+            }
+            Message::CheckUpdate(id) => {
+                if let Some(m) = self.mod_manager.get_mod(&id).cloned() {
+                    let stem = ModManager::mod_stem(&m.path);
+                    let gh = self.mod_manager.mod_link(&stem).map(|s| s.to_string());
+                    let mh = self.mod_manager.modhub_link(&stem).map(|s| s.to_string());
+                    if gh.is_some() || mh.is_some() {
+                        self.update_status.insert(id.clone(), UpdateState::Checking);
+                        let (base, token) = self.mod_manager.github_endpoint();
+                        let current = m.version.clone();
+                        return Task::perform(
+                            async move {
+                                check_any_job(base, token, gh, mh, stem, current).await
+                            },
+                            move |result| Message::UpdateChecked(id.clone(), result),
+                        );
+                    }
+                }
+            }
+            Message::UpdateChecked(id, result) => {
+                let name = self
+                    .mod_manager
+                    .get_mod(&id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                match result {
+                    Ok(Some(info)) => {
+                        self.status = format!(
+                            "Update available for {}: v{}.",
+                            name, info.version
+                        );
+                        self.update_status.insert(id, UpdateState::Available(info));
+                    }
+                    Ok(None) => {
+                        self.status = format!("{} is up to date.", name);
+                        self.update_status.insert(id, UpdateState::UpToDate);
+                    }
+                    Err(e) => {
+                        self.status = format!("Update check failed for {}: {}", name, e);
+                        self.update_status.insert(id, UpdateState::Failed(e));
+                    }
+                }
+            }
+            Message::InstallUpdate(id) => {
+                let info = match self.update_status.get(&id) {
+                    Some(UpdateState::Available(info)) => Some(info.clone()),
+                    _ => None,
+                };
+                if let (Some(info), Some(m)) =
+                    (info, self.mod_manager.get_mod(&id).cloned())
+                {
+                    self.update_status.insert(id.clone(), UpdateState::Installing);
+                    self.status = format!("Downloading {} v{}…", m.name, info.version);
+                    let (_base, token) = self.mod_manager.github_endpoint();
+                    let stem = ModManager::mod_stem(&m.path);
+                    let dest = m
+                        .path
+                        .parent()
+                        .map(|p| p.join(format!(".playground-dl-{}.zip", stem)))
+                        .unwrap_or_else(|| PathBuf::from(".playground-dl.zip"));
+                    let url = info.download_url.clone();
+                    if let Some(mh_id) = info.repo.strip_prefix("modhub:") {
+                        // ModHub's CDN wants the mod page as the
+                        // referer; the GitHub flow doesn't need one.
+                        let page = crate::sources::mod_hub::page_url(mh_id);
+                        let dest2 = dest.clone();
+                        return Task::perform(
+                            async move {
+                                crate::sources::mod_hub::ModHubSource::new()
+                                    .download_to(&url, &page, &dest2)
+                                    .await
+                                    .map(|_| dest2)
+                                    .map_err(|e| e.to_string())
+                            },
+                            move |result| Message::UpdateInstalled(id.clone(), result),
+                        );
+                    }
+                    return Task::perform(
+                        async move {
+                            let src = GithubSource::new(token);
+                            src.download_to(&url, &dest)
+                                .await
+                                .map(|_| dest)
+                                .map_err(|e| e.to_string())
+                        },
+                        move |result| Message::UpdateInstalled(id.clone(), result),
+                    );
+                }
+            }
+            Message::UpdateInstalled(id, result) => {
+                let name = self
+                    .mod_manager
+                    .get_mod(&id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                match result {
+                    Ok(downloaded) => {
+                        match self.mod_manager.replace_mod_file(&id, &downloaded) {
+                            Ok(change) => {
+                                self.update_status.insert(id.clone(), UpdateState::UpToDate);
+                                self.recompute_conflicts();
+                                self.status = format!(
+                                    "Updated {} ({}).",
+                                    name, change
+                                );
+                            }
+                            Err(e) => {
+                                self.status = format!("Installing the update for {} failed: {}", name, e);
+                                self.update_status
+                                    .insert(id, UpdateState::Failed(e.to_string()));
+                            }
+                        }
+                        let _ = std::fs::remove_file(&downloaded);
+                    }
+                    Err(e) => {
+                        self.status = format!("Download for {} failed: {}", name, e);
+                        self.update_status.insert(id, UpdateState::Failed(e));
+                    }
+                }
+                return self.begin_icon_load();
+            }
+            Message::CheckAllUpdates => {
+                // Consult the catalog first so unlinked mods
+                // it knows get checked locally, alongside the
+                // linked mods' live checks.
+                self.status = "Checking the ModHub catalog…".to_string();
+                let url = self.mod_manager.catalog_url();
+                return Task::perform(
+                    async move {
+                        let pairs = match crate::sources::catalog::ensure(&url).await {
+                            Some(cat) => crate::sources::catalog::by_stem(&cat)
+                                .into_iter()
+                                .collect(),
+                            None => Vec::new(),
+                        };
+                        pairs
+                    },
+                    Message::CheckUpdatesCatalogReady,
+                );
+            }
+            Message::CheckUpdatesCatalogReady(catalog_pairs) => {
+                let catalog: std::collections::HashMap<
+                    String,
+                    crate::sources::mod_hub::CatalogEntry,
+                > = catalog_pairs.into_iter().collect();
+                // One job per mod carrying either link kind —
+                // or, for unlinked mods, a catalog entry to
+                // check locally. Each mod is checked against
+                // GitHub first, then ModHub.
+                let mut jobs: Vec<(
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                    Option<crate::sources::mod_hub::CatalogEntry>,
+                )> = Vec::new();
+                for m in self.mod_manager.get_mods() {
+                    let stem = ModManager::mod_stem(&m.path);
+                    let gh = self.mod_manager.mod_link(&stem).map(|s| s.to_string());
+                    let mh = self
+                        .mod_manager
+                        .modhub_link(&stem)
+                        .map(|s| s.to_string());
+                    let cat = if gh.is_none() && mh.is_none() {
+                        catalog.get(&stem).cloned()
+                    } else {
+                        None
+                    };
+                    if gh.is_some() || mh.is_some() || cat.is_some() {
+                        jobs.push((m.id.clone(), gh, mh, stem, m.version.clone(), cat));
+                    }
+                }
+                if jobs.is_empty() {
+                    self.status =
+                        "No mods are linked yet and the catalog doesn't know any of them — open a mod's details and link it to GitHub or ModHub first."
+                            .to_string();
+                } else {
+                    for (id, _, _, _, _, _) in &jobs {
+                        self.update_status.insert(id.clone(), UpdateState::Checking);
+                    }
+                    self.status = format!(
+                        "Checking {} mods for updates…",
+                        jobs.len()
+                    );
+                    let (base, token) = self.mod_manager.github_endpoint();
+                    return Task::perform(
+                        async move {
+                            let mut out = Vec::new();
+                            for (id, gh, mh, stem, current, cat) in jobs {
+                                let result = match cat {
+                                    Some(entry)
+                                        if gh.is_none() && mh.is_none() =>
+                                    {
+                                        Ok(check_catalog_entry(&entry, &current))
+                                    }
+                                    _ => {
+                                        check_any_job(
+                                            base.clone(),
+                                            token.clone(),
+                                            gh,
+                                            mh,
+                                            stem,
+                                            current,
+                                        )
+                                        .await
+                                    }
+                                };
+                                out.push((id, result));
+                            }
+                            out
+                        },
+                        Message::AllUpdatesChecked,
+                    );
+                }
+            }
+            Message::AllUpdatesChecked(results) => {
+                let mut available = 0usize;
+                let mut failed = 0usize;
+                for (id, result) in results {
+                    match result {
+                        Ok(Some(info)) => {
+                            available += 1;
+                            self.update_status.insert(id, UpdateState::Available(info));
+                        }
+                        Ok(None) => {
+                            self.update_status.insert(id, UpdateState::UpToDate);
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            self.update_status.insert(id, UpdateState::Failed(e));
+                        }
+                    }
+                }
+                self.status = format!(
+                    "Update check done — {} available, {} could not be checked.",
+                    available, failed
+                );
+            }
+            Message::DetectModHub => {
+                if !self.detect_jobs.is_empty() {
+                    self.status =
+                        "ModHub detection is already running — watch the counter; every batch is saved as it lands."
+                            .to_string();
+                    return Task::none();
+                }
+                // Consult the catalog first: one download
+                // answers most mods instantly, and only the
+                // stems it doesn't know fall through to live
+                // searching.
+                self.status = "Checking the ModHub catalog…".to_string();
+                let url = self.mod_manager.catalog_url();
+                return Task::perform(
+                    async move {
+                        let pairs = match crate::sources::catalog::ensure(&url).await {
+                            Some(cat) => cat
+                                .mods
+                                .iter()
+                                .map(|e| (e.stem.clone(), e.modhub_id.clone()))
+                                .collect(),
+                            None => Vec::new(),
+                        };
+                        pairs
+                    },
+                    Message::DetectCatalogReady,
+                );
+            }
+            Message::DetectCatalogReady(catalog_pairs) => {
+                if !self.detect_jobs.is_empty() {
+                    return Task::none(); // a pass is already running
+                }
+                let catalog: std::collections::HashMap<String, String> =
+                    catalog_pairs.into_iter().collect();
+                // One job per unique .zip file stem that has no
+                // ModHub link yet: (stem, file name, title).
+                let mut jobs: Vec<(String, String, String)> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for m in self.mod_manager.get_mods() {
+                    let stem = ModManager::mod_stem(&m.path);
+                    if self.mod_manager.modhub_link(&stem).is_some()
+                        || !seen.insert(stem.clone())
+                    {
+                        continue;
+                    }
+                    let Some(file_name) = m
+                        .path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                    else {
+                        continue;
+                    };
+                    if !file_name.to_lowercase().ends_with(".zip") {
+                        continue;
+                    }
+                    jobs.push((stem, file_name, m.name.clone()));
+                }
+                if jobs.is_empty() {
+                    self.status =
+                        "Every .zip mod already has a ModHub link — nothing to detect."
+                            .to_string();
+                    return Task::none();
+                }
+                // Catalog hits link instantly, no searching.
+                let total = jobs.len();
+                let mut instant = 0usize;
+                let mut live: Vec<(String, String, String)> = Vec::new();
+                for (stem, file_name, title) in jobs {
+                    match catalog.get(&stem) {
+                        Some(id) => {
+                            let _ = self
+                                .mod_manager
+                                .set_modhub_link(&stem, Some(id.clone()));
+                            instant += 1;
+                        }
+                        None => live.push((stem, file_name, title)),
+                    }
+                }
+                if live.is_empty() {
+                    self.status = format!(
+                        "ModHub auto-detect done — all {} mods linked from the catalog, no live searching needed. Run Check for updates to see what's newer.",
+                        instant
+                    );
+                    return Task::none();
+                }
+                self.detect_total = total;
+                self.detect_done = instant;
+                self.detect_found = instant;
+                self.detect_missed = 0;
+                self.detect_jobs = live;
+                self.status = format!(
+                    "Detecting ModHub links — {} of {} checked ({} linked instantly from the catalog). Links save every batch, so closing the app loses nothing.",
+                    self.detect_done, self.detect_total, instant
+                );
+                return self.next_detect_batch();
+            }
+            Message::DetectBatchDone {
+                found,
+                missed,
+                processed,
+            } => {
+                // Save this batch's links immediately, tally,
+                // drop the processed jobs, and chain the next
+                // batch (or finish).
+                for (stem, id) in &found {
+                    let _ = self.mod_manager.set_modhub_link(stem, Some(id.clone()));
+                }
+                self.detect_found += found.len();
+                self.detect_missed += missed;
+                self.detect_done += processed;
+                self.detect_jobs.drain(..processed.min(self.detect_jobs.len()));
+                if self.detect_jobs.is_empty() {
+                    self.status = format!(
+                        "ModHub auto-detect done — {} mods linked, {} not found on ModHub. Run Check for updates to see what's newer.",
+                        self.detect_found, self.detect_missed
+                    );
+                    self.detect_total = 0;
+                    self.detect_done = 0;
+                } else {
+                    self.status = format!(
+                        "Detecting ModHub links — {} of {} checked, {} linked so far…",
+                        self.detect_done, self.detect_total, self.detect_found
+                    );
+                    return self.next_detect_batch();
+                }
+            }
+            Message::ModHubLinksDetected { .. } => {
+                // Superseded by the chunked batch flow; kept so
+                // older in-flight tasks land harmlessly.
+            }
             Message::SearchChanged(query) => self.search_query = query,
             Message::LibraryFilter(view) => {
                 self.current_tab = Tab::Browse;
@@ -399,6 +850,19 @@ impl App {
                 if self.just_toggled_favorite {
                     self.just_toggled_favorite = false;
                 } else {
+                    if let Some(m) = self.mod_manager.get_mod(&id) {
+                        let stem = ModManager::mod_stem(&m.path);
+                        self.link_input = self
+                            .mod_manager
+                            .mod_link(&stem)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        self.modhub_input = self
+                            .mod_manager
+                            .modhub_link(&stem)
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                    }
                     self.selected_mod = Some(id);
                 }
             }
@@ -759,12 +1223,17 @@ impl App {
                     let fav = self.mod_manager.is_favorite(&m.favorite_key());
                     let selected = self.selected_mod.as_deref() == Some(m.id.as_str());
                     let conflict = self.mod_has_conflict(&m.name);
+                    let update_available = matches!(
+                        self.update_status.get(&m.id),
+                        Some(crate::ui::components::update_types::UpdateState::Available(_))
+                    );
                     r = r.push(mod_card(
                         m,
                         self.icons.get(&m.id),
                         fav,
                         selected,
                         conflict,
+                        update_available,
                         card_w,
                         CARD_H,
                     ));
@@ -866,6 +1335,74 @@ impl App {
                 .width(Length::Fill)
                 .on_press(Message::ToggleFavorite(m.id.clone())),
         );
+
+        // Updates (GitHub): link this mod to its repo, check the
+        // latest release, and install over the old file in place.
+        let stem = ModManager::mod_stem(&m.path);
+        let linked = self.mod_manager.mod_link(&stem).map(|s| s.to_string());
+        col = col.push(text("Updates (GitHub):").size(13));
+        col = col.push(
+            row![
+                text_input("owner/repo or repo URL", &self.link_input)
+                    .on_input(Message::LinkInputChanged)
+                    .size(13),
+                button(text(if linked.is_some() { "Save link" } else { "Link" }).size(13))
+                    .on_press(Message::SaveModLink(m.id.clone())),
+            ]
+            .spacing(6),
+        );
+        // Updates (ModHub): link by page URL or numeric mod_id.
+        // The check button below serves both sources.
+        let mh_linked = self
+            .mod_manager
+            .modhub_link(&stem)
+            .map(|s| s.to_string());
+        col = col.push(text("Updates (ModHub):").size(13));
+        col = col.push(
+            row![
+                text_input("ModHub page URL or mod id", &self.modhub_input)
+                    .on_input(Message::ModHubInputChanged)
+                    .size(13),
+                button(text(if mh_linked.is_some() { "Save link" } else { "Link" }).size(13))
+                    .on_press(Message::SaveModHubLink(m.id.clone())),
+            ]
+            .spacing(6),
+        );
+        if linked.is_some() || mh_linked.is_some() {
+            let state_line = match self.update_status.get(&m.id) {
+                Some(UpdateState::Checking) => "Checking for updates…".to_string(),
+                Some(UpdateState::UpToDate) => "Up to date.".to_string(),
+                Some(UpdateState::Available(info)) => {
+                    format!("Update available: {} ({})", info.version, info.tag)
+                }
+                Some(UpdateState::Installing) => "Downloading and installing…".to_string(),
+                Some(UpdateState::Failed(e)) => format!("Check failed: {}", e),
+                None => "Not checked yet.".to_string(),
+            };
+            col = col.push(text(state_line).size(12));
+            col = col.push(
+                button(text("Check for update"))
+                    .width(Length::Fill)
+                    .on_press(Message::CheckUpdate(m.id.clone())),
+            );
+            if let Some(UpdateState::Available(info)) = self.update_status.get(&m.id) {
+                let label = format!("Download && install v{}", info.version);
+                col = col.push(
+                    button(text(label))
+                        .width(Length::Fill)
+                        .on_press(Message::InstallUpdate(m.id.clone())),
+                );
+            }
+            if m.mod_type != crate::mod_manager::types::ModType::Zip {
+                col = col.push(
+                    text("Update installs work on .zip mods; this is a folder mod.").size(12),
+                );
+            }
+        } else {
+            col = col.push(
+                text("Link this mod to its GitHub repo to check it for updates.").size(12),
+            );
+        }
         if m.state == ModState::Active {
             col = col.push(
                 button(text("Move to Archive"))
@@ -1531,7 +2068,7 @@ impl App {
             ),
             Space::with_height(Length::Fill),
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
-            text("V1.0.2  © 2026 Farmer Jay.")
+            text("V1.0.3  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -1564,10 +2101,67 @@ impl App {
             .into()
     }
 
+    /// Kick off the next chunk of the ModHub detection pass:
+    /// up to 25 mods, checked with the shared finder. The
+    /// DetectBatchDone handler saves the batch's links and
+    /// chains the next chunk, so progress is never lost.
+    fn next_detect_batch(&mut self) -> Task<Message> {
+        // Small batches on purpose: the counter ticks every
+        // few seconds, so the pass visibly breathes instead of
+        // sitting at 0 while a big batch chews.
+        const BATCH: usize = 8;
+        let batch: Vec<(String, String, String)> =
+            self.detect_jobs.iter().take(BATCH).cloned().collect();
+        if batch.is_empty() {
+            return Task::none();
+        }
+        Task::perform(
+            async move {
+                // Several mods in flight at once (narrow
+                // per-mod candidate width keeps the total
+                // request pressure browser-like), tallied per
+                // group so partial progress still reports.
+                let src = crate::sources::mod_hub::ModHubSource::new();
+                let mut found = Vec::new();
+                let mut missed = 0usize;
+                for group in batch.chunks(4) {
+                    let results = futures::future::join_all(
+                        group
+                            .iter()
+                            .map(|(stem, file_name, title)| {
+                                let src = &src;
+                                async move {
+                                    (
+                                        stem.clone(),
+                                        src.find_mod_id(file_name, title, 2).await,
+                                    )
+                                }
+                            }),
+                    )
+                    .await;
+                    for (stem, res) in results {
+                        match res {
+                            Ok(Some(id)) => found.push((stem, id)),
+                            _ => missed += 1,
+                        }
+                    }
+                }
+                (found, missed, batch.len())
+            },
+            |(found, missed, processed)| Message::DetectBatchDone {
+                found,
+                missed,
+                processed,
+            },
+        )
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let header = row![
             text("FS Mod Manager").size(24),
             Space::with_width(Length::Fill),
+            button(text("Detect ModHub links")).on_press(Message::DetectModHub),
+            button(text("Check for updates")).on_press(Message::CheckAllUpdates),
             button(text("Rescan")).on_press(Message::Scan),
             button(text("Exit")).on_press(Message::Exit),
         ]
@@ -1611,6 +2205,121 @@ impl App {
             _ => None,
         })
     }
+}
+
+/// One GitHub update check: the repo's latest release, resolved
+/// to an installable update when it is newer than the mod's
+/// current version. Ok(None) means "no update" (no releases, or
+/// already current); a newer release with no .zip asset is an
+/// error the user should see, not a silent "up to date".
+async fn check_with(
+    src: &GithubSource,
+    base: &str,
+    repo: &str,
+    stem: &str,
+    current: &str,
+) -> Result<Option<UpdateInfo>, String> {
+    let release = src
+        .latest_release(base, repo)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(release) = release else {
+        return Ok(None);
+    };
+    if !crate::sources::github::is_newer(&release.version, current) {
+        return Ok(None);
+    }
+    match crate::sources::github::pick_asset(&release, stem) {
+        Some(asset) => Ok(Some(UpdateInfo {
+            version: release.version.clone(),
+            tag: release.tag.clone(),
+            download_url: asset.browser_download_url.clone(),
+            asset_name: asset.name.clone(),
+            repo: repo.to_string(),
+        })),
+        None => Err(format!(
+            "Release {} is newer but has no .zip asset to install",
+            release.tag
+        )),
+    }
+}
+
+/// One ModHub update check: the mod's page, resolved to an
+/// installable update when ModHub's version is newer than the
+/// mod's current version. Ok(None) means "no update" (page
+/// gone, or already current). The UpdateInfo's repo carries a
+/// "modhub:" prefix so the install step knows to download with
+/// the mod page as referer.
+async fn check_modhub_with(
+    src: &crate::sources::mod_hub::ModHubSource,
+    mod_id: &str,
+    current: &str,
+) -> Result<Option<UpdateInfo>, String> {
+    let info = src
+        .fetch_info(mod_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(info) = info else {
+        return Ok(None);
+    };
+    if !crate::sources::github::is_newer(&info.version, current) {
+        return Ok(None);
+    }
+    Ok(Some(UpdateInfo {
+        version: info.version.clone(),
+        tag: "ModHub".to_string(),
+        download_url: info.download_url.clone(),
+        asset_name: info.file_name.clone(),
+        repo: format!("modhub:{}", mod_id),
+    }))
+}
+
+/// One catalog update check: purely local — the catalog
+/// entry's version against the mod's current version. The
+/// UpdateInfo points at the entry's own download URL with the
+/// usual "modhub:" repo marker, so installing works exactly
+/// like a live-checked ModHub update (the install step
+/// re-reads the mod's page before downloading).
+fn check_catalog_entry(
+    entry: &crate::sources::mod_hub::CatalogEntry,
+    current: &str,
+) -> Option<UpdateInfo> {
+    if !crate::sources::github::is_newer(&entry.version, current) {
+        return None;
+    }
+    Some(UpdateInfo {
+        version: entry.version.clone(),
+        tag: "ModHub".to_string(),
+        download_url: entry.download_url.clone(),
+        asset_name: entry.file_name.clone(),
+        repo: format!("modhub:{}", entry.modhub_id),
+    })
+}
+
+/// Background-task wrapper for one mod's combined update
+/// check: GitHub first when linked, then ModHub; the first
+/// source reporting an update wins.
+async fn check_any_job(
+    base: String,
+    token: Option<String>,
+    gh_repo: Option<String>,
+    mh_id: Option<String>,
+    stem: String,
+    current: String,
+) -> Result<Option<UpdateInfo>, String> {
+    if let Some(repo) = &gh_repo {
+        let src = GithubSource::new(token.clone());
+        if let Some(info) = check_with(&src, &base, repo, &stem, &current).await? {
+            return Ok(Some(info));
+        }
+    }
+    if let Some(id) = &mh_id {
+        let src = crate::sources::mod_hub::ModHubSource::new();
+        if let Some(info) = check_modhub_with(&src, id, &current).await? {
+            return Ok(Some(info));
+        }
+    }
+    Ok(None)
 }
 
 fn to_handle(icon: LoadedIcon) -> ImageHandle {

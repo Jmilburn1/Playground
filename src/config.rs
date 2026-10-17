@@ -51,6 +51,26 @@ pub struct Settings {
     /// the Settings tab. Powers the console on/off toggle.
     #[serde(default)]
     pub game_directory: Option<PathBuf>,
+    /// Update-check links (GitHub): mod file stem (lowercase, no
+    /// .zip) -> "owner/repo". Set per mod in the details panel;
+    /// keyed by stem so the link survives moves and version bumps.
+    #[serde(default)]
+    pub mod_links: std::collections::HashMap<String, String>,
+    /// Update-check links (GIANTS ModHub): mod file stem ->
+    /// ModHub mod_id (digits). Same keying as the GitHub links.
+    #[serde(default)]
+    pub modhub_links: std::collections::HashMap<String, String>,
+    /// The published ModHub catalog the app reads update and
+    /// link answers from (see sources::catalog). Defaults to
+    /// the production catalog; empty disables fetching (a
+    /// previously downloaded cache is still used).
+    #[serde(default = "default_catalog_url")]
+    pub catalog_url: String,
+}
+
+/// Serde default for Settings::catalog_url.
+fn default_catalog_url() -> String {
+    crate::sources::catalog::DEFAULT_CATALOG_URL.to_string()
 }
 
 /// Expand a leading `~` in a configured path. Configs written by other
@@ -157,6 +177,9 @@ impl Config {
                 favorites: Vec::new(),
                 save_loadouts: std::collections::HashMap::new(),
                 game_directory: None,
+                mod_links: std::collections::HashMap::new(),
+                modhub_links: std::collections::HashMap::new(),
+                catalog_url: crate::sources::catalog::DEFAULT_CATALOG_URL.to_string(),
             },
         }
     }
