@@ -6,6 +6,7 @@ use crate::mod_manager::types::{Mod, ModState};
 use crate::mod_manager::ModManager;
 use crate::sources::github::GithubSource;
 use crate::ui::components::update_types::{UpdateInfo, UpdateState};
+use crate::update_db::{self, UpdateRow};
 use crate::ui::components::{
     format_size, mod_card, BrowseView, FolderTarget, LogKind, LogLine, LogOutcome,
     Message, ScanOutcome, Tab,
@@ -68,6 +69,20 @@ pub struct App {
     /// Update checks (GitHub): per-mod check state by mod id, and
     /// the details panel's repo link field.
     update_status: HashMap<String, UpdateState>,
+    /// Update database (the reader): rows by stem, read
+    /// silently from updates.json at every scan load — the
+    /// launch answers come from the last fill, never from a
+    /// click-time crawl. No database file yet = no rows, and
+    /// the app simply has nothing to present.
+    db_rows: HashMap<String, UpdateRow>,
+    db_generated_at: Option<u64>,
+    db_summary: update_db::DbSummary,
+    /// Mod ids whose current update state came from the
+    /// database. A rescan re-applies the database, and this
+    /// set keeps that from overwriting a fresher live-check
+    /// result from the same session — every live handler
+    /// removes its id from the set when it writes a state.
+    db_applied: HashSet<String>,
     link_input: String,
     modhub_input: String,
     /// Chunked ModHub detection pass state: remaining
@@ -122,6 +137,10 @@ impl App {
             log_errors_only: false,
             log_note: String::new(),
             update_status: HashMap::new(),
+            db_rows: HashMap::new(),
+            db_generated_at: None,
+            db_summary: update_db::DbSummary::default(),
+            db_applied: HashSet::new(),
             link_input: String::new(),
             modhub_input: String::new(),
             detect_jobs: Vec::new(),
@@ -145,6 +164,106 @@ impl App {
             async move { scan_job(archive, active, parallel) },
             Message::ScanLoaded,
         )
+    }
+
+    /// Read the personal update database and present it —
+    /// silently, locally, in milliseconds, with no network.
+    /// Runs at every scan load, so a fill that lands while
+    /// the app is open is picked up on the next rescan.
+    ///
+    /// Rows are judged against the versions actually on disk
+    /// right now, not the versions the fill recorded. A row
+    /// whose source offers more becomes an installable
+    /// UpdateState built from the row (the existing install
+    /// flow consumes it unchanged — the "modhub:" repo marker
+    /// tells it to download with the mod page as referer).
+    /// Downgrade-blocked rows are NEVER turned into an offer:
+    /// no state, no pill, no button — the details panel reads
+    /// the row itself and explains the block.
+    fn apply_update_db(&mut self) {
+        let Some(db) = update_db::load_default() else {
+            self.db_rows.clear();
+            self.db_generated_at = None;
+            self.db_summary = update_db::DbSummary::default();
+            self.db_applied.clear();
+            return;
+        };
+        self.db_generated_at = Some(db.generated_at);
+        self.db_rows = db
+            .rows
+            .iter()
+            .map(|r| (r.stem.clone(), r.clone()))
+            .collect();
+        let installed: HashMap<String, String> = self
+            .mod_manager
+            .get_mods()
+            .iter()
+            .map(|m| (ModManager::mod_stem(&m.path), m.version.clone()))
+            .collect();
+        self.db_summary = update_db::summarize(&db, &installed);
+        for m in self.mod_manager.get_mods() {
+            if self.update_status.contains_key(&m.id)
+                && !self.db_applied.contains(&m.id)
+            {
+                continue; // a live result from this session stands
+            }
+            let stem = ModManager::mod_stem(&m.path);
+            let Some(row) = self.db_rows.get(&stem).cloned() else {
+                continue;
+            };
+            match update_db::status_of(&m.version, row.latest_version.as_deref()) {
+                "update_available" => {
+                    if let (Some(latest), Some(url)) =
+                        (row.latest_version.clone(), row.download_url.clone())
+                    {
+                        let (repo, tag) = if row.source_kind == "modhub" {
+                            (
+                                format!(
+                                    "modhub:{}",
+                                    row.file_id.clone().unwrap_or_default()
+                                ),
+                                "ModHub".to_string(),
+                            )
+                        } else {
+                            (
+                                row.source_ref.clone().unwrap_or_default(),
+                                format!("v{}", latest),
+                            )
+                        };
+                        self.update_status.insert(
+                            m.id.clone(),
+                            UpdateState::Available(UpdateInfo {
+                                version: latest,
+                                tag,
+                                download_url: url,
+                                asset_name: row.file_name.clone(),
+                                repo,
+                            }),
+                        );
+                        self.db_applied.insert(m.id.clone());
+                    } else {
+                        // The database knows a newer version
+                        // exists but recorded no downloadable
+                        // asset for it — visible in the details
+                        // panel via the row, never a dead button.
+                        self.update_status.remove(&m.id);
+                        self.db_applied.remove(&m.id);
+                    }
+                }
+                "up_to_date" => {
+                    self.update_status
+                        .insert(m.id.clone(), UpdateState::UpToDate);
+                    self.db_applied.insert(m.id.clone());
+                }
+                _ => {
+                    // ahead_blocked / unknown: no state, no
+                    // pill, no offer. The details panel reads
+                    // the row and says why.
+                    self.update_status.remove(&m.id);
+                    self.db_applied.remove(&m.id);
+                }
+            }
+        }
     }
 
     fn begin_icon_load(&self) -> Task<Message> {
@@ -300,6 +419,9 @@ impl App {
                             .collect(),
                     );
                     self.conflicts = outcome.conflicts;
+                    // The reader: present the update database
+                    // against the library just loaded.
+                    self.apply_update_db();
                     if let Some(id) = &self.selected_mod {
                         if self.mod_manager.get_mod(id).is_none() {
                             self.selected_mod = None;
@@ -327,6 +449,13 @@ impl App {
                     self.mod_manager.get_mods().len(),
                     self.conflicts.len()
                 );
+                if let Some(when) = self.db_generated_at {
+                    self.status += &format!(
+                        " Update database: {} updates available (filled {}).",
+                        self.db_summary.updates,
+                        fmt_time(when)
+                    );
+                }
                 if let Some(note) = self.pending_status.take() {
                     self.status = note;
                 }
@@ -465,6 +594,7 @@ impl App {
                     let gh = self.mod_manager.mod_link(&stem).map(|s| s.to_string());
                     let mh = self.mod_manager.modhub_link(&stem).map(|s| s.to_string());
                     if gh.is_some() || mh.is_some() {
+                        self.db_applied.remove(&id);
                         self.update_status.insert(id.clone(), UpdateState::Checking);
                         let (base, token) = self.mod_manager.github_endpoint();
                         let current = m.version.clone();
@@ -478,6 +608,7 @@ impl App {
                 }
             }
             Message::UpdateChecked(id, result) => {
+                self.db_applied.remove(&id);
                 let name = self
                     .mod_manager
                     .get_mod(&id)
@@ -509,6 +640,7 @@ impl App {
                 if let (Some(info), Some(m)) =
                     (info, self.mod_manager.get_mod(&id).cloned())
                 {
+                    self.db_applied.remove(&id);
                     self.update_status.insert(id.clone(), UpdateState::Installing);
                     self.status = format!("Downloading {} v{}…", m.name, info.version);
                     let (_base, token) = self.mod_manager.github_endpoint();
@@ -548,6 +680,7 @@ impl App {
                 }
             }
             Message::UpdateInstalled(id, result) => {
+                self.db_applied.remove(&id);
                 let name = self
                     .mod_manager
                     .get_mod(&id)
@@ -637,6 +770,7 @@ impl App {
                             .to_string();
                 } else {
                     for (id, _, _, _, _, _) in &jobs {
+                        self.db_applied.remove(id);
                         self.update_status.insert(id.clone(), UpdateState::Checking);
                     }
                     self.status = format!(
@@ -678,6 +812,7 @@ impl App {
                 let mut available = 0usize;
                 let mut failed = 0usize;
                 for (id, result) in results {
+                    self.db_applied.remove(&id);
                     match result {
                         Ok(Some(info)) => {
                             available += 1;
@@ -1340,6 +1475,62 @@ impl App {
         // latest release, and install over the old file in place.
         let stem = ModManager::mod_stem(&m.path);
         let linked = self.mod_manager.mod_link(&stem).map(|s| s.to_string());
+        // Update database: what the last fill recorded for
+        // this mod — its source and the version direction,
+        // read straight from the row. This is the substance
+        // behind the card's pill; the downgrade block shows
+        // here as an explanation, never as an offer.
+        if let Some(row) = self.db_rows.get(&stem) {
+            col = col.push(text("Update database:").size(13));
+            let source_line = match row.source_kind.as_str() {
+                "modhub" => match &row.file_id {
+                    Some(fid) => format!("Source: ModHub (mod {})", fid),
+                    None => "Source: ModHub".to_string(),
+                },
+                "github" => format!(
+                    "Source: GitHub — {}",
+                    row.source_ref.clone().unwrap_or_default()
+                ),
+                _ => "Source: none recorded".to_string(),
+            };
+            col = col.push(text(source_line).size(12));
+            if let Some(latest) = &row.latest_version {
+                col = col.push(
+                    text(format!(
+                        "Installed v{} → latest v{}",
+                        m.version, latest
+                    ))
+                    .size(12),
+                );
+                let note = match update_db::status_of(&m.version, Some(latest.as_str())) {
+                    "update_available" => {
+                        "Update available (from the database)."
+                    }
+                    "ahead_blocked" => {
+                        "Installed is newer than the source — update blocked; a downgrade is never offered."
+                    }
+                    "up_to_date" => "Up to date (per the database).",
+                    _ => "",
+                };
+                if !note.is_empty() {
+                    col = col.push(text(note).size(12));
+                }
+                if update_db::is_changed(row) {
+                    col = col.push(
+                        text("Latest version changed at the last fill.").size(12),
+                    );
+                }
+            } else if row.source_kind != "none" {
+                col = col.push(
+                    text("Source recorded; no version on file yet.").size(12),
+                );
+            }
+            if let Some(when) = self.db_generated_at {
+                col = col.push(
+                    text(format!("Database filled {}.", fmt_time(when))).size(12),
+                );
+            }
+        }
         col = col.push(text("Updates (GitHub):").size(13));
         col = col.push(
             row![
@@ -1393,6 +1584,31 @@ impl App {
                         .on_press(Message::InstallUpdate(m.id.clone())),
                 );
             }
+            if m.mod_type != crate::mod_manager::types::ModType::Zip {
+                col = col.push(
+                    text("Update installs work on .zip mods; this is a folder mod.").size(12),
+                );
+            }
+        } else if let Some(UpdateState::Available(info)) =
+            self.update_status.get(&m.id)
+        {
+            // Not linked by hand, but the update database
+            // knows this mod's source and a newer version —
+            // the install runs off the database row.
+            let info = info.clone();
+            col = col.push(
+                text(format!(
+                    "Update available: {} ({}) — from the update database",
+                    info.version, info.tag
+                ))
+                .size(12),
+            );
+            let label = format!("Download && install v{}", info.version);
+            col = col.push(
+                button(text(label))
+                    .width(Length::Fill)
+                    .on_press(Message::InstallUpdate(m.id.clone())),
+            );
             if m.mod_type != crate::mod_manager::types::ModType::Zip {
                 col = col.push(
                     text("Update installs work on .zip mods; this is a folder mod.").size(12),
@@ -2036,6 +2252,19 @@ impl App {
                 })
                 .on_press(Message::TabSelected(tab))
         };
+        // The reader's glance: what the update database says,
+        // stamped with the fill that produced it. Nothing at
+        // all until a first fill has landed.
+        let db_line: Element<'_, Message> = match self.db_generated_at {
+            Some(when) => text(format!(
+                "Updates available: {}\n(from the database, filled {})",
+                self.db_summary.updates,
+                fmt_time(when)
+            ))
+            .size(12)
+            .into(),
+            None => Space::with_height(0).into(),
+        };
         let total_size: u64 = all.iter().map(|m| m.size).sum();
 
         let content = column![
@@ -2067,8 +2296,9 @@ impl App {
                 BrowseView::Category("Scripts".to_string())
             ),
             Space::with_height(Length::Fill),
+            db_line,
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
-            text("V1.0.3  © 2026 Farmer Jay.")
+            text("V1.1.0  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -2320,6 +2550,18 @@ async fn check_any_job(
         }
     }
     Ok(None)
+}
+
+/// "Oct 18, 11:31 AM" — a database fill time the way John
+/// reads clocks: 12-hour, local.
+fn fmt_time(secs: u64) -> String {
+    match chrono::DateTime::from_timestamp(secs as i64, 0) {
+        Some(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%b %d, %I:%M %p")
+            .to_string(),
+        None => "an unknown time".to_string(),
+    }
 }
 
 fn to_handle(icon: LoadedIcon) -> ImageHandle {

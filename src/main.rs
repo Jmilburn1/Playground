@@ -9,6 +9,7 @@
 mod mod_manager;
 mod scanner;
 mod sources;
+mod update_db;
 mod config;
 mod ui;
 
@@ -268,6 +269,16 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                 });
             }
         }
+        Some("db-fill") => {
+            // The one swipe: fill the personal update
+            // database (scan facts + catalog join + link
+            // polls) and write updates.json beside the
+            // catalog cache. Built to run scheduled and
+            // unattended; the summary also lands in
+            // updates-summary.txt next to the database.
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(async { crate::update_db::fill(mod_manager).await })?;
+        }
         Some("update") => {
             let Some(stem) = args.get(1).map(|s| s.to_lowercase()) else {
                 println!("Usage: cli update <mod file stem>");
@@ -485,8 +496,20 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
             // static catalog JSON. Merging makes runs resumable
             // and incremental — ids already catalogued are
             // skipped unless --refresh is given.
+            //
+            // --full is the COMPLETE WALK (John, 2026-10-18):
+            // walk every listing page to the very end with no
+            // early stop, and fetch the page of EVERY mod the
+            // listings show — not just the new ones — so each
+            // record ends up carrying all four searched tags
+            // (id, download link, filename, Released date)
+            // plus its version, and the run can report the
+            // complete-list diff: how many mods ModHub has,
+            // how many were missing from the catalog, and how
+            // many catalogued ids the walk never saw (delisted
+            // candidates; their records are kept, not deleted).
             let Some(out) = args.get(1) else {
-                println!("Usage: cli catalog-build <catalog.json> [--pages N] [--max N] [--ids 123,456] [--stale DAYS] [--refresh]");
+                println!("Usage: cli catalog-build <catalog.json> [--pages N] [--max N] [--ids 123,456] [--stale DAYS] [--refresh] [--full]");
                 return Ok(());
             };
             let out_path = std::path::Path::new(out);
@@ -494,6 +517,7 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
             let mut max: Option<usize> = None;
             let mut ids_arg: Option<Vec<String>> = None;
             let mut refresh = false;
+            let mut full = false;
             let mut stale_days: u64 = 7;
             let mut it = args.iter().skip(2).peekable();
             while let Some(a) = it.next() {
@@ -514,6 +538,7 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                         })
                     }
                     "--refresh" => refresh = true,
+                    "--full" => full = true,
                     _ => {}
                 }
             }
@@ -536,9 +561,17 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let mut todo_ids: Vec<String> = Vec::new();
+            // The complete list, when the listing walk runs:
+            // every mod_id ModHub showed, in walk order. The
+            // --full report diffs this against the catalog.
+            let mut walk_ids: Vec<String> = Vec::new();
+            // True only when the walk reached an empty listing
+            // page — the natural end — rather than stopping at
+            // a failed page or the --pages cap.
+            let mut walk_complete = false;
             if let Some(list) = ids_arg {
                 for id in list {
-                    if refresh || !known.contains(&id) {
+                    if full || refresh || !known.contains(&id) {
                         todo_ids.push(id);
                     }
                 }
@@ -550,15 +583,26 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                     match runtime.block_on(src.listing_ids(page)) {
                         Ok(ids) => {
                             if ids.is_empty() {
+                                walk_complete = true;
                                 break;
                             }
                             let mut new_to_catalog = 0usize;
                             for id in ids {
-                                if seen.insert(id.clone())
-                                    && !known.contains(&id)
-                                {
-                                    new_to_catalog += 1;
-                                    todo_ids.push(id);
+                                if seen.insert(id.clone()) {
+                                    walk_ids.push(id.clone());
+                                    if !known.contains(&id) {
+                                        new_to_catalog += 1;
+                                    }
+                                    // A normal walk queues only
+                                    // ids the catalog lacks. A
+                                    // --full walk queues EVERY id
+                                    // it sees: every mod page gets
+                                    // re-fetched, so every record
+                                    // is re-verified and gains its
+                                    // Released date.
+                                    if full || !known.contains(&id) {
+                                        todo_ids.push(id);
+                                    }
                                 }
                             }
                             println!(
@@ -569,8 +613,10 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                             );
                             // Listings are newest-first: once a
                             // whole page is already catalogued,
-                            // deeper pages only get older.
-                            if new_to_catalog == 0 && !refresh {
+                            // deeper pages only get older. A
+                            // --full walk never stops early — the
+                            // complete list is the whole point.
+                            if new_to_catalog == 0 && !refresh && !full {
                                 break;
                             }
                         }
@@ -599,6 +645,12 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
             }
             if todo_ids.is_empty() {
                 println!("Nothing to fetch — the catalog already covers the requested ids.");
+                if full && !walk_ids.is_empty() {
+                    println!(
+                        "WARNING (--full): the walk saw {} mods but queued none — the report would be empty. That is not a complete walk.",
+                        walk_ids.len()
+                    );
+                }
             } else {
                 println!(
                     "Fetching {} mod pages (four at a time, politely)…",
@@ -631,6 +683,7 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                                         modhub_id: id.clone(),
                                         version: info.version.clone(),
                                         download_url: info.download_url.clone(),
+                                        released: info.released.clone(),
                                         checked_at: now_secs,
                                     },
                                 );
@@ -650,6 +703,29 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                     if done % 100 < 4 || done == todo_ids.len() {
                         println!("  …{} of {} fetched", done, todo_ids.len());
                     }
+                    // Checkpoint every 500 fetched pages: a full
+                    // walk runs about an hour, and a run killed
+                    // by a dropped connection or a closed laptop
+                    // must not lose everything since the start.
+                    // The catalog on disk stays a valid merge of
+                    // everything fetched so far; re-running the
+                    // same command picks up from there.
+                    if done % 500 < 4 || done == todo_ids.len() {
+                        let mut snapshot: Vec<crate::sources::mod_hub::CatalogEntry> =
+                            by_id.values().cloned().collect();
+                        snapshot.sort_by(|a, b| a.stem.cmp(&b.stem));
+                        let checkpoint = crate::sources::mod_hub::Catalog {
+                            format: 1,
+                            generated_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
+                            mods: snapshot,
+                        };
+                        if let Err(e) = checkpoint.save(out_path) {
+                            println!("  (checkpoint save failed: {})", e);
+                        }
+                    }
                     runtime.block_on(async {
                         tokio::time::sleep(std::time::Duration::from_millis(80)).await
                     });
@@ -668,6 +744,107 @@ fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<()> 
                     recorded,
                     failed
                 );
+                if full {
+                    // The complete-list report: what ModHub has,
+                    // what the catalog had, and what this walk
+                    // left outstanding. Written beside the
+                    // catalog as well as printed, so an
+                    // unattended run leaves a receipt.
+                    let walk_set: std::collections::HashSet<&String> =
+                        walk_ids.iter().collect();
+                    let new_ids: Vec<&String> = walk_ids
+                        .iter()
+                        .filter(|id| !known.contains(*id))
+                        .collect();
+                    let final_released: std::collections::HashMap<&str, &str> =
+                        catalog
+                            .mods
+                            .iter()
+                            .map(|e| (e.modhub_id.as_str(), e.released.as_str()))
+                            .collect();
+                    let still_missing: Vec<&String> = walk_ids
+                        .iter()
+                        .filter(|id| {
+                            final_released
+                                .get(id.as_str())
+                                .map(|r| r.is_empty())
+                                .unwrap_or(true)
+                        })
+                        .collect();
+                    let not_seen: Vec<&String> = known
+                        .iter()
+                        .filter(|id| !walk_set.contains(id))
+                        .collect();
+                    let with_date = catalog
+                        .mods
+                        .iter()
+                        .filter(|e| !e.released.is_empty())
+                        .count();
+                    let mut report = String::new();
+                    report.push_str("Playground complete-walk report (--full)\n");
+                    report.push_str(&format!("Catalog file: {}\n", out));
+                    report.push_str(&format!(
+                        "Walk reached the end of the listings: {}\n",
+                        if walk_complete { "yes" } else { "NO — the walk stopped early, this list is incomplete" }
+                    ));
+                    report.push_str(&format!(
+                        "Mods on ModHub (ids seen in the walk): {}\n",
+                        walk_ids.len()
+                    ));
+                    report.push_str(&format!(
+                        "New to the catalog in this walk: {}\n",
+                        new_ids.len()
+                    ));
+                    report.push_str(&format!(
+                        "Catalog records now carrying a Released date: {} of {}\n",
+                        with_date,
+                        catalog.mods.len()
+                    ));
+                    report.push_str(&format!(
+                        "Walked mods still missing a record/date after the fetch: {}\n",
+                        still_missing.len()
+                    ));
+                    report.push_str(&format!(
+                        "Catalogued ids the walk did NOT see (delisted candidates — records kept, not deleted): {}\n",
+                        not_seen.len()
+                    ));
+                    report.push_str(&format!(
+                        "New ids: {}\n",
+                        new_ids
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                    report.push_str(&format!(
+                        "Still-missing ids: {}\n",
+                        still_missing
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                    report.push_str(&format!(
+                        "Not-seen ids: {}\n",
+                        not_seen
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                    print!("\n{}", report);
+                    let report_path = out_path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(|p| p.join("catalog-full-report.txt"))
+                        .unwrap_or_else(|| {
+                            std::path::PathBuf::from("catalog-full-report.txt")
+                        });
+                    match std::fs::write(&report_path, &report) {
+                        Ok(_) => println!("Report written to {:?}", report_path),
+                        Err(e) => println!("Could not write the report file: {}", e),
+                    }
+                }
             }
         }
         Some("help") | _ => {
@@ -864,7 +1041,8 @@ fn print_help() {
     println!("  cli update <stem> - Download and install the linked mod's latest version");
     println!("  cli detect-modhub [limit] - Auto-link mods to ModHub by verified filename match");
     println!("  cli catalog-fetch - Download/refresh the published ModHub catalog into the local cache");
-    println!("  cli catalog-build <catalog.json> [--pages N] [--max N] [--ids a,b] [--refresh] - Build/refresh the static ModHub catalog");
+    println!("  cli catalog-build <catalog.json> [--pages N] [--max N] [--ids a,b] [--refresh] [--full] - Build/refresh the static ModHub catalog (--full: complete walk — every listing page, every mod page, adds Released dates, writes catalog-full-report.txt)");
+    println!("  cli db-fill - Fill the personal update database (updates.json): scan + catalog join + link polls, in one swipe");
     println!("  cli help - Show this help");
     println!("  (no args) - Launch GUI");
 }

@@ -178,6 +178,16 @@ pub struct CatalogEntry {
     pub version: String,
     /// The direct CDN download URL from the mod's page.
     pub download_url: String,
+    /// ModHub's "Released" date for the mod, exactly as the
+    /// mod page's info table reports it (e.g. "28.04.2026").
+    /// That is the label GIANTS shows; whether their backend
+    /// treats it as a creation date is not visible from the
+    /// page, so it is stored verbatim under their label.
+    /// Empty on records written before this field existed —
+    /// the complete-walk build (`catalog-build --full`)
+    /// backfills it for every record it re-fetches.
+    #[serde(default)]
+    pub released: String,
     /// Unix seconds when this record was last verified
     /// against ModHub — drives the indexer's refresh cycle:
     /// records older than the stale window get re-fetched, so
@@ -266,6 +276,11 @@ pub struct ModHubInfo {
     pub file_name: String,
     /// The direct CDN download URL from the page.
     pub download_url: String,
+    /// ModHub's "Released" date as the page reports it
+    /// (e.g. "28.04.2026"); empty when the page carries no
+    /// Released field — a missing date never fails a parse
+    /// whose version/filename did read.
+    pub released: String,
 }
 
 /// Extract one labeled value from the page's info table: rows
@@ -306,10 +321,12 @@ pub fn parse_page(html: &str) -> Option<ModHubInfo> {
     if version.is_empty() || file_name.is_empty() {
         return None;
     }
+    let released = table_value(html, "Released").unwrap_or_default();
     Some(ModHubInfo {
         version,
         file_name,
         download_url,
+        released,
     })
 }
 
@@ -437,12 +454,39 @@ mod tests {
                 <div class="table-cell"><b>Version</b></div>
                 <div class="table-cell">1.1.0.0</div>
             </div>
+            <div class="table-row">
+                <div class="table-cell"><b>Released</b></div>
+                <div class="table-cell">28.04.2026</div>
+            </div>
             <a href="https://cdn26.giants-software.com/modHub/storage/00304979/FS25_Concrete_Curb_Pack.zip" class="button">DOWNLOAD</a>
         "#;
         let info = parse_page(html).expect("page should parse");
         assert_eq!(info.version, "1.1.0.0");
         assert_eq!(info.file_name, "FS25_Concrete_Curb_Pack.zip");
         assert!(info.download_url.contains("cdn26.giants-software.com"));
+        assert_eq!(info.released, "28.04.2026");
+    }
+
+    #[test]
+    fn catalog_records_without_released_still_load() {
+        // Catalogs published before the Released field existed
+        // carry no "released" key; they must still parse, with
+        // the date empty until a --full walk backfills it.
+        let text = r#"{
+            "format": 1,
+            "generated_at": 1792254539,
+            "mods": [{
+                "stem": "fs25_000_datadump",
+                "file_name": "FS25_000_DataDump.zip",
+                "modhub_id": "303452",
+                "version": "1.0.0.0",
+                "download_url": "https://cdn27.giants-software.com/modHub/storage/00303452/FS25_000_DataDump.zip",
+                "checked_at": 1792251330
+            }]
+        }"#;
+        let cat: Catalog = serde_json::from_str(text).expect("old catalog should load");
+        assert_eq!(cat.mods.len(), 1);
+        assert_eq!(cat.mods[0].released, "");
     }
 
     #[test]
