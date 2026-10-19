@@ -34,6 +34,9 @@ pub enum BrowseView {
     Active,
     Archived,
     Favorites,
+    /// Mods with an update available (reader state — from
+    /// the update database at launch, or a live check).
+    Updates,
     Category(String),
 }
 
@@ -44,6 +47,7 @@ impl std::fmt::Display for BrowseView {
             BrowseView::Active => write!(f, "Active mods"),
             BrowseView::Archived => write!(f, "Archived mods"),
             BrowseView::Favorites => write!(f, "Favorite mods"),
+            BrowseView::Updates => write!(f, "Updates"),
             BrowseView::Category(c) => write!(f, "Category: {}", c),
         }
     }
@@ -146,8 +150,6 @@ pub enum Message {
     /// Update checks (ModHub): the details panel's ModHub field.
     ModHubInputChanged(String),
     SaveModHubLink(String),
-    /// Auto-detect ModHub links for every unlinked .zip mod.
-    DetectModHub,
     /// The catalog arrived (or not) for a detection pass:
     /// stem -> mod_id pairs the catalog could answer
     /// instantly, before any live searching happens.
@@ -167,14 +169,6 @@ pub enum Message {
     UpdateChecked(String, Result<Option<update_types::UpdateInfo>, String>),
     InstallUpdate(String),
     UpdateInstalled(String, Result<std::path::PathBuf, String>),
-    CheckAllUpdates,
-    /// The catalog arrived (or not) for an update check:
-    /// stem -> catalog entry, so unlinked mods the catalog
-    /// knows can be checked locally with no ModHub traffic.
-    CheckUpdatesCatalogReady(
-        Vec<(String, crate::sources::mod_hub::CatalogEntry)>,
-    ),
-    AllUpdatesChecked(Vec<(String, Result<Option<update_types::UpdateInfo>, String>)>),
     SelectSaveSlot(String),
     DraftToggle(String),
     DraftUseActive,
@@ -183,7 +177,6 @@ pub enum Message {
     ApplyLoadout,
     SavesFilterChanged(String),
     WindowResized(iced::Size),
-    Exit,
 }
 
 pub fn format_size(bytes: u64) -> String {

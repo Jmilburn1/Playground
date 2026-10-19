@@ -49,7 +49,18 @@ fn candidate_names(icon_filename: Option<&str>) -> Vec<String> {
 
 pub fn load_icon(mod_path: &Path, icon_filename: Option<&str>) -> Option<LoadedIcon> {
     let candidates = candidate_names(icon_filename);
-    for (name, bytes) in read_icon_candidates(mod_path, &candidates) {
+    let mut found = read_icon_candidates(mod_path, &candidates);
+    if found.is_empty() {
+        // The GIANTS naming convention: most mods ship their icon
+        // as icon_<something>.dds (maps especially: icon_map.dds,
+        // icon_<mapname>.dds). When the declared name and the fixed
+        // fallbacks all miss, any icon_* image in the mod is a far
+        // better answer than the letter placeholder (John found
+        // whole map rows on placeholders, 2026-10-18 — the working
+        // icons were the literal icon.dds ones).
+        found = read_wild_candidates(mod_path);
+    }
+    for (name, bytes) in found {
         if bytes.starts_with(b"DDS ") || name.to_lowercase().ends_with(".dds") {
             // A DDS that won't decode shouldn't end the search — another
             // candidate (a png twin, a store image) may still work.
@@ -187,4 +198,77 @@ fn decode_dds(bytes: &[u8]) -> Option<LoadedIcon> {
         height,
         pixels: img.into_raw(),
     })
+}
+
+/// Last-resort icon search: any file whose name starts with
+/// `icon_` and ends in an image extension, best first (DDS before
+/// PNG — the DDS is the mod icon proper when both exist — then by
+/// name, so the pick is deterministic).
+fn read_wild_candidates(mod_path: &Path) -> Vec<(String, Vec<u8>)> {
+    fn wild_rank(name: &str) -> Option<(u8, String)> {
+        let base = basename(name);
+        if !base.starts_with("icon_") {
+            return None;
+        }
+        let rank = if base.ends_with(".dds") {
+            0
+        } else if base.ends_with(".png") {
+            1
+        } else if base.ends_with(".jpg") || base.ends_with(".jpeg") {
+            2
+        } else {
+            return None;
+        };
+        Some((rank, base))
+    }
+
+    let mut hits: Vec<(u8, String, Vec<u8>)> = Vec::new();
+    if mod_path.is_dir() {
+        for entry in walkdir::WalkDir::new(mod_path)
+            .max_depth(4)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if let Some((rank, _)) = wild_rank(&name) {
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    hits.push((rank, name, bytes));
+                }
+            }
+        }
+    } else if mod_path
+        .extension()
+        .map_or(false, |e| e.eq_ignore_ascii_case("zip"))
+    {
+        let Ok(file) = std::fs::File::open(mod_path) else {
+            return Vec::new();
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(file) else {
+            return Vec::new();
+        };
+        for i in 0..archive.len() {
+            let (entry_name, rank) = {
+                let Ok(entry) = archive.by_index(i) else {
+                    continue;
+                };
+                let raw = entry.name().replace('\\', "/").to_lowercase();
+                match wild_rank(&raw) {
+                    Some((rank, _)) => (raw, rank),
+                    None => continue,
+                }
+            };
+            let mut buf = Vec::new();
+            if let Ok(mut entry) = archive.by_index(i) {
+                use std::io::Read as _;
+                if entry.read_to_end(&mut buf).is_ok() {
+                    hits.push((rank, entry_name, buf));
+                }
+            }
+        }
+    }
+    hits.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    hits.into_iter().map(|(_, name, bytes)| (name, bytes)).collect()
 }

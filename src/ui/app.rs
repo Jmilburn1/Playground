@@ -87,6 +87,10 @@ pub struct App {
     modhub_input: String,
     /// Chunked ModHub detection pass state: remaining
     /// (stem, file name, title) jobs and running tallies.
+    /// Set by a user-pressed Rescan (sidebar or Settings):
+    /// when that scan lands, the ModHub detection pass
+    /// follows automatically. Launch loads leave it false.
+    detect_after_scan: bool,
     detect_jobs: Vec<(String, String, String)>,
     detect_total: usize,
     detect_done: usize,
@@ -143,6 +147,7 @@ impl App {
             db_applied: HashSet::new(),
             link_input: String::new(),
             modhub_input: String::new(),
+            detect_after_scan: false,
             detect_jobs: Vec::new(),
             detect_total: 0,
             detect_done: 0,
@@ -362,6 +367,10 @@ impl App {
                         BrowseView::Favorites => {
                             self.mod_manager.is_favorite(&m.favorite_key())
                         }
+                        BrowseView::Updates => matches!(
+                            self.update_status.get(&m.id),
+                            Some(UpdateState::Available(_))
+                        ),
                         BrowseView::Category(c) => {
                             m.categories.iter().any(|x| x == c)
                         }
@@ -405,6 +414,10 @@ impl App {
                 if self.loading {
                     self.status = "Still loading — give it a moment.".to_string();
                 } else {
+                    // Detection is part of Rescan now (John,
+                    // 2026-10-18): when this scan lands, the
+                    // ModHub detection pass follows on its own.
+                    self.detect_after_scan = true;
                     return self.begin_load();
                 }
             }
@@ -458,6 +471,10 @@ impl App {
                 }
                 if let Some(note) = self.pending_status.take() {
                     self.status = note;
+                }
+                if self.detect_after_scan {
+                    self.detect_after_scan = false;
+                    return self.start_detect();
                 }
             }
             Message::SelectSaveSlot(dir_name) => {
@@ -711,154 +728,6 @@ impl App {
                     }
                 }
                 return self.begin_icon_load();
-            }
-            Message::CheckAllUpdates => {
-                // Consult the catalog first so unlinked mods
-                // it knows get checked locally, alongside the
-                // linked mods' live checks.
-                self.status = "Checking the ModHub catalog…".to_string();
-                let url = self.mod_manager.catalog_url();
-                return Task::perform(
-                    async move {
-                        let pairs = match crate::sources::catalog::ensure(&url).await {
-                            Some(cat) => crate::sources::catalog::by_stem(&cat)
-                                .into_iter()
-                                .collect(),
-                            None => Vec::new(),
-                        };
-                        pairs
-                    },
-                    Message::CheckUpdatesCatalogReady,
-                );
-            }
-            Message::CheckUpdatesCatalogReady(catalog_pairs) => {
-                let catalog: std::collections::HashMap<
-                    String,
-                    crate::sources::mod_hub::CatalogEntry,
-                > = catalog_pairs.into_iter().collect();
-                // One job per mod carrying either link kind —
-                // or, for unlinked mods, a catalog entry to
-                // check locally. Each mod is checked against
-                // GitHub first, then ModHub.
-                let mut jobs: Vec<(
-                    String,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    String,
-                    Option<crate::sources::mod_hub::CatalogEntry>,
-                )> = Vec::new();
-                for m in self.mod_manager.get_mods() {
-                    let stem = ModManager::mod_stem(&m.path);
-                    let gh = self.mod_manager.mod_link(&stem).map(|s| s.to_string());
-                    let mh = self
-                        .mod_manager
-                        .modhub_link(&stem)
-                        .map(|s| s.to_string());
-                    let cat = if gh.is_none() && mh.is_none() {
-                        catalog.get(&stem).cloned()
-                    } else {
-                        None
-                    };
-                    if gh.is_some() || mh.is_some() || cat.is_some() {
-                        jobs.push((m.id.clone(), gh, mh, stem, m.version.clone(), cat));
-                    }
-                }
-                if jobs.is_empty() {
-                    self.status =
-                        "No mods are linked yet and the catalog doesn't know any of them — open a mod's details and link it to GitHub or ModHub first."
-                            .to_string();
-                } else {
-                    for (id, _, _, _, _, _) in &jobs {
-                        self.db_applied.remove(id);
-                        self.update_status.insert(id.clone(), UpdateState::Checking);
-                    }
-                    self.status = format!(
-                        "Checking {} mods for updates…",
-                        jobs.len()
-                    );
-                    let (base, token) = self.mod_manager.github_endpoint();
-                    return Task::perform(
-                        async move {
-                            let mut out = Vec::new();
-                            for (id, gh, mh, stem, current, cat) in jobs {
-                                let result = match cat {
-                                    Some(entry)
-                                        if gh.is_none() && mh.is_none() =>
-                                    {
-                                        Ok(check_catalog_entry(&entry, &current))
-                                    }
-                                    _ => {
-                                        check_any_job(
-                                            base.clone(),
-                                            token.clone(),
-                                            gh,
-                                            mh,
-                                            stem,
-                                            current,
-                                        )
-                                        .await
-                                    }
-                                };
-                                out.push((id, result));
-                            }
-                            out
-                        },
-                        Message::AllUpdatesChecked,
-                    );
-                }
-            }
-            Message::AllUpdatesChecked(results) => {
-                let mut available = 0usize;
-                let mut failed = 0usize;
-                for (id, result) in results {
-                    self.db_applied.remove(&id);
-                    match result {
-                        Ok(Some(info)) => {
-                            available += 1;
-                            self.update_status.insert(id, UpdateState::Available(info));
-                        }
-                        Ok(None) => {
-                            self.update_status.insert(id, UpdateState::UpToDate);
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            self.update_status.insert(id, UpdateState::Failed(e));
-                        }
-                    }
-                }
-                self.status = format!(
-                    "Update check done — {} available, {} could not be checked.",
-                    available, failed
-                );
-            }
-            Message::DetectModHub => {
-                if !self.detect_jobs.is_empty() {
-                    self.status =
-                        "ModHub detection is already running — watch the counter; every batch is saved as it lands."
-                            .to_string();
-                    return Task::none();
-                }
-                // Consult the catalog first: one download
-                // answers most mods instantly, and only the
-                // stems it doesn't know fall through to live
-                // searching.
-                self.status = "Checking the ModHub catalog…".to_string();
-                let url = self.mod_manager.catalog_url();
-                return Task::perform(
-                    async move {
-                        let pairs = match crate::sources::catalog::ensure(&url).await {
-                            Some(cat) => cat
-                                .mods
-                                .iter()
-                                .map(|e| (e.stem.clone(), e.modhub_id.clone()))
-                                .collect(),
-                            None => Vec::new(),
-                        };
-                        pairs
-                    },
-                    Message::DetectCatalogReady,
-                );
             }
             Message::DetectCatalogReady(catalog_pairs) => {
                 if !self.detect_jobs.is_empty() {
@@ -1199,7 +1068,6 @@ impl App {
             },
             Message::LogErrorsOnlyToggled(on) => self.log_errors_only = on,
             Message::WindowResized(size) => self.window_size = size,
-            Message::Exit => return iced::exit(),
         }
 
         Task::none()
@@ -1217,7 +1085,7 @@ impl App {
             .into()
     }
 
-    fn browse_view(&self) -> Element<'_, Message> {
+    fn browse_view(&self) -> (Element<'_, Message>, Element<'_, Message>) {
         let mods = self.filtered_mods();
 
         // One dropdown picks what the grid shows: every mod, one
@@ -1227,6 +1095,7 @@ impl App {
             BrowseView::Active,
             BrowseView::Archived,
             BrowseView::Favorites,
+            BrowseView::Updates,
         ];
         let mut cats: Vec<String> = self
             .mod_manager
@@ -1238,9 +1107,12 @@ impl App {
         cats.dedup();
         view_options.extend(cats.into_iter().map(BrowseView::Category));
         // Stat boxes across the top (John, round 4 — Hub's tiles):
-        // installed / favourited / maps / disk usage.
+        // installed / favourited / maps / available updates. The
+        // fourth tile was DISK USAGE until 2026-10-18: that
+        // figure already lives in the sidebar, so John swapped
+        // the tile to the update count from the database —
+        // the number that changes something.
         let all_mods = self.mod_manager.get_mods();
-        let total_size: u64 = all_mods.iter().map(|m| m.size).sum();
         let maps_count = all_mods
             .iter()
             .filter(|m| m.categories.iter().any(|c| c == "Maps"))
@@ -1271,7 +1143,13 @@ impl App {
             tile(all_mods.len().to_string(), "INSTALLED"),
             tile(self.mod_manager.favorites_count().to_string(), "FAVOURITED"),
             tile(maps_count.to_string(), "MAPS"),
-            tile(format_size(total_size), "DISK USAGE"),
+            tile(
+                match self.db_generated_at {
+                    Some(_) => self.db_summary.updates.to_string(),
+                    None => "–".to_string(),
+                },
+                "AVAILABLE UPDATES",
+            ),
         ]
         .spacing(10);
 
@@ -1390,7 +1268,12 @@ impl App {
             content
         };
 
-        column![tiles, toolbar, body].spacing(8).into()
+        // The tiles/toolbar and the body are returned separately:
+        // view() draws them in different stack layers (see there).
+        (
+            column![tiles, toolbar].spacing(8).into(),
+            body,
+        )
     }
 
     fn details_view(&self) -> Option<Element<'_, Message>> {
@@ -2245,26 +2128,17 @@ impl App {
         let nav = |label: String, tab: Tab| {
             button(text(label).size(14))
                 .width(Length::Fill)
-                .style(if self.current_tab == tab {
-                    button::primary
-                } else {
-                    button::secondary
-                })
+                // All nav buttons grey (John, 2026-10-18):
+                // Rescan is the sidebar's one blue button —
+                // a blue Browse next to it just read as noise,
+                // and the tab itself is obvious from the page.
+                .style(button::secondary)
                 .on_press(Message::TabSelected(tab))
         };
-        // The reader's glance: what the update database says,
-        // stamped with the fill that produced it. Nothing at
-        // all until a first fill has landed.
-        let db_line: Element<'_, Message> = match self.db_generated_at {
-            Some(when) => text(format!(
-                "Updates available: {}\n(from the database, filled {})",
-                self.db_summary.updates,
-                fmt_time(when)
-            ))
-            .size(12)
-            .into(),
-            None => Space::with_height(0).into(),
-        };
+        // The update count used to live here too, until the
+        // stat tiles took it over (John, 2026-10-18): one
+        // home per number — updates in the tiles, disk
+        // usage here.
         let total_size: u64 = all.iter().map(|m| m.size).sum();
 
         let content = column![
@@ -2281,6 +2155,13 @@ impl App {
                 .height(184),
                 Space::with_width(Length::Fill),
             ],
+            // Rescan leads the sidebar, above Browse (John,
+            // 2026-10-18) — and detection rides along with
+            // every rescan now (see Message::Scan).
+            button(text("Rescan").size(14))
+                .width(Length::Fill)
+                .style(button::primary)
+                .on_press(Message::Scan),
             nav("Browse".to_string(), Tab::Browse),
             nav(format!("Conflicts ({})", self.conflicts.len()), Tab::Conflicts),
             nav("Configure Save (wip)".to_string(), Tab::Saves),
@@ -2295,10 +2176,13 @@ impl App {
                 count_cat("Scripts"),
                 BrowseView::Category("Scripts".to_string())
             ),
-            Space::with_height(Length::Fill),
-            db_line,
+            // Disk usage rides with the library block, right
+            // under the Scripts row (John, 2026-10-18) — the
+            // empty stretch belongs between it and the
+            // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
-            text("V1.1.0  © 2026 Farmer Jay.")
+            Space::with_height(Length::Fill),
+            text("V1.1.1  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -2386,23 +2270,101 @@ impl App {
         )
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
-        let header = row![
-            text("FS Mod Manager").size(24),
-            Space::with_width(Length::Fill),
-            button(text("Detect ModHub links")).on_press(Message::DetectModHub),
-            button(text("Check for updates")).on_press(Message::CheckAllUpdates),
-            button(text("Rescan")).on_press(Message::Scan),
-            button(text("Exit")).on_press(Message::Exit),
-        ]
-        .spacing(10);
+    /// The ModHub detection pass — formerly the header's
+    /// Detect button. Since John's 2026-10-18 ruling it is
+    /// part of Rescan: it starts from IconsLoaded whenever
+    /// the scan that just finished was user-triggered.
+    fn start_detect(&mut self) -> Task<Message> {
+        if !self.detect_jobs.is_empty() {
+            self.status =
+                "ModHub detection is already running — watch the counter; every batch is saved as it lands."
+                    .to_string();
+            return Task::none();
+        }
+        // Consult the catalog first: one download
+        // answers most mods instantly, and only the
+        // stems it doesn't know fall through to live
+        // searching.
+        self.status = "Checking the ModHub catalog…".to_string();
+        let url = self.mod_manager.catalog_url();
+        Task::perform(
+            async move {
+                let pairs = match crate::sources::catalog::ensure(&url).await {
+                    Some(cat) => cat
+                        .mods
+                        .iter()
+                        .map(|e| (e.stem.clone(), e.modhub_id.clone()))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                pairs
+            },
+            Message::DetectCatalogReady,
+        )
+    }
 
-        let content: Element<'_, Message> = match self.current_tab {
-            Tab::Browse => self.browse_view(),
-            Tab::Conflicts => self.conflicts_view(),
-            Tab::Saves => self.saves_view(),
-            Tab::Log => self.log_view(),
-            Tab::Settings => self.settings_view(),
+    pub fn view(&self) -> Element<'_, Message> {
+        // Header (John, 2026-10-18): his FS25 banner alone —
+        // no text beside it, and no buttons at all. The old
+        // header actions are gone by his ruling: Detect is
+        // folded into Rescan, Check for updates was
+        // superseded by the update-database reader, Exit by
+        // the window's own close button, and Rescan moved to
+        // the sidebar above Browse. The banner names the
+        // game this build manages — when Game Switching
+        // lands, this is where the current game will show.
+        // Pre-scaled to 2x its 40px display height (the
+        // sidebar badge's live-shrink pixelation lesson).
+        let header = iced::widget::image(iced::widget::image::Handle::from_bytes(
+            include_bytes!("../../assets/fs25_banner.png").to_vec(),
+        ))
+        .filter_method(iced::widget::image::FilterMethod::Linear)
+        .height(40);
+
+        // The main area is a stack of two columns — the scroll-clip
+        // fix (John, live, 2026-10-18: card ICONS slid over the
+        // toolbar and the status bar while the card boxes clipped
+        // correctly). Root cause, proven in a local repro: in iced
+        // 0.13's renderers, image and mesh primitives inside a
+        // scrollable are not cut by the scrollable's clip the way
+        // quads and text are — they paint past its edges at their
+        // natural positions. So the tab content lives in the base
+        // layer with empty holes where the header zone and status
+        // bar sit, and the header zone (banner + the Browse tiles
+        // and toolbar) and the status bar are drawn in the stack's
+        // top layer: a stack child after the first gets its own
+        // layer, painted over any escaped pixels, and opaque
+        // window-colored slabs behind them close their gaps too.
+        // The hole heights match the top layer's fixed segments:
+        // header 40 + spacing 10 (+ Browse tiles 63 + spacing 8 +
+        // toolbar 36 + spacing 8) at the top, status 17 + spacing
+        // 10 at the bottom; the slabs' extra padding (8 bottom /
+        // 10 top) covers the spacing gaps at the grid's edges.
+        let (top_controls, content, top_hole): (
+            Element<'_, Message>,
+            Element<'_, Message>,
+            f32,
+        ) = match self.current_tab {
+            Tab::Browse => {
+                let (top, body) = self.browse_view();
+                (top, body, 165.0)
+            }
+            Tab::Conflicts => (
+                Space::with_height(0).into(),
+                self.conflicts_view(),
+                50.0,
+            ),
+            Tab::Saves => (
+                Space::with_height(0).into(),
+                self.saves_view(),
+                50.0,
+            ),
+            Tab::Log => (Space::with_height(0).into(), self.log_view(), 50.0),
+            Tab::Settings => (
+                Space::with_height(0).into(),
+                self.settings_view(),
+                50.0,
+            ),
         };
 
         let status = row![
@@ -2411,11 +2373,44 @@ impl App {
             text(format!("Favorites: {}", self.mod_manager.favorites_count())).size(13),
         ];
 
-        // Shell: left sidebar + main column. Both are bounded to the
-        // window — an unbounded root lets scrolled grid rows draw
-        // over the header and pushes the status bar off-screen.
-        let main = column![header, content, status]
-            .spacing(10)
+        let window_bg = iced::Color::from_rgb(0.125, 0.133, 0.145);
+        let base = column![
+            Space::with_height(top_hole),
+            content,
+            Space::with_height(27),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill);
+        let top_layer = column![
+            container(column![header, top_controls].spacing(10))
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 8.0,
+                    left: 0.0,
+                })
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(iced::Background::Color(window_bg)),
+                    ..Default::default()
+                }),
+            Space::with_height(Length::Fill),
+            container(status)
+                .padding(iced::Padding {
+                    top: 10.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                })
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(iced::Background::Color(window_bg)),
+                    ..Default::default()
+                }),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill);
+        let main = iced::widget::stack![base, top_layer]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -2504,27 +2499,6 @@ async fn check_modhub_with(
     }))
 }
 
-/// One catalog update check: purely local — the catalog
-/// entry's version against the mod's current version. The
-/// UpdateInfo points at the entry's own download URL with the
-/// usual "modhub:" repo marker, so installing works exactly
-/// like a live-checked ModHub update (the install step
-/// re-reads the mod's page before downloading).
-fn check_catalog_entry(
-    entry: &crate::sources::mod_hub::CatalogEntry,
-    current: &str,
-) -> Option<UpdateInfo> {
-    if !crate::sources::github::is_newer(&entry.version, current) {
-        return None;
-    }
-    Some(UpdateInfo {
-        version: entry.version.clone(),
-        tag: "ModHub".to_string(),
-        download_url: entry.download_url.clone(),
-        asset_name: entry.file_name.clone(),
-        repo: format!("modhub:{}", entry.modhub_id),
-    })
-}
 
 /// Background-task wrapper for one mod's combined update
 /// check: GitHub first when linked, then ModHub; the first
