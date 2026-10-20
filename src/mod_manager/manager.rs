@@ -2,7 +2,7 @@ use super::types::{Mod, ModState, ModType};
 use crate::config::Config;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Move a file or folder, across drives if needed. `fs::rename`
@@ -105,7 +105,28 @@ impl ModManager {
         parallel: usize,
     ) -> Result<HashMap<String, Mod>> {
         let mut mods = Self::scan_directory(archive_dir, ModState::Archived, parallel)?;
-        mods.extend(Self::scan_directory(active_dir, ModState::Active, parallel)?);
+        let active = Self::scan_directory(active_dir, ModState::Active, parallel)?;
+        // One library, two doors: the active folder is a hardlink
+        // projection of the archive, so the same file in both
+        // folders is ONE mod wearing two paths (each copy hashes
+        // its own path into a distinct id, so both loaded). The
+        // twin test is the favorite-key test — EXACT file name
+        // (characters and case included), size and version: a
+        // match is the same file, so load the active copy and
+        // ignore its archive twin. Same name but different size
+        // or version means the copies diverged: both load, and
+        // the conflict detector reports them. Keying on the
+        // modDesc TITLE instead would swallow different mods
+        // that share a title (John's Bale Storage family,
+        // 2026-10-19).
+        let active_files: HashSet<(String, u64, String)> = active
+            .values()
+            .map(|m| (m.file_name(), m.size, m.version.clone()))
+            .collect();
+        mods.retain(|_, m| {
+            !active_files.contains(&(m.file_name(), m.size, m.version.clone()))
+        });
+        mods.extend(active);
         Ok(mods)
     }
 

@@ -146,12 +146,21 @@ impl Mod {
     /// path (and therefore its id), but filename + size + version survive
     /// the move, so the favorite does too.
     pub fn favorite_key(&self) -> String {
-        let file_name = self
-            .path
+        format!("{}|{}|{}", self.file_name(), self.size, self.version)
+    }
+
+    /// The mod's identity: its exact file name on disk, every
+    /// character and case included. `name` is the modDesc
+    /// TITLE — a display label different mods freely share
+    /// (whole families ship as "Bale Storage") — so anything
+    /// that decides whether two entries are the same mod
+    /// (duplicate detection, the scan's twin collapse) keys
+    /// on this, never on the title (John, 2026-10-19).
+    pub fn file_name(&self) -> String {
+        self.path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&self.name)
-            .to_string();
-        format!("{}|{}|{}", file_name, self.size, self.version)
+            .to_string()
     }
 }

@@ -39,18 +39,22 @@ impl ConflictDetector {
     }
 
     fn check_duplicates(mods: &[Mod], conflicts: &mut Vec<Conflict>) {
+        // Identity is the exact file name (see Mod::file_name):
+        // two entries sharing it are copies of one file; mods
+        // that merely share a TITLE are different mods.
         let mut seen: std::collections::HashMap<String, &Mod> = std::collections::HashMap::new();
-        
+
         for mod1 in mods {
-            if let Some(existing) = seen.get(&mod1.name) {
+            let key = mod1.file_name();
+            if let Some(existing) = seen.get(&key) {
                 conflicts.push(Conflict {
-                    mod1: existing.name.clone(),
-                    mod2: mod1.name.clone(),
+                    mod1: existing.file_name(),
+                    mod2: key.clone(),
                     conflict_type: ConflictType::DuplicateMod,
-                    description: format!("Duplicate mod: {}", mod1.name),
+                    description: format!("Duplicate mod: {}", key),
                 });
             } else {
-                seen.insert(mod1.name.clone(), mod1);
+                seen.insert(key, mod1);
             }
         }
     }
@@ -86,12 +90,16 @@ impl ConflictDetector {
     }
 
     fn check_versions(mods: &[Mod], conflicts: &mut Vec<Conflict>) {
-        for mod1 in mods {
-            for mod2 in mods {
-                if mod1.name == mod2.name && mod1.version != mod2.version {
+        // Same exact file name, different versions: copies of
+        // one file that have diverged — a genuine conflict.
+        // (Unordered pairs only; the old loop also emitted the
+        // mirror image of every pair.)
+        for (i, mod1) in mods.iter().enumerate() {
+            for mod2 in mods.iter().skip(i + 1) {
+                if mod1.file_name() == mod2.file_name() && mod1.version != mod2.version {
                     conflicts.push(Conflict {
-                        mod1: mod1.name.clone(),
-                        mod2: mod2.name.clone(),
+                        mod1: mod1.file_name(),
+                        mod2: mod2.file_name(),
                         conflict_type: ConflictType::VersionMismatch,
                         description: format!("Different versions: {} vs {}", mod1.version, mod2.version),
                     });

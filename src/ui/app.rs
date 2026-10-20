@@ -1,6 +1,8 @@
 use crate::mod_manager::conflict::{Conflict, ConflictDetector, ConflictType};
 use crate::mod_manager::game_files;
-use crate::mod_manager::icons::{load_icon, LoadedIcon};
+use crate::mod_manager::icons::{
+    icon_cache_dir, icon_cache_key, load_icon_cached, sweep_icon_cache, LoadedIcon,
+};
 use crate::mod_manager::saves::SaveSlot;
 use crate::mod_manager::types::{Mod, ModState};
 use crate::mod_manager::ModManager;
@@ -2182,7 +2184,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.1.1  © 2026 Farmer Jay.")
+            text("V1.1.2  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -2624,11 +2626,26 @@ fn log_job(
 }
 
 fn icon_job(jobs: Vec<(String, PathBuf, Option<String>)>) -> Vec<(String, LoadedIcon)> {
-    jobs.par_iter()
+    // Decoded icons are cached on disk (see icons.rs): the
+    // first pass pays the archive opens and decodes, later
+    // launches read ready-made thumbnails. The sweep after
+    // the pass drops entries for mods no longer present.
+    let cache_dir = icon_cache_dir();
+    let keep: HashSet<String> = jobs
+        .iter()
+        .filter_map(|(_, path, _)| icon_cache_key(path))
+        .collect();
+    let out: Vec<(String, LoadedIcon)> = jobs
+        .par_iter()
         .filter_map(|(id, path, icon)| {
-            load_icon(path, icon.as_deref()).map(|loaded| (id.clone(), loaded))
+            load_icon_cached(path, icon.as_deref(), cache_dir.as_deref())
+                .map(|loaded| (id.clone(), loaded))
         })
-        .collect()
+        .collect();
+    if let Some(dir) = &cache_dir {
+        sweep_icon_cache(dir, &keep);
+    }
+    out
 }
 
 pub fn run(mod_manager: ModManager) -> anyhow::Result<()> {
