@@ -177,6 +177,7 @@ pub enum Message {
     ApplyLoadout,
     SavesFilterChanged(String),
     WindowResized(iced::Size),
+    GridScrolled(iced::widget::scrollable::Viewport),
 }
 
 pub fn format_size(bytes: u64) -> String {

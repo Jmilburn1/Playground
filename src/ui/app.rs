@@ -99,6 +99,10 @@ pub struct App {
     detect_found: usize,
     detect_missed: usize,
     window_size: Size,
+    /// Browse grid windowing: last reported scroll offset and
+    /// viewport height (see the grid build in browse_view).
+    grid_offset: f32,
+    grid_view_h: f32,
 }
 
 impl App {
@@ -156,6 +160,8 @@ impl App {
             detect_found: 0,
             detect_missed: 0,
             window_size: Size::new(1280.0, 800.0),
+            grid_offset: 0.0,
+            grid_view_h: 0.0,
         }
     }
 
@@ -379,14 +385,17 @@ impl App {
                     })
             })
             .collect();
-        mods.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        mods.sort_by_cached_key(|m| m.name.to_lowercase());
         mods
     }
 
-    fn mod_has_conflict(&self, name: &str) -> bool {
-        self.conflicts
-            .iter()
-            .any(|c| c.mod1 == name || c.mod2 == name)
+    fn mod_has_conflict(&self, m: &Mod) -> bool {
+        // Duplicate/version conflicts are keyed by exact file
+        // name; dependency conflicts still carry display names.
+        let file = m.file_name();
+        self.conflicts.iter().any(|c| {
+            c.mod1 == m.name || c.mod2 == m.name || c.mod1 == file || c.mod2 == file
+        })
     }
 
     /// Shared favorite-toggle logic (fly-out button and card star badge).
@@ -833,11 +842,23 @@ impl App {
                 // Superseded by the chunked batch flow; kept so
                 // older in-flight tasks land harmlessly.
             }
-            Message::SearchChanged(query) => self.search_query = query,
+            Message::SearchChanged(query) => {
+                self.search_query = query;
+                self.grid_offset = 0.0;
+                return iced::widget::scrollable::scroll_to(
+                    iced::widget::scrollable::Id::new("grid"),
+                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                );
+            }
             Message::LibraryFilter(view) => {
                 self.current_tab = Tab::Browse;
                 self.view_filter = view;
                 self.favorites_only = false;
+                self.grid_offset = 0.0;
+                return iced::widget::scrollable::scroll_to(
+                    iced::widget::scrollable::Id::new("grid"),
+                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                );
             }
             Message::TabSelected(tab) => {
                 if tab == Tab::Saves {
@@ -848,7 +869,14 @@ impl App {
                     return self.begin_log_load();
                 }
             }
-            Message::BrowseViewChanged(view) => self.view_filter = view,
+            Message::BrowseViewChanged(view) => {
+                self.view_filter = view;
+                self.grid_offset = 0.0;
+                return iced::widget::scrollable::scroll_to(
+                    iced::widget::scrollable::Id::new("grid"),
+                    iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+                );
+            }
             Message::SelectMod(id) => {
                 // A click on a card's star badge also lands here (the
                 // badge is nested in the card) — the favorite toggle
@@ -1070,6 +1098,10 @@ impl App {
             },
             Message::LogErrorsOnlyToggled(on) => self.log_errors_only = on,
             Message::WindowResized(size) => self.window_size = size,
+            Message::GridScrolled(viewport) => {
+                self.grid_offset = viewport.absolute_offset().y;
+                self.grid_view_h = viewport.bounds().height;
+            }
         }
 
         Task::none()
@@ -1231,13 +1263,41 @@ impl App {
             }
             let card_w = (grid_w - (cols as f32 - 1.0) * GRID_SPACING) / cols as f32;
 
+            // Windowed grid (John's return-to-Browse hang,
+            // 2026-10-20): the whole library's cards used to be
+            // built and measured on every frame — at ~2,900 mods
+            // returning to this tab froze for seconds. Cards are
+            // a fixed height, so the scrollable now only builds
+            // the rows around the visible window (plus a buffer)
+            // and pads the rest with spacers; the total height —
+            // and therefore the scrollbar — is unchanged. The
+            // last viewport arrives via Message::GridScrolled.
+            let rows_total = (mods.len() + cols - 1) / cols;
+            let pitch = CARD_H + GRID_SPACING;
+            let view_h = if self.grid_view_h > 0.0 {
+                self.grid_view_h
+            } else {
+                (self.window_size.height - 216.0).max(CARD_H)
+            };
+            const BUFFER_ROWS: usize = 3;
+            let first_row = ((self.grid_offset / pitch).floor() as usize)
+                .saturating_sub(BUFFER_ROWS)
+                .min(rows_total);
+            let visible_rows = (view_h / pitch).ceil() as usize + 1;
+            let end_row = (first_row + visible_rows + 2 * BUFFER_ROWS).min(rows_total);
+
             let mut grid = column![].spacing(GRID_SPACING);
-            for chunk in mods.chunks(cols) {
+            if first_row > 0 {
+                grid = grid.push(Space::with_height(
+                    first_row as f32 * pitch - GRID_SPACING,
+                ));
+            }
+            for chunk in mods.chunks(cols).skip(first_row).take(end_row - first_row) {
                 let mut r = row![].spacing(GRID_SPACING);
                 for m in chunk {
                     let fav = self.mod_manager.is_favorite(&m.favorite_key());
                     let selected = self.selected_mod.as_deref() == Some(m.id.as_str());
-                    let conflict = self.mod_has_conflict(&m.name);
+                    let conflict = self.mod_has_conflict(m);
                     let update_available = matches!(
                         self.update_status.get(&m.id),
                         Some(crate::ui::components::update_types::UpdateState::Available(_))
@@ -1255,7 +1315,14 @@ impl App {
                 }
                 grid = grid.push(r);
             }
+            if end_row < rows_total {
+                grid = grid.push(Space::with_height(
+                    (rows_total - end_row) as f32 * pitch - GRID_SPACING,
+                ));
+            }
             scrollable(grid)
+                .id(iced::widget::scrollable::Id::new("grid"))
+                .on_scroll(Message::GridScrolled)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -1334,15 +1401,22 @@ impl App {
             col = col.push(text(format!("Depends on: {}", m.dependencies.join(", "))).size(12));
         }
 
+        let my_file = m.file_name();
         let my_conflicts: Vec<&Conflict> = self
             .conflicts
             .iter()
-            .filter(|c| c.mod1 == m.name || c.mod2 == m.name)
+            .filter(|c| {
+                c.mod1 == m.name || c.mod2 == m.name || c.mod1 == my_file || c.mod2 == my_file
+            })
             .collect();
         if !my_conflicts.is_empty() {
             col = col.push(text("Conflicts:").size(13));
             for c in my_conflicts {
-                let other = if c.mod1 == m.name { &c.mod2 } else { &c.mod1 };
+                let other = if c.mod1 == m.name || c.mod1 == my_file {
+                    &c.mod2
+                } else {
+                    &c.mod1
+                };
                 col = col.push(
                     text(format!("{} — {:?}", other, c.conflict_type)).size(12),
                 );
@@ -1595,6 +1669,10 @@ impl App {
             .clamp(1, 4);
         let card_w = (content_w - (cols as f32 - 1.0) * GRID_SPACING) / cols as f32;
 
+        // Groups are keyed by the conflict's mod1, which for
+        // duplicate/version conflicts is now the EXACT file
+        // name — copies are the loaded entries with that file
+        // name, never every mod sharing a title.
         let mut dup_names: Vec<String> = Vec::new();
         for c in &self.conflicts {
             if matches!(
@@ -1613,7 +1691,7 @@ impl App {
                 .mod_manager
                 .get_mods()
                 .into_iter()
-                .filter(|m| &m.name == name)
+                .filter(|m| m.file_name() == *name)
                 .collect();
             copies.sort_by_key(|m| m.state != ModState::Active);
 
@@ -1625,12 +1703,16 @@ impl App {
                         .into(),
                     None => container(text("")).width(44).height(44).into(),
                 };
+            let title = copies
+                .first()
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| name.clone());
             let mut card_col = column![
                 row![
                     header_icon,
                     column![
-                        text(name.clone()).size(15),
-                        text(format!("{} copies", copies.len())).size(12),
+                        text(title).size(15),
+                        text(format!("{} copies - {}", copies.len(), name)).size(12),
                     ]
                     .spacing(2),
                 ]
@@ -2184,7 +2266,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.1.2  © 2026 Farmer Jay.")
+            text("V1.1.3  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -2656,7 +2738,7 @@ pub fn run(mod_manager: ModManager) -> anyhow::Result<()> {
         None,
     )
     .ok();
-    let result = iced::application("FS Mod Manager", App::update, App::view)
+    let result = iced::application("Playground", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_: &App| Theme::Dark)
         .window(iced::window::Settings {
