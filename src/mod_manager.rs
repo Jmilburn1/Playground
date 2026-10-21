@@ -1,6 +1,8 @@
 pub mod types;
 pub mod manager;
 pub mod library_db;
+pub mod layout;
+pub mod layout_exec;
 pub mod conflict;
 pub mod moddesc;
 pub mod icons;

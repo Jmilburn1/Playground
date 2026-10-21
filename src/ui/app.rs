@@ -501,11 +501,26 @@ impl App {
                     // gets its ordinary shape back (decorated,
                     // 1280x800; see restore_window). (Icons
                     // keep loading behind it, as before.)
+                    // The handover belongs to the boot only:
+                    // a rescan's load finishing must never
+                    // touch the window (the decorations
+                    // toggle is stateful — firing it per load
+                    // would flip the frame off again).
+                    let was_booting = self.booting;
                     self.booting = false;
                     self.status = format!("Loaded {} mods — loading icons…", count);
-                    return Task::batch(vec![self.begin_icon_load(), Self::restore_window()]);
+                    let icons = self.begin_icon_load();
+                    if was_booting {
+                        return Task::batch(vec![
+                            icons,
+                            Self::restore_window(),
+                            Self::verify_window_restored(),
+                        ]);
+                    }
+                    return icons;
                 }
                 LoadEvent::Finished(Err(e)) => {
+                    let was_booting = self.booting;
                     self.loading = false;
                     self.booting = false;
                     self.status = format!("Scan failed: {}", e);
@@ -515,7 +530,13 @@ impl App {
                     // Even a failed boot hands over: the main
                     // window (carrying the error in its status
                     // line) gets its ordinary shape back too.
-                    return Self::restore_window();
+                    if was_booting {
+                        return Task::batch(vec![
+                            Self::restore_window(),
+                            Self::verify_window_restored(),
+                        ]);
+                    }
+                    return Task::none();
                 }
             },
             Message::IconsLoaded(loaded) => {
@@ -2559,7 +2580,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.2.1  © 2026 Farmer Jay.")
+            text("V1.3.1  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -2721,25 +2742,89 @@ impl App {
     /// the main window is re-centered on the same point:
     /// inheriting the splash's top-left would push a
     /// 1280x800 window off the right and bottom edges.
+    ///
+    /// STRUCTURE IS THE FIX (field bug, 2026-10-21: every
+    /// launch on the owner's Windows stayed splash-shaped
+    /// and borderless with the main UI inside it): the
+    /// frame and size are built DIRECTLY in get_latest's
+    /// continuation — the shell answers GetLatest
+    /// unconditionally, so that continuation always runs.
+    /// They must never again be built downstream of
+    /// `window::get_position`: it is a oneshot task, and
+    /// if the shell's answer never arrives the chained
+    /// continuation silently never executes (the runtime's
+    /// oneshot stream ends with no output), taking the
+    /// whole restore with it and logging nothing. The
+    /// centering move therefore rides its own independent
+    /// chain (see center_main_window): its worst case is
+    /// a main window that keeps the splash's top-left —
+    /// never a window that keeps the splash's shape.
     fn restore_window() -> Task<Message> {
         iced::window::get_latest().then(|id| match id {
-            Some(id) => iced::window::get_position(id).then(move |pos| {
-                let mut tasks = vec![
-                    iced::window::toggle_decorations(id),
-                    iced::window::resize(id, Size::new(1280.0, 800.0)),
-                ];
-                if let Some(pos) = pos {
-                    let center_x = pos.x + SPLASH_W / 2.0;
-                    let center_y = pos.y + SPLASH_H / 2.0;
-                    tasks.push(iced::window::move_to(
-                        id,
-                        iced::Point::new(center_x - 640.0, center_y - 400.0),
-                    ));
+            Some(id) => Task::batch(vec![
+                iced::window::toggle_decorations(id),
+                iced::window::resize(id, Size::new(1280.0, 800.0)),
+                Self::center_main_window(id),
+            ]),
+            None => Task::none(),
+        })
+    }
+
+    /// Re-center the (now 1280x800) main window on the
+    /// splash's center point. Independent of the frame
+    /// restore by design: the position read is the one
+    /// fallible step in the handover, so only the move is
+    /// allowed to ride on it. A lost answer costs the
+    /// centering and nothing else.
+    fn center_main_window(id: iced::window::Id) -> Task<Message> {
+        iced::window::get_position(id).then(move |pos| match pos {
+            Some(pos) => {
+                let center_x = pos.x + SPLASH_W / 2.0;
+                let center_y = pos.y + SPLASH_H / 2.0;
+                iced::window::move_to(
+                    id,
+                    iced::Point::new(center_x - 640.0, center_y - 400.0),
+                )
+            }
+            None => Task::none(),
+        })
+    }
+
+    /// One-shot safety net behind restore_window, run
+    /// once per boot handover: read the window's size
+    /// back, and if it is still exactly the splash's size
+    /// the restore batch demonstrably never landed, so
+    /// issue it once more. Any other size — restored, or
+    /// already resized by hand — leaves the window
+    /// strictly alone; in particular the stateful
+    /// decorations toggle is only ever re-issued when
+    /// the coupled resize is provably missing too, so
+    /// the net cannot flip a restored window's frame
+    /// back off. There is no retry loop: one check, at
+    /// most one re-issue, per boot.
+    fn verify_window_restored() -> Task<Message> {
+        iced::window::get_latest().then(|id| match id {
+            Some(id) => iced::window::get_size(id).then(move |size| {
+                if Self::still_splash_sized(size) {
+                    Task::batch(vec![
+                        iced::window::toggle_decorations(id),
+                        iced::window::resize(id, Size::new(1280.0, 800.0)),
+                        Self::center_main_window(id),
+                    ])
+                } else {
+                    Task::none()
                 }
-                Task::batch(tasks)
             }),
             None => Task::none(),
         })
+    }
+
+    /// The safety net's trigger, kept pure for testing:
+    /// the window still wears the splash's exact size
+    /// (within a pixel — the shell reports logical size,
+    /// so a landed resize reads exactly 1280x800).
+    fn still_splash_sized(size: Size) -> bool {
+        (size.width - SPLASH_W).abs() < 1.0 && (size.height - SPLASH_H).abs() < 1.0
     }
 
     /// The launch splash (John, 2026-10-21): the Playground
@@ -3339,5 +3424,26 @@ pub fn run(mod_manager: ModManager) -> anyhow::Result<()> {
     match result {
         Ok(()) => Ok(()),
         Err(e) => Err(anyhow::anyhow!("GUI failed to start: {:?}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The restore safety net fires ONLY on the splash's
+    /// own size: a landed restore (1280x800) and any
+    /// hand-resized window must both leave the stateful
+    /// decorations toggle untouched.
+    #[test]
+    fn splash_size_trigger_matches_only_the_splash() {
+        assert!(App::still_splash_sized(Size::new(SPLASH_W, SPLASH_H)));
+        assert!(App::still_splash_sized(Size::new(
+            SPLASH_W + 0.5,
+            SPLASH_H - 0.5
+        )));
+        assert!(!App::still_splash_sized(Size::new(1280.0, 800.0)));
+        assert!(!App::still_splash_sized(Size::new(1000.0, 700.0)));
+        assert!(!App::still_splash_sized(Size::new(SPLASH_W, 800.0)));
     }
 }

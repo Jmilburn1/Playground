@@ -755,6 +755,37 @@ pub fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<
                 }
             }
         }
+        Some("layout-plan") => {
+            // Roadmap #2, Phase 1: the read-only layout
+            // engine. Prints the migration plan and saves
+            // it as layout-plan.json in the config dir —
+            // Phase 2's input contract. Nothing in the
+            // library or the game folder is touched.
+            let plan = mod_manager.layout_plan();
+            print!("{}", crate::mod_manager::layout::render_text(&plan));
+            let path = crate::mod_manager::layout::write_plan_json(&plan)?;
+            println!("Plan saved to {}", path.display());
+        }
+        Some("layout-apply") => {
+            // Roadmap #2, Phase 2: execute the Library
+            // Layout migration — archive sort, staging
+            // farm, verification, swap — recorded op by op
+            // in layout-state.json. Refuses (rather than
+            // improvising) on a cross-volume pair, an open
+            // earlier migration, or a saved plan for other
+            // folders. The destructive step is printed in
+            // plain words before anything is written.
+            crate::mod_manager::layout_exec::run_apply(mod_manager)?;
+        }
+        Some("layout-rollback") => {
+            // Roadmap #2, Phase 2: restore the
+            // pre-migration world from layout-state.json —
+            // audit the farm, swap the backup back, undo
+            // the archive sort. The backup itself is only
+            // ever consumed by being renamed home; it is
+            // never deleted.
+            crate::mod_manager::layout_exec::run_rollback()?;
+        }
         Some("help") | _ => {
             print_help();
         }
@@ -1246,6 +1277,9 @@ fn print_help() {
     println!("  cli update - Run the update fill: fill the personal update database (catalog-home.json): scan + catalog join + link polls, in one swipe");
     println!("  cli update <stem> - Download and install the linked mod's latest version");
     println!("  cli db-fill - Deprecated alias of 'cli update' (the fill)");
+    println!("  cli layout-plan - Print the Library Layout migration plan (read-only) and save it as layout-plan.json");
+    println!("  cli layout-apply - Execute the Library Layout migration (sort + projection farm + swap; backup kept, rollback with layout-rollback)");
+    println!("  cli layout-rollback - Undo a Library Layout migration from its state record (restores the original game folder and the flat library)");
     println!("  cli help - Show this help");
     println!("  (no args) - Launch GUI");
 }

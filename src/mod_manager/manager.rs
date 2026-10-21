@@ -221,7 +221,7 @@ impl ModManager {
         db: &super::library_db::LibraryDb,
         on_progress: &(dyn Fn(usize, usize) + Sync),
     ) -> Result<HashMap<String, Mod>> {
-        let archive_paths = Self::enumerate_candidates(&archive_dir);
+        let archive_paths = Self::enumerate_library_candidates(&archive_dir);
         let active_paths = Self::enumerate_candidates(&active_dir);
         let total = archive_paths.len() + active_paths.len();
         let done = std::sync::atomic::AtomicUsize::new(0);
@@ -245,27 +245,64 @@ impl ModManager {
             on_progress,
         )?;
         db.save();
-        // One library, two doors: the active folder is a hardlink
-        // projection of the archive, so the same file in both
-        // folders is ONE mod wearing two paths (each copy hashes
-        // its own path into a distinct id, so both loaded). The
-        // twin test is the favorite-key test — EXACT file name
-        // (characters and case included), size and version: a
-        // match is the same file, so load the active copy and
-        // ignore its archive twin. Same name but different size
-        // or version means the copies diverged: both load, and
-        // the conflict detector reports them. Keying on the
-        // modDesc TITLE instead would swallow different mods
-        // that share a title (John's Bale Storage family,
-        // 2026-10-19).
-        let active_files: HashSet<(String, u64, String)> = active
-            .values()
-            .map(|m| (m.file_name(), m.size, m.version.clone()))
-            .collect();
-        mods.retain(|_, m| {
-            !active_files.contains(&(m.file_name(), m.size, m.version.clone()))
-        });
-        mods.extend(active);
+        // One library, two doors: the game folder is a
+        // projection of the library (hardlinks and
+        // junctions since the Library Layout; plain twin
+        // copies before it), so the same file in both
+        // folders is ONE mod wearing two paths. The twin
+        // test is the favorite-key test — EXACT file name
+        // (characters and case included), size and
+        // version: a match is the same file. The surviving
+        // record is the LIBRARY copy — its path, its id,
+        // its library-DB fingerprint — and the game-folder
+        // entry only marks it Active: in the layout world
+        // the game folder holds no data of its own, so a
+        // record keyed there would point every operation
+        // at a link (Roadmap #2, Phase 3). Same name but
+        // different size or version means the copies
+        // diverged — a stray real copy, not a projection:
+        // both load, and the conflict detector reports
+        // them, exactly as before. A game-folder entry
+        // with no library twin stays a standalone Active
+        // record. Keying on the modDesc TITLE instead
+        // would swallow different mods that share a title
+        // (John's Bale Storage family, 2026-10-19).
+        let mut library_by_name: HashMap<String, Vec<String>> = HashMap::new();
+        for m in mods.values() {
+            library_by_name
+                .entry(m.file_name())
+                .or_default()
+                .push(m.id.clone());
+        }
+        for ids in library_by_name.values_mut() {
+            ids.sort_by(|a, b| mods[a].path.cmp(&mods[b].path));
+        }
+        let mut game_records: Vec<Mod> = active.into_values().collect();
+        game_records.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut consumed: HashSet<String> = HashSet::new();
+        for game_rec in game_records {
+            let twin = library_by_name
+                .get(&game_rec.file_name())
+                .and_then(|ids| {
+                    ids.iter().find(|id| {
+                        !consumed.contains(*id)
+                            && mods[*id].size == game_rec.size
+                            && mods[*id].version == game_rec.version
+                    })
+                })
+                .cloned();
+            match twin {
+                Some(id) => {
+                    consumed.insert(id.clone());
+                    if let Some(lib_rec) = mods.get_mut(&id) {
+                        lib_rec.state = ModState::Active;
+                    }
+                }
+                None => {
+                    mods.insert(game_rec.id.clone(), game_rec);
+                }
+            }
+        }
         Ok(mods)
     }
 
@@ -273,6 +310,74 @@ impl ModManager {
     pub fn install_mods(&mut self, mods: HashMap<String, Mod>) {
         self.mods = mods;
         self.migrate_other_links();
+    }
+
+    /// List the LIBRARY folder's mod candidates: the root
+    /// level plus one category level down (the Library
+    /// Layout's shape), without opening any of them. The
+    /// listing rule mirrors the layout engine's
+    /// (`layout::list_library`), tightened so a flat
+    /// library enumerates exactly what the depth-1 listing
+    /// always produced:
+    ///
+    /// - a `.zip` file at the root is a candidate, as are
+    ///   a folder mod's own files one level down;
+    /// - a root folder holding a `modDesc.xml` at its top
+    ///   is a folder mod — a candidate itself;
+    /// - a root folder without one whose children include
+    ///   mod-shaped entries (folders or `.zip` files) is a
+    ///   category container: its children are the
+    ///   candidates, never the folder itself — a category
+    ///   folder must not appear as a phantom "mod";
+    /// - a root folder without one and with no mod-shaped
+    ///   children (only loose files) keeps the pre-layout
+    ///   treatment: the folder itself is the candidate;
+    /// - an empty folder holds nothing and is skipped.
+    fn enumerate_library_candidates(dir: &PathBuf) -> Vec<PathBuf> {
+        if !dir.exists() {
+            return Vec::new();
+        }
+        let mut top: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+            Err(_) => return Vec::new(),
+        };
+        top.sort();
+        let is_zip = |p: &std::path::Path| {
+            p.is_file()
+                && p.extension()
+                    .map_or(false, |e| e.eq_ignore_ascii_case("zip"))
+        };
+        let mut out: Vec<PathBuf> = Vec::new();
+        for path in top {
+            if path.is_file() {
+                if is_zip(&path) {
+                    out.push(path);
+                }
+            } else if path.is_dir() {
+                if path.join("modDesc.xml").exists() {
+                    out.push(path);
+                    continue;
+                }
+                let mut children: Vec<PathBuf> = match std::fs::read_dir(&path) {
+                    Ok(rd) => rd
+                        .filter_map(|e| e.ok().map(|e| e.path()))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                children.sort();
+                let mod_children: Vec<PathBuf> = children
+                    .iter()
+                    .filter(|c| c.is_dir() || is_zip(c))
+                    .cloned()
+                    .collect();
+                if !mod_children.is_empty() {
+                    out.extend(mod_children);
+                } else if !children.is_empty() {
+                    out.push(path);
+                }
+            }
+        }
+        out
     }
 
     /// List a folder's mod candidates (folders and .zip files,
@@ -334,10 +439,134 @@ impl ModManager {
         Ok(result)
     }
 
+    // -----------------------------------------------------------------
+    // Library Layout steady state (Roadmap #2, Phase 3).
+    //
+    // There is no mode flag: every decision below is derived
+    // from the tree in front of the manager, per mod. A mod
+    // whose library copy sits in a category subfolder of the
+    // library, with the library and game folders on one
+    // volume, lives in the layout world — activation projects
+    // it, deactivation unprojects it, and the library copy
+    // never moves. Anything else (a flat library, a
+    // cross-volume pair per Ruling F, a game-folder-only mod)
+    // takes the pre-layout move code paths unchanged.
+    // -----------------------------------------------------------------
+
+    /// Is this path one of the library's own copies (as
+    /// opposed to a game-folder entry)?
+    fn is_library_path(&self, path: &std::path::Path) -> bool {
+        path.starts_with(&self.archive_dir)
+    }
+
+    /// Does this library copy sit in a category subfolder —
+    /// `<library>/<Category>/<file>` — rather than at the
+    /// library root?
+    fn in_category_subfolder(&self, library_path: &std::path::Path) -> bool {
+        library_path.parent().map_or(false, |parent| {
+            parent != self.archive_dir.as_path()
+                && parent.parent() == Some(self.archive_dir.as_path())
+        })
+    }
+
+    /// The layout is in effect for this library copy: filed
+    /// in a category subfolder, and the two folders share a
+    /// volume so projections can exist (Ruling F — when the
+    /// volume cannot even be proven shared, the safe answer
+    /// is the copy/move behavior, never a failed link).
+    fn layout_in_effect_for(&self, library_path: &std::path::Path) -> bool {
+        self.is_library_path(library_path)
+            && self.in_category_subfolder(library_path)
+            && super::layout_exec::same_volume(&self.archive_dir, &self.active_dir)
+                == Some(true)
+    }
+
+    /// Is the library as a whole in layout form — any known
+    /// library copy filed in a category subfolder? New files
+    /// entering the library (update installs of game-only
+    /// mods) land sorted only when it is.
+    fn library_in_layout_form(&self) -> bool {
+        self.mods
+            .values()
+            .any(|m| self.is_library_path(&m.path) && self.in_category_subfolder(&m.path))
+    }
+
+    /// The projection kind a mod takes in the game folder:
+    /// folder mods project as junctions, file mods as
+    /// hardlinks (Ruling D).
+    fn projection_kind(m: &Mod) -> super::layout::LinkKind {
+        match m.mod_type {
+            ModType::Folder => super::layout::LinkKind::Junction,
+            _ => super::layout::LinkKind::Hardlink,
+        }
+    }
+
+    /// Where a mod's file belongs in a laid-out library:
+    /// `<library>/<card category>/<file name>`, the
+    /// category sanitized for the filesystem, `Other` when
+    /// the mod has none (Rulings A and B, via the layout
+    /// engine's own rule).
+    pub fn library_home_for(&self, m: &Mod) -> PathBuf {
+        self.archive_dir
+            .join(super::layout::sanitize_category(
+                &super::layout::layout_category(m),
+            ))
+            .join(m.file_name())
+    }
+
+    /// Does the game folder currently hold a PROVEN
+    /// projection of this library-resident mod — proven by
+    /// the executor's own satisfaction check, never by the
+    /// mere presence of a same-named entry?
+    fn game_entry_is_projection(&self, m: &Mod) -> bool {
+        if !self.is_library_path(&m.path) {
+            return false;
+        }
+        let entry = self.active_dir.join(m.file_name());
+        std::fs::symlink_metadata(&entry).is_ok()
+            && super::layout_exec::projection_proven(
+                &m.path,
+                &entry,
+                Self::projection_kind(m),
+            )
+    }
+
     pub fn move_to_archive(&mut self, mod_id: &str) -> Result<()> {
-        let mod_data = self.mods.get_mut(mod_id)
+        let snapshot = self
+            .mods
+            .get(mod_id)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("Mod not found: {}", mod_id))?;
-        
+
+        if self.is_library_path(&snapshot.path) {
+            // The record is keyed to the library copy (the
+            // scan keeps it there); deactivation is about
+            // the game-folder entry, never about moving the
+            // library copy.
+            let entry = self.active_dir.join(snapshot.file_name());
+            if std::fs::symlink_metadata(&entry).is_ok() {
+                if self.game_entry_is_projection(&snapshot) {
+                    // A proven projection is the library
+                    // file wearing a second name — removing
+                    // it loses nothing, in any layout state.
+                    super::layout_exec::remove_projected_entry(&entry)?;
+                } else {
+                    // A real file, not a projection of this
+                    // copy: the pre-layout move semantics —
+                    // the game copy moves onto the library
+                    // home (for a flat library that IS the
+                    // archive-root destination it always
+                    // was), replacing it.
+                    move_path(&entry, &snapshot.path)?;
+                }
+            }
+            let mod_data = self.mods.get_mut(mod_id).unwrap();
+            mod_data.state = ModState::Archived;
+            return Ok(());
+        }
+
+        let mod_data = self.mods.get_mut(mod_id).unwrap();
+
         let source_path = mod_data.path.clone();
         let dest_path = self.archive_dir.join(source_path.file_name().unwrap());
 
@@ -350,9 +579,42 @@ impl ModManager {
     }
 
     pub fn move_to_active(&mut self, mod_id: &str) -> Result<()> {
-        let mod_data = self.mods.get_mut(mod_id)
+        let snapshot = self
+            .mods
+            .get(mod_id)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("Mod not found: {}", mod_id))?;
-        
+
+        if self.is_library_path(&snapshot.path)
+            && self.layout_in_effect_for(&snapshot.path)
+        {
+            // Layout world: activation is creating the
+            // projection. The library copy does not move;
+            // only the record's state changes.
+            let dest = self.active_dir.join(snapshot.file_name());
+            if std::fs::symlink_metadata(&dest).is_ok() {
+                if self.game_entry_is_projection(&snapshot) {
+                    // Already projected — the state was
+                    // simply stale.
+                    self.mods.get_mut(mod_id).unwrap().state = ModState::Active;
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "Cannot activate {}: a different file already sits in the game folder under that name.",
+                    snapshot.file_name()
+                );
+            }
+            super::layout_exec::create_projection(
+                &snapshot.path,
+                &dest,
+                Self::projection_kind(&snapshot),
+            )?;
+            self.mods.get_mut(mod_id).unwrap().state = ModState::Active;
+            return Ok(());
+        }
+
+        let mod_data = self.mods.get_mut(mod_id).unwrap();
+
         let source_path = mod_data.path.clone();
         let dest_path = self.active_dir.join(source_path.file_name().unwrap());
 
@@ -365,9 +627,21 @@ impl ModManager {
     }
 
     pub fn move_between_directories(&mut self, mod_id: &str, target_dir: &PathBuf) -> Result<()> {
+        // The CLI's `move` verb names the two real folders:
+        // a move "to" the game folder IS activation and a
+        // move "to" the library IS deactivation, so both
+        // route through those ops (link operations in the
+        // layout world, moves in the flat one). Any other
+        // target keeps the raw move below.
+        if target_dir == &self.active_dir {
+            return self.move_to_active(mod_id);
+        }
+        if target_dir == &self.archive_dir {
+            return self.move_to_archive(mod_id);
+        }
         let mod_data = self.mods.get_mut(mod_id)
             .ok_or_else(|| anyhow::anyhow!("Mod not found: {}", mod_id))?;
-        
+
         let source_path = mod_data.path.clone();
         let dest_path = target_dir.join(source_path.file_name().unwrap());
 
@@ -429,13 +703,31 @@ impl ModManager {
     pub fn remove_mod(&mut self, mod_id: &str) -> Result<()> {
         let mod_data = self.mods.remove(mod_id)
             .ok_or_else(|| anyhow::anyhow!("Mod not found: {}", mod_id))?;
-        
+
+        // A library-resident mod's game-folder projection
+        // is the same file wearing a second name, not a
+        // copy: deleting only the library path would leave
+        // the mod fully alive in the game. When the entry
+        // is a PROVEN projection of this copy (checked
+        // before the copy goes — the proof reads it), it is
+        // removed too. A real file in the game folder is
+        // not the record's copy and is left alone, as
+        // before.
+        let projection_entry = if self.game_entry_is_projection(&mod_data) {
+            Some(self.active_dir.join(mod_data.file_name()))
+        } else {
+            None
+        };
+
         if mod_data.path.exists() {
             if mod_data.path.is_dir() {
                 std::fs::remove_dir_all(&mod_data.path)?;
             } else {
                 std::fs::remove_file(&mod_data.path)?;
             }
+        }
+        if let Some(entry) = projection_entry {
+            let _ = super::layout_exec::remove_projected_entry(&entry);
         }
 
         Ok(())
@@ -467,6 +759,16 @@ impl ModManager {
 
     pub fn get_archive_dir(&self) -> &PathBuf {
         &self.archive_dir
+    }
+
+    /// The Library Layout plan (Roadmap #2, Phase 1):
+    /// a read-only census of both folders against the
+    /// scanned records — moves into category subfolders
+    /// and game-folder projections a migration would
+    /// make. Planning changes nothing on disk.
+    pub fn layout_plan(&self) -> super::layout::LayoutPlan {
+        let mods: Vec<Mod> = self.mods.values().cloned().collect();
+        super::layout::build_plan(&self.archive_dir, &self.active_dir, &mods)
     }
 
     pub fn get_active_dir(&self) -> &PathBuf {
@@ -707,8 +1009,31 @@ impl ModManager {
             .get(mod_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Mod not found: {}", mod_id))?;
+        // Imports land sorted (Phase 3): a mod that lives
+        // ONLY in the game folder has no library home yet,
+        // so its update is the moment a new file enters the
+        // library. When the library is in layout form (and
+        // the folders share a volume, so the mod can be
+        // projected back), the download lands at the mod's
+        // category home and the game entry becomes its
+        // projection. In a flat library the install stays
+        // exactly what it always was: in place, below.
+        if !self.is_library_path(&old.path)
+            && old.state == ModState::Active
+            && self.library_in_layout_form()
+            && super::layout_exec::same_volume(&self.archive_dir, &self.active_dir)
+                == Some(true)
+        {
+            return self.replace_into_library(&old, downloaded);
+        }
+        // Ruling E, captured BEFORE anything is replaced:
+        // does the game folder hold a proven projection of
+        // this library copy? If so, the install must leave
+        // that entry reading the NEW file (see
+        // `finish_replace`).
+        let was_projection = self.game_entry_is_projection(&old);
         match old.mod_type {
-            ModType::Folder => return self.replace_folder_mod(&old, downloaded),
+            ModType::Folder => return self.replace_folder_mod(&old, downloaded, was_projection),
             ModType::Zip => {}
             _ => anyhow::bail!(
                 "Updates install over .zip or folder mods — {} is neither.",
@@ -743,7 +1068,7 @@ impl ModManager {
         // of the path, so it survives the swap unchanged.
         let fresh = Mod::new(old.path.clone())
             .context("The updated file would not re-read after installing")?;
-        self.finish_replace(&old, fresh)
+        self.finish_replace(&old, fresh, was_projection)
     }
 
     /// The folder-mod half of `replace_mod_file`: the
@@ -752,7 +1077,12 @@ impl ModManager {
     /// aside first and only deleted once the new contents
     /// re-read as a mod — an unpack or parse failure puts
     /// the old folder back exactly as it was.
-    fn replace_folder_mod(&mut self, old: &Mod, downloaded: &std::path::Path) -> Result<String> {
+    fn replace_folder_mod(
+        &mut self,
+        old: &Mod,
+        downloaded: &std::path::Path,
+        was_projection: bool,
+    ) -> Result<String> {
         let folder = old.path.clone();
         let parent = folder
             .parent()
@@ -797,7 +1127,7 @@ impl ModManager {
         match Mod::new(folder.clone()) {
             Ok(fresh) => {
                 let _ = std::fs::remove_dir_all(&backup);
-                self.finish_replace(old, fresh)
+                self.finish_replace(old, fresh, was_projection)
             }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&folder);
@@ -815,12 +1145,24 @@ impl ModManager {
     /// so it survives the swap) and carry favorites and
     /// loadout entries from the old favorite key to the new
     /// one. Returns "old -> new" version text.
-    fn finish_replace(&mut self, old: &Mod, mut fresh: Mod) -> Result<String> {
+    fn finish_replace(
+        &mut self,
+        old: &Mod,
+        mut fresh: Mod,
+        was_projection: bool,
+    ) -> Result<String> {
         fresh.state = old.state.clone();
         let old_key = old.favorite_key();
         let old_version = old.version.clone();
         let new_key = fresh.favorite_key();
         let new_version = fresh.version.clone();
+        // Ruling E: the replaced library copy had a game
+        // projection — the entry must not be left reading
+        // the stranded old file. (A sorted-landing install
+        // passes false: it builds its projection itself.)
+        if was_projection {
+            self.refresh_projection(&fresh);
+        }
         self.mods.insert(fresh.id.clone(), fresh);
 
         let mut dirty = false;
@@ -842,6 +1184,202 @@ impl ModManager {
         }
 
         Ok(format!("{} -> {}", old_version, new_version))
+    }
+
+    /// Ruling E's repair: after an update replaced the
+    /// library copy at `m.path`, make sure the game-folder
+    /// entry reads the NEW file. When the replace preserved
+    /// the file's identity the projection already carries
+    /// the new content (and a junction follows its target
+    /// path by construction) — the executor's proof says
+    /// so and there is nothing to do. When the replace
+    /// created a new file (the zip swap removes and
+    /// renames), the old entry still names the stranded
+    /// file: remove it and project the new copy. If even
+    /// that fails, fall back to a real copy so the game
+    /// keeps an updated, working mod rather than none.
+    fn refresh_projection(&self, m: &Mod) {
+        let entry = self.active_dir.join(m.file_name());
+        if std::fs::symlink_metadata(&entry).is_err() {
+            return;
+        }
+        let kind = Self::projection_kind(m);
+        if super::layout_exec::projection_proven(&m.path, &entry, kind) {
+            return;
+        }
+        if super::layout_exec::remove_projected_entry(&entry).is_err() {
+            return;
+        }
+        if super::layout_exec::create_projection(&m.path, &entry, kind).is_err() {
+            match m.mod_type {
+                ModType::Folder => {
+                    let _ = copy_dir_all(&m.path, &entry);
+                }
+                _ => {
+                    let _ = std::fs::copy(&m.path, &entry);
+                }
+            }
+        }
+    }
+
+    /// The sorted landing for an update install whose mod
+    /// lives only in the game folder (see the dispatch in
+    /// `replace_mod_file`): the download is validated
+    /// exactly as the in-place installs validate theirs,
+    /// placed at the mod's category home in the library,
+    /// and projected back into the game folder — the mod
+    /// gains a library home and stays active, as a link.
+    /// Every failure before the game side is touched
+    /// leaves the installed mod exactly as it was.
+    fn replace_into_library(
+        &mut self,
+        old: &Mod,
+        downloaded: &std::path::Path,
+    ) -> Result<String> {
+        let game_path = old.path.clone();
+        let parent = game_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Mod path has no parent folder"))?
+            .to_path_buf();
+        // Validate the download under a .zip name BEFORE
+        // anything is touched, same as the in-place paths,
+        // and keep the probe's record: its categories pick
+        // the library home.
+        let probe = parent.join(".playground-update-probe.zip");
+        std::fs::copy(downloaded, &probe)
+            .context("Could not stage the downloaded file for checking")?;
+        let probe_result = Mod::new(probe.clone());
+        let _ = std::fs::remove_file(&probe);
+        let probe_mod = probe_result.map_err(|_| {
+            anyhow::anyhow!(
+                "The downloaded file is not a readable mod — keeping the installed one."
+            )
+        })?;
+
+        let file_name = old.file_name();
+        let home = self
+            .archive_dir
+            .join(super::layout::sanitize_category(
+                &super::layout::layout_category(&probe_mod),
+            ))
+            .join(&file_name);
+        let category_dir = home
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Library home has no parent folder"))?
+            .to_path_buf();
+        if home.exists() {
+            anyhow::bail!(
+                "A file already sits at the library home {} — not overwriting it.",
+                home.display()
+            );
+        }
+        std::fs::create_dir_all(&category_dir)
+            .context("Could not create the category folder in the library")?;
+
+        match old.mod_type {
+            ModType::Folder => {
+                // Unpack the download into a fresh folder
+                // at the home; the game folder is touched
+                // only once the new folder re-reads clean.
+                std::fs::create_dir_all(&home)
+                    .context("Could not create the mod's library home")?;
+                let unpacked = extract_zip(downloaded, &home);
+                let fresh = unpacked.and_then(|_| {
+                    Mod::new(home.clone())
+                        .context("The unpacked update would not re-read as a mod")
+                });
+                let fresh = match fresh {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&home);
+                        return Err(e.context(
+                            "Could not install the update into the library — the installed folder was left as it was",
+                        ));
+                    }
+                };
+                // The game side: the old folder aside,
+                // then the junction in its place. If the
+                // junction cannot be made, the new folder
+                // simply moves into the game folder and the
+                // install completes in place instead.
+                let backup =
+                    parent.join(format!(".playground-update-backup-{}", file_name));
+                if backup.exists() {
+                    std::fs::remove_dir_all(&backup)
+                        .context("Could not clear a stale update backup")?;
+                }
+                std::fs::rename(&game_path, &backup)
+                    .context("Could not move the old folder aside")?;
+                match super::layout_exec::create_projection(
+                    &home,
+                    &game_path,
+                    super::layout::LinkKind::Junction,
+                ) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_dir_all(&backup);
+                        self.mods.remove(&old.id);
+                        self.finish_replace(old, fresh, false)
+                    }
+                    Err(_) => match std::fs::rename(&home, &game_path) {
+                        Ok(()) => {
+                            let _ = std::fs::remove_dir_all(&backup);
+                            let fresh =
+                                Mod::new(game_path.clone()).context(
+                                    "The updated file would not re-read after installing",
+                                )?;
+                            self.finish_replace(old, fresh, false)
+                        }
+                        Err(e) => {
+                            let _ = std::fs::rename(&backup, &game_path);
+                            Err(e).context(
+                                "Could not put the updated folder in place — the old folder was restored",
+                            )
+                        }
+                    },
+                }
+            }
+            ModType::Zip => {
+                // Stage the new file beside its home, move
+                // it in, re-read — only then swap the game
+                // entry for a hardlink.
+                let staged = category_dir.join(".playground-update-new.zip");
+                std::fs::copy(downloaded, &staged)
+                    .context("Could not stage the update in the library")?;
+                if let Err(e) = std::fs::rename(&staged, &home) {
+                    let _ = std::fs::remove_file(&staged);
+                    return Err(e)
+                        .context("Could not put the updated file in the library");
+                }
+                let fresh = match Mod::new(home.clone()) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&home);
+                        return Err(e).context(
+                            "The updated file would not re-read after installing — the installed file was left as it was",
+                        );
+                    }
+                };
+                if std::fs::remove_file(&game_path).is_ok() {
+                    if super::layout_exec::create_projection(
+                        &home,
+                        &game_path,
+                        super::layout::LinkKind::Hardlink,
+                    )
+                    .is_err()
+                    {
+                        // Still updated, just not linked:
+                        // a real copy where the link belongs.
+                        let _ = std::fs::copy(&home, &game_path);
+                    }
+                }
+                self.mods.remove(&old.id);
+                self.finish_replace(old, fresh, false)
+            }
+            _ => anyhow::bail!(
+                "Updates install over .zip or folder mods — {} is neither.",
+                old.name
+            ),
+        }
     }
 
     /// The game's profile folder, resolved DIRECTLY (John,
@@ -1130,6 +1668,700 @@ mod tests {
         // longer matches the replaced folder, so the next
         // ask re-parses and serves the new version.
         assert_eq!(db.get_or_parse(&folder).unwrap().version, "2.0.0.0");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3 (steady state) fixtures. The modDesc shapes
+    // mirror the ones the Phase 1/2 rigs proved against
+    // the real binary: a plain desc lands in Scripts, a
+    // <maps> desc in Maps, a store-item desc in its
+    // bucket, and no desc at all in Uncategorized (the
+    // layout's "Other").
+    // -----------------------------------------------------------------
+
+    fn desc_plain(version: &str, title: &str) -> String {
+        format!(
+            "<modDesc><version>{}</version><title><en>{}</en></title></modDesc>",
+            version, title
+        )
+    }
+
+    fn desc_map(version: &str, title: &str) -> String {
+        format!(
+            "<modDesc><version>{}</version><title><en>{}</en></title><maps><map id=\"1\"/></maps></modDesc>",
+            version, title
+        )
+    }
+
+    fn desc_tractor(version: &str, title: &str) -> String {
+        format!(
+            "<modDesc><version>{}</version><title><en>{}</en></title><storeItems><storeItem xmlFilename=\"tractor.xml\"/></storeItems></modDesc>",
+            version, title
+        )
+    }
+
+    const TRACTOR_XML: &str = "<vehicle type=\"tractor\"><storeData><category>tractorsSmall</category></storeData></vehicle>";
+
+    /// Build a zip in memory (Stored, so byte lengths are
+    /// exact — the twin fixtures depend on it).
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(cursor);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn write_zip_file(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, zip_bytes(entries)).unwrap();
+    }
+
+    fn write_folder_mod(dir: &std::path::Path, desc: &str, files: &[(&str, &[u8])]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("modDesc.xml"), desc).unwrap();
+        for (name, data) in files {
+            std::fs::write(dir.join(name), data).unwrap();
+        }
+    }
+
+    /// Project a file the way the layout does: a hardlink
+    /// where the platform supports the test, a plain copy
+    /// elsewhere (the twin test cannot tell them apart,
+    /// which is the point).
+    fn project_file(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::fs::hard_link(src, dst).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(src, dst).unwrap();
+    }
+
+    fn project_folder(src: &std::path::Path, dst: &std::path::Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(src, dst).unwrap();
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(dst).unwrap();
+            for e in std::fs::read_dir(src).unwrap() {
+                let e = e.unwrap();
+                std::fs::copy(e.path(), dst.join(e.file_name())).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn dev_ino(path: &std::path::Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).unwrap();
+        (md.dev(), md.ino())
+    }
+
+    fn scan_scratch(
+        base: &std::path::Path,
+        archive: &std::path::Path,
+        active: &std::path::Path,
+    ) -> Vec<Mod> {
+        let db = crate::mod_manager::library_db::LibraryDb::load_from(
+            base.join("library-db.json"),
+        );
+        let mods = ModManager::scan_directories_with_db(
+            archive.to_path_buf(),
+            active.to_path_buf(),
+            2,
+            &db,
+            &|_, _| {},
+        )
+        .unwrap();
+        let mut mods: Vec<Mod> = mods.into_values().collect();
+        mods.sort_by(|a, b| a.file_name().cmp(&b.file_name()).then(a.path.cmp(&b.path)));
+        mods
+    }
+
+    #[test]
+    fn migrated_tree_scans_as_one_library() {
+        let base =
+            std::env::temp_dir().join(format!("mm-p3-census-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+
+        // The migrated library: one copy of each mod,
+        // filed by category.
+        write_folder_mod(
+            &lib.join("Maps").join("FS25_CensusMap"),
+            &desc_map("1.0.0.0", "Census Map"),
+            &[("data.bin", b"map-data")],
+        );
+        write_zip_file(
+            &lib.join("Scripts").join("FS25_CensusScript.zip"),
+            &[
+                ("modDesc.xml", desc_plain("1.0.0.0", "Census Script").as_bytes()),
+                ("data.bin", b"script-data"),
+            ],
+        );
+        write_zip_file(
+            &lib.join("Other").join("FS25_CensusPlain.zip"),
+            &[("data.txt", b"no moddesc here")],
+        );
+        write_zip_file(
+            &lib.join("Scripts").join("FS25_CensusDiverged.zip"),
+            &[("modDesc.xml", desc_plain("1.0.0.0", "Census Diverged").as_bytes())],
+        );
+        // Projections for the active two.
+        project_folder(
+            &lib.join("Maps").join("FS25_CensusMap"),
+            &game.join("FS25_CensusMap"),
+        );
+        project_file(
+            &lib.join("Scripts").join("FS25_CensusScript.zip"),
+            &game.join("FS25_CensusScript.zip"),
+        );
+        // A diverged real copy in the game folder: same
+        // name, different version — NOT a projection.
+        write_zip_file(
+            &game.join("FS25_CensusDiverged.zip"),
+            &[
+                ("modDesc.xml", desc_plain("2.0.0.0", "Census Diverged").as_bytes()),
+                ("extra.bin", b"a longer payload"),
+            ],
+        );
+        // A game-only mod.
+        write_zip_file(
+            &game.join("FS25_CensusGameOnly.zip"),
+            &[("modDesc.xml", desc_plain("1.0.0.0", "Census GameOnly").as_bytes())],
+        );
+
+        let mods = scan_scratch(&base, &lib, &game);
+
+        // The census: 5 library/game mods + the diverged
+        // twin counted twice = 6 records, and NO phantom
+        // record for any category folder.
+        let names: Vec<String> = mods.iter().map(|m| m.file_name()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "FS25_CensusDiverged.zip",
+                "FS25_CensusDiverged.zip",
+                "FS25_CensusGameOnly.zip",
+                "FS25_CensusMap",
+                "FS25_CensusPlain.zip",
+                "FS25_CensusScript.zip",
+            ]
+        );
+        assert!(mods.iter().all(|m| {
+            m.path != lib.join("Maps") && m.path != lib.join("Scripts") && m.path != lib.join("Other")
+        }));
+
+        let by_name = |n: &str| mods.iter().filter(|m| m.file_name() == n).collect::<Vec<_>>();
+        let map = &by_name("FS25_CensusMap")[0];
+        assert_eq!(map.path, lib.join("Maps").join("FS25_CensusMap"));
+        assert_eq!(map.state, ModState::Active);
+        assert!(map.categories.iter().any(|c| c == "Maps"));
+
+        let script = &by_name("FS25_CensusScript.zip")[0];
+        assert_eq!(script.path, lib.join("Scripts").join("FS25_CensusScript.zip"));
+        assert_eq!(script.state, ModState::Active);
+
+        let plain = &by_name("FS25_CensusPlain.zip")[0];
+        assert_eq!(plain.path, lib.join("Other").join("FS25_CensusPlain.zip"));
+        assert_eq!(plain.state, ModState::Archived);
+
+        let diverged = by_name("FS25_CensusDiverged.zip");
+        assert_eq!(diverged.len(), 2);
+        let lib_copy = diverged.iter().find(|m| m.path.starts_with(&lib)).unwrap();
+        let game_copy = diverged.iter().find(|m| m.path.starts_with(&game)).unwrap();
+        assert_eq!(lib_copy.state, ModState::Archived);
+        assert_eq!(lib_copy.version, "1.0.0.0");
+        assert_eq!(game_copy.state, ModState::Active);
+        assert_eq!(game_copy.version, "2.0.0.0");
+
+        let game_only = &by_name("FS25_CensusGameOnly.zip")[0];
+        assert_eq!(game_only.path, game.join("FS25_CensusGameOnly.zip"));
+        assert_eq!(game_only.state, ModState::Active);
+
+        // Conflicts: only the diverged pair — projections
+        // produce none.
+        let conflicts =
+            crate::mod_manager::conflict::ConflictDetector::detect_conflicts(&mods);
+        assert!(!conflicts.is_empty());
+        assert!(conflicts
+            .iter()
+            .all(|c| c.mod1 == "FS25_CensusDiverged.zip" || c.mod2 == "FS25_CensusDiverged.zip"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// THE acceptance scenario (owner, 2026-10-21, after
+    /// the v1.3.0 field test): the migrated library's mod
+    /// list must be indistinguishable from the flat
+    /// library's — same filenames, same categories, same
+    /// active flags — with the ONLY change being that the
+    /// active mods are projections in the game folder.
+    #[test]
+    fn layout_list_equality_flat_vs_migrated() {
+        let build = |tag: &str, migrated: bool| {
+            let base = std::env::temp_dir().join(format!(
+                "mm-p3-equal-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            let lib = base.join("lib");
+            let game = base.join("game");
+            std::fs::create_dir_all(&game).unwrap();
+            // File a library copy: at the root when flat,
+            // in its category folder when migrated.
+            let at = |lib: &std::path::Path, cat: &str, name: &str| {
+                if migrated {
+                    lib.join(cat).join(name)
+                } else {
+                    lib.join(name)
+                }
+            };
+            write_zip_file(
+                &at(&lib, "Tractors", "FS25_EqTractor.zip"),
+                &[
+                    ("modDesc.xml", desc_tractor("1.0.0.0", "Eq Tractor").as_bytes()),
+                    ("tractor.xml", TRACTOR_XML.as_bytes()),
+                ],
+            );
+            write_zip_file(
+                &at(&lib, "Maps", "FS25_EqMap.zip"),
+                &[("modDesc.xml", desc_map("1.0.0.0", "Eq Map").as_bytes())],
+            );
+            write_zip_file(
+                &at(&lib, "Scripts", "FS25_EqScript.zip"),
+                &[("modDesc.xml", desc_plain("1.0.0.0", "Eq Script").as_bytes())],
+            );
+            write_zip_file(
+                &at(&lib, "Other", "FS25_EqNoDesc.zip"),
+                &[("data.txt", b"no moddesc here")],
+            );
+            write_folder_mod(
+                &at(&lib, "Scripts", "FS25_EqFolder"),
+                &desc_plain("1.0.0.0", "Eq Folder"),
+                &[("data.bin", b"folder-data")],
+            );
+            // Active set: the tractor and the folder mod,
+            // plus a game-only mod — the same in both
+            // worlds (links after migration, copies
+            // before; the scan must not care).
+            if migrated {
+                project_file(
+                    &at(&lib, "Tractors", "FS25_EqTractor.zip"),
+                    &game.join("FS25_EqTractor.zip"),
+                );
+                project_folder(
+                    &at(&lib, "Scripts", "FS25_EqFolder"),
+                    &game.join("FS25_EqFolder"),
+                );
+            } else {
+                std::fs::copy(
+                    at(&lib, "Tractors", "FS25_EqTractor.zip"),
+                    game.join("FS25_EqTractor.zip"),
+                )
+                .unwrap();
+                write_folder_mod(
+                    &game.join("FS25_EqFolder"),
+                    &desc_plain("1.0.0.0", "Eq Folder"),
+                    &[("data.bin", b"folder-data")],
+                );
+            }
+            write_zip_file(
+                &game.join("FS25_EqGameOnly.zip"),
+                &[("modDesc.xml", desc_plain("1.0.0.0", "Eq GameOnly").as_bytes())],
+            );
+            (base, lib, game)
+        };
+
+        let shape = |mods: &[Mod]| {
+            let mut v: Vec<(String, String, bool)> = mods
+                .iter()
+                .map(|m| {
+                    (
+                        m.file_name(),
+                        m.categories.join(","),
+                        m.state == ModState::Active,
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+
+        let (flat_base, flat_lib, flat_game) = build("flat", false);
+        let flat_mods = scan_scratch(&flat_base, &flat_lib, &flat_game);
+        let (mig_base, mig_lib, mig_game) = build("mig", true);
+        let mig_mods = scan_scratch(&mig_base, &mig_lib, &mig_game);
+
+        assert_eq!(flat_mods.len(), 6, "flat census: {:?}", flat_mods.iter().map(|m| m.file_name()).collect::<Vec<_>>());
+        assert_eq!(
+            shape(&flat_mods),
+            shape(&mig_mods),
+            "the migrated mod list must equal the flat one"
+        );
+        // And the trees really do differ underneath: the
+        // migrated records point into category folders.
+        assert!(mig_mods
+            .iter()
+            .filter(|m| m.path.starts_with(&mig_lib))
+            .all(|m| m.path.parent() != Some(mig_lib.as_path())));
+
+        std::fs::remove_dir_all(&flat_base).ok();
+        std::fs::remove_dir_all(&mig_base).ok();
+    }
+
+    #[test]
+    fn layout_activate_deactivate_use_links() {
+        let base =
+            std::env::temp_dir().join(format!("mm-p3-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        write_zip_file(
+            &lib.join("Scripts").join("FS25_LinkScript.zip"),
+            &[
+                ("modDesc.xml", desc_plain("1.0.0.0", "Link Script").as_bytes()),
+                ("data.bin", b"script-bytes"),
+            ],
+        );
+        write_folder_mod(
+            &lib.join("Maps").join("FS25_LinkMap"),
+            &desc_map("1.0.0.0", "Link Map"),
+            &[("data.bin", b"map-bytes")],
+        );
+        let script_home = lib.join("Scripts").join("FS25_LinkScript.zip");
+        let script_bytes = std::fs::read(&script_home).unwrap();
+
+        let mut manager = ModManager::new(test_config(lib.clone(), game.clone())).unwrap();
+        let find = |manager: &ModManager, name: &str| {
+            manager
+                .get_mods()
+                .into_iter()
+                .find(|m| m.file_name() == name)
+                .unwrap()
+                .clone()
+        };
+
+        // Activate the zip: a projection appears, the
+        // library file is untouched, the record stays
+        // keyed to the library copy.
+        let script = find(&manager, "FS25_LinkScript.zip");
+        assert_eq!(script.state, ModState::Archived);
+        manager.move_to_active(&script.id).unwrap();
+        let entry = game.join("FS25_LinkScript.zip");
+        assert!(entry.exists());
+        #[cfg(unix)]
+        assert_eq!(dev_ino(&entry), dev_ino(&script_home), "the game entry is the library file (hardlink)");
+        assert_eq!(std::fs::read(&script_home).unwrap(), script_bytes);
+        let script = find(&manager, "FS25_LinkScript.zip");
+        assert_eq!(script.state, ModState::Active);
+        assert_eq!(script.path, script_home);
+
+        // Deactivate: the link goes, the library bytes stay.
+        manager.move_to_archive(&script.id).unwrap();
+        assert!(!entry.exists());
+        assert_eq!(std::fs::read(&script_home).unwrap(), script_bytes);
+        assert_eq!(find(&manager, "FS25_LinkScript.zip").state, ModState::Archived);
+
+        // The folder mod projects as a link too.
+        let map = find(&manager, "FS25_LinkMap");
+        manager.move_to_active(&map.id).unwrap();
+        let map_entry = game.join("FS25_LinkMap");
+        assert!(map_entry.join("modDesc.xml").exists());
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(&map_entry)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the folder projection is a link, not a copy"
+        );
+        manager.move_to_archive(&map.id).unwrap();
+        assert!(std::fs::symlink_metadata(&map_entry).is_err());
+        assert!(lib.join("Maps").join("FS25_LinkMap").join("data.bin").exists());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn deactivate_against_a_real_file_uses_move_semantics() {
+        // Same name, same size, same version — but a REAL
+        // game copy with different bytes (not a hardlink).
+        // Deactivation must not just unlink it (that would
+        // silently keep the library's variant); the game
+        // copy moves onto the library home, as it always
+        // did — proven by whose bytes survive.
+        let base =
+            std::env::temp_dir().join(format!("mm-p3-twinmove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        let desc = desc_plain("1.0.0.0", "Twin Move");
+        let bytes_a = zip_bytes(&[
+            ("modDesc.xml", desc.as_bytes()),
+            ("pad.bin", &[b'A'; 64]),
+        ]);
+        let bytes_b = zip_bytes(&[
+            ("modDesc.xml", desc.as_bytes()),
+            ("pad.bin", &[b'B'; 64]),
+        ]);
+        assert_eq!(bytes_a.len(), bytes_b.len());
+        let home = lib.join("Scripts").join("FS25_TwinMove.zip");
+        std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+        std::fs::write(&home, &bytes_a).unwrap();
+        let entry = game.join("FS25_TwinMove.zip");
+        std::fs::write(&entry, &bytes_b).unwrap();
+
+        let mut manager = ModManager::new(test_config(lib.clone(), game.clone())).unwrap();
+        let twin = manager
+            .get_mods()
+            .into_iter()
+            .find(|m| m.file_name() == "FS25_TwinMove.zip")
+            .unwrap()
+            .clone();
+        // One record (the twin test passed), Active, keyed
+        // to the library copy.
+        assert_eq!(twin.state, ModState::Active);
+        assert_eq!(twin.path, home);
+        #[cfg(unix)]
+        assert_ne!(dev_ino(&entry), dev_ino(&home), "fixture: a real copy, not a link");
+
+        manager.move_to_archive(&twin.id).unwrap();
+        assert!(!entry.exists());
+        assert_eq!(
+            std::fs::read(&home).unwrap(),
+            bytes_b,
+            "the game copy's bytes moved onto the library home"
+        );
+        assert_eq!(
+            manager.get_mod(&twin.id).unwrap().state,
+            ModState::Archived
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn flat_tree_scan_and_moves_behave_as_before() {
+        let base =
+            std::env::temp_dir().join(format!("mm-p3-flat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::create_dir_all(&game).unwrap();
+        write_zip_file(
+            &lib.join("FS25_FlatA.zip"),
+            &[("modDesc.xml", desc_plain("1.0.0.0", "Flat A").as_bytes())],
+        );
+        write_zip_file(
+            &lib.join("FS25_FlatT.zip"),
+            &[("modDesc.xml", desc_plain("1.0.0.0", "Flat T").as_bytes())],
+        );
+        std::fs::copy(lib.join("FS25_FlatT.zip"), game.join("FS25_FlatT.zip")).unwrap();
+        write_zip_file(
+            &game.join("FS25_FlatB.zip"),
+            &[("modDesc.xml", desc_plain("1.0.0.0", "Flat B").as_bytes())],
+        );
+
+        let mut manager = ModManager::new(test_config(lib.clone(), game.clone())).unwrap();
+        let find = |manager: &ModManager, name: &str| {
+            manager
+                .get_mods()
+                .into_iter()
+                .filter(|m| m.file_name() == name)
+                .map(|m| m.clone())
+                .collect::<Vec<_>>()
+        };
+        // The flat census: A archived at the root, B
+        // game-only, T one twin record.
+        let a = find(&manager, "FS25_FlatA.zip");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].state, ModState::Archived);
+        assert_eq!(a[0].path, lib.join("FS25_FlatA.zip"));
+        let b = find(&manager, "FS25_FlatB.zip");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].state, ModState::Active);
+        assert_eq!(b[0].path, game.join("FS25_FlatB.zip"));
+        let t = find(&manager, "FS25_FlatT.zip");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].state, ModState::Active);
+
+        // Activation MOVES the flat library's file, as
+        // always: the archive copy leaves, a real file
+        // lands in the game folder.
+        let a_id = a[0].id.clone();
+        manager.move_to_active(&a_id).unwrap();
+        assert!(!lib.join("FS25_FlatA.zip").exists());
+        assert!(game.join("FS25_FlatA.zip").exists());
+        let a = find(&manager, "FS25_FlatA.zip");
+        assert_eq!(a[0].path, game.join("FS25_FlatA.zip"));
+        assert_eq!(a[0].state, ModState::Active);
+        // And back.
+        manager.move_to_archive(&a_id).unwrap();
+        assert!(lib.join("FS25_FlatA.zip").exists());
+        assert!(!game.join("FS25_FlatA.zip").exists());
+        let a = find(&manager, "FS25_FlatA.zip");
+        assert_eq!(a[0].path, lib.join("FS25_FlatA.zip"));
+        assert_eq!(a[0].state, ModState::Archived);
+
+        // Deactivating the flat twin: the game copy moves
+        // onto the archive copy; one copy remains, at the
+        // root.
+        let t_id = t[0].id.clone();
+        let t_bytes = std::fs::read(lib.join("FS25_FlatT.zip")).unwrap();
+        manager.move_to_archive(&t_id).unwrap();
+        assert!(!game.join("FS25_FlatT.zip").exists());
+        assert_eq!(std::fs::read(lib.join("FS25_FlatT.zip")).unwrap(), t_bytes);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn update_install_keeps_the_projection_current() {
+        let base =
+            std::env::temp_dir().join(format!("mm-p3-updlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        let home = lib.join("Scripts").join("FS25_UpdScript.zip");
+        write_zip_file(
+            &home,
+            &[
+                ("modDesc.xml", desc_plain("1.0.0.0", "Upd Script").as_bytes()),
+                ("data.bin", b"v1"),
+            ],
+        );
+        let entry = game.join("FS25_UpdScript.zip");
+        project_file(&home, &entry);
+
+        let mut manager = ModManager::new(test_config(lib.clone(), game.clone())).unwrap();
+        let rec = manager
+            .get_mods()
+            .into_iter()
+            .find(|m| m.file_name() == "FS25_UpdScript.zip")
+            .unwrap()
+            .clone();
+        assert_eq!(rec.state, ModState::Active);
+        assert_eq!(rec.path, home);
+
+        let download = base.join("download.zip");
+        write_zip_file(
+            &download,
+            &[
+                ("modDesc.xml", desc_plain("2.0.0.0", "Upd Script").as_bytes()),
+                ("data.bin", b"v2-with-more-bytes"),
+            ],
+        );
+        let change = manager.replace_mod_file(&rec.id, &download).unwrap();
+        assert_eq!(change, "1.0.0.0 -> 2.0.0.0");
+
+        // The entry the game reads now carries the NEW
+        // file — not the stranded old one (Ruling E).
+        assert_eq!(std::fs::read(&entry).unwrap(), std::fs::read(&home).unwrap());
+        assert_eq!(Mod::new(entry.clone()).unwrap().version, "2.0.0.0");
+        #[cfg(unix)]
+        assert_eq!(dev_ino(&entry), dev_ino(&home), "the entry was re-projected onto the new file");
+        let rec = manager.get_mod(&rec.id).unwrap();
+        assert_eq!(rec.version, "2.0.0.0");
+        assert_eq!(rec.path, home);
+        assert_eq!(rec.state, ModState::Active);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn game_only_update_lands_sorted_and_projects() {
+        let base =
+            std::env::temp_dir().join(format!("mm-p3-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        // The anchor: a filed library mod — the library
+        // is in layout form.
+        write_zip_file(
+            &lib.join("Scripts").join("FS25_Anchor.zip"),
+            &[("modDesc.xml", desc_plain("1.0.0.0", "Anchor").as_bytes())],
+        );
+        // Two game-only mods: one with a category, one
+        // without.
+        write_zip_file(
+            &game.join("FS25_ImpScript.zip"),
+            &[("modDesc.xml", desc_plain("1.0.0.0", "Imp Script").as_bytes())],
+        );
+        write_zip_file(
+            &game.join("FS25_ImpPlain.zip"),
+            &[("data.txt", b"v1")],
+        );
+
+        let mut manager = ModManager::new(test_config(lib.clone(), game.clone())).unwrap();
+        let id_of = |manager: &ModManager, name: &str| {
+            manager
+                .get_mods()
+                .into_iter()
+                .find(|m| m.file_name() == name)
+                .unwrap()
+                .id
+                .clone()
+        };
+
+        // The categorized one lands in Scripts/.
+        let dl = base.join("dl-script.zip");
+        write_zip_file(
+            &dl,
+            &[("modDesc.xml", desc_plain("2.0.0.0", "Imp Script").as_bytes())],
+        );
+        let id = id_of(&manager, "FS25_ImpScript.zip");
+        let change = manager.replace_mod_file(&id, &dl).unwrap();
+        assert_eq!(change, "1.0.0.0 -> 2.0.0.0");
+        let home = lib.join("Scripts").join("FS25_ImpScript.zip");
+        assert!(home.exists());
+        let rec = manager
+            .get_mods()
+            .into_iter()
+            .find(|m| m.file_name() == "FS25_ImpScript.zip")
+            .unwrap();
+        assert_eq!(rec.path, home);
+        assert_eq!(rec.state, ModState::Active);
+        let entry = game.join("FS25_ImpScript.zip");
+        assert_eq!(std::fs::read(&entry).unwrap(), std::fs::read(&home).unwrap());
+        #[cfg(unix)]
+        assert_eq!(dev_ino(&entry), dev_ino(&home), "projected after placement");
+
+        // The category-less one lands in Other/, and its
+        // game entry reads the new bytes through the link.
+        let dl2 = base.join("dl-plain.zip");
+        write_zip_file(&dl2, &[("data.txt", b"v2-longer")]);
+        let id = id_of(&manager, "FS25_ImpPlain.zip");
+        manager.replace_mod_file(&id, &dl2).unwrap();
+        let home2 = lib.join("Other").join("FS25_ImpPlain.zip");
+        assert!(home2.exists());
+        let entry2 = game.join("FS25_ImpPlain.zip");
+        let through = {
+            let f = std::fs::File::open(&entry2).unwrap();
+            let mut z = zip::ZipArchive::new(f).unwrap();
+            let mut s = String::new();
+            use std::io::Read as _;
+            z.by_name("data.txt").unwrap().read_to_string(&mut s).unwrap();
+            s
+        };
+        assert_eq!(through, "v2-longer");
+        #[cfg(unix)]
+        assert_eq!(dev_ino(&entry2), dev_ino(&home2));
 
         std::fs::remove_dir_all(&base).ok();
     }
