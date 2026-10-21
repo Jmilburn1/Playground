@@ -7,6 +7,7 @@ use crate::mod_manager::layout::{self, LayoutPlan};
 use crate::mod_manager::layout_exec::{
     self, ApplyOutcome, LayoutState, MigrationStatus, RollbackOutcome,
 };
+use crate::mod_manager::savegame::{self, CareerSettings, FarmFinances, RecordedMod};
 use crate::mod_manager::saves::SaveSlot;
 use crate::mod_manager::types::{Mod, ModState};
 use crate::mod_manager::ModManager;
@@ -99,6 +100,173 @@ fn tally_states(states: impl Iterator<Item = ModState>) -> (usize, usize, usize)
     (total, active, archived)
 }
 
+/// Configure Save: money with thousands separators —
+/// "$181,992". The wizard's cash and loan speak in whole
+/// amounts; a negative keeps its sign.
+fn fmt_money(v: i64) -> String {
+    let digits = v.unsigned_abs().to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    format!("{}${}", if v < 0 { "-" } else { "" }, grouped)
+}
+
+/// The wizard's panel: petrol fill, soft corners — the
+/// app's current language (theme palette), used for the
+/// wizard's sections and summary blocks.
+fn wizard_panel(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(theme::PANEL)),
+        border: iced::Border {
+            color: iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: 8.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The wizard's inset box (a path display inside a panel):
+/// the near-black base, so it reads as a well in the panel.
+fn wizard_inset(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(theme::BASE)),
+        border: iced::Border {
+            color: iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: 8.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// One titled section of the Settings step.
+fn wizard_section<'a>(
+    title: &'a str,
+    body: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut col = column![text(title).size(15).color(theme::TEXT)].spacing(7);
+    for el in body {
+        col = col.push(el);
+    }
+    container(col)
+        .width(Length::Fill)
+        .padding(11)
+        .style(wizard_panel)
+        .into()
+}
+
+/// A settings row that may not exist in this save: the
+/// control when the save carries the field, the honest
+/// absence line when it doesn't.
+fn wizard_opt_row<'a>(
+    label: &'a str,
+    present: bool,
+    control: Element<'a, Message>,
+) -> Element<'a, Message> {
+    if present {
+        wizard_row(label, control)
+    } else {
+        wizard_absent(label)
+    }
+}
+
+/// A labelled settings row: the label takes a fixed
+/// column so the controls line up down the page.
+fn wizard_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
+    row![
+        text(label).size(13).color(theme::TEXT).width(200),
+        control,
+    ]
+    .spacing(10)
+    .into()
+}
+
+/// A settings row for a field the save doesn't carry:
+/// named, and honestly marked — never given a control
+/// that would invent it (owner ruling, 2026-10-21).
+fn wizard_absent<'a>(label: &'a str) -> Element<'a, Message> {
+    row![
+        text(label).size(13).color(theme::TEXT_DIM).width(200),
+        text("Not in this save yet").size(12).color(theme::TEXT_DIM),
+    ]
+    .spacing(10)
+    .into()
+}
+
+/// Two pills for a boolean field, with the player's own
+/// words for the ends ("Off"/"On", "Off"/"Buy").
+fn wizard_bool_pills<'a>(
+    key: &str,
+    value: bool,
+    off_label: &'a str,
+    on_label: &'a str,
+) -> Element<'a, Message> {
+    let key = key.to_string();
+    row![
+        button(text(off_label).size(12))
+            .style(theme::nav_pill(!value))
+            .on_press(Message::WizardSetBool(key.clone(), false)),
+        button(text(on_label).size(12))
+            .style(theme::nav_pill(value))
+            .on_press(Message::WizardSetBool(key, true)),
+    ]
+    .spacing(4)
+    .into()
+}
+
+/// A row of option pills for an enum/number field.
+/// Options are (stored value, label); the current value
+/// is lit. A current value outside the option set is
+/// added as its own lit pill, so the save's real value
+/// is never hidden from its owner.
+fn wizard_segment<'a>(
+    key: &str,
+    options: Vec<(String, String)>,
+    current: &str,
+) -> Element<'a, Message> {
+    let mut options = options;
+    if !options.iter().any(|(v, _)| v == current) {
+        options.push((current.to_string(), current.to_string()));
+    }
+    let key = key.to_string();
+    let mut r = row![].spacing(4);
+    for (value, label) in options {
+        let selected = value == current;
+        r = r.push(
+            button(text(label).size(12))
+                .style(theme::nav_pill(selected))
+                .on_press(Message::WizardSetValue(key.clone(), value)),
+        );
+    }
+    r.into()
+}
+
+/// A small rounded label chip, in the mod card's pill
+/// shape but the theme palette.
+fn wizard_pill(
+    label: String,
+    bg: iced::Color,
+    fg: iced::Color,
+) -> Element<'static, Message> {
+    container(text(label).size(10).color(fg))
+        .padding([2, 7])
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(bg)),
+            border: iced::Border {
+                color: iced::Color::TRANSPARENT,
+                width: 0.0,
+                radius: 9.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// The boot handover (splash -> main window) as a small
 /// state machine, driven by the Restore* messages and a
 /// short-lived clock subscription. It exists so the
@@ -158,6 +326,33 @@ enum LayoutRun {
     Rollback,
 }
 
+/// One mod as the Configure Save loadout step shows it:
+/// the card's facts, plus the draft key it toggles by.
+#[derive(Debug, Clone)]
+struct WizardModEntry {
+    key: String,
+    id: String,
+    name: String,
+    author: Option<String>,
+    version: String,
+    category: Option<String>,
+    required: bool,
+}
+
+/// A money field's text as a whole number: thousands
+/// separators, spaces, and a stray currency symbol are
+/// forgiven; anything else doesn't parse.
+fn parse_amount(text: &str) -> Option<i64> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    if cleaned.is_empty() || cleaned == "-" {
+        return None;
+    }
+    cleaned.parse::<i64>().ok()
+}
+
 pub struct App {
     mod_manager: ModManager,
     current_tab: Tab,
@@ -195,12 +390,31 @@ pub struct App {
     /// reaches the card's select handler (nested widgets), and this
     /// flag tells it to stand down once.
     just_toggled_favorite: bool,
-    /// Configure Save (Saves tab) state.
+    /// Configure Save wizard state. The step is 0-based:
+    /// 0 Select, 1 Settings, 2 Loadout, 3 Review, 4 Results.
+    /// `wizard_original` is the save as read from disk; the
+    /// draft beside it is what the player edits, and Review
+    /// diffs the two.
     save_slots_cache: Vec<SaveSlot>,
     saves_selected: Option<String>,
     saves_draft: HashSet<String>,
     saves_filter: String,
-    saves_arm_apply: bool,
+    wizard_step: u8,
+    wizard_original: Option<CareerSettings>,
+    wizard_settings: Option<CareerSettings>,
+    wizard_finances: Option<FarmFinances>,
+    wizard_other_names: Vec<String>,
+    wizard_cash: String,
+    wizard_loan: String,
+    wizard_recorded: Vec<RecordedMod>,
+    wizard_missing: Vec<String>,
+    wizard_seed_note: String,
+    wizard_autodrive: Option<PathBuf>,
+    wizard_autodrive_existing: bool,
+    wizard_collapsed: HashSet<String>,
+    wizard_arm_apply: bool,
+    wizard_done: Vec<String>,
+    wizard_failed: Vec<String>,
     /// Log Reader state.
     log_lines: Vec<LogLine>,
     log_suspects: Vec<String>,
@@ -314,7 +528,22 @@ impl App {
             saves_selected: None,
             saves_draft: HashSet::new(),
             saves_filter: String::new(),
-            saves_arm_apply: false,
+            wizard_step: 0,
+            wizard_original: None,
+            wizard_settings: None,
+            wizard_finances: None,
+            wizard_other_names: Vec::new(),
+            wizard_cash: String::new(),
+            wizard_loan: String::new(),
+            wizard_recorded: Vec::new(),
+            wizard_missing: Vec::new(),
+            wizard_seed_note: String::new(),
+            wizard_autodrive: None,
+            wizard_autodrive_existing: false,
+            wizard_collapsed: HashSet::new(),
+            wizard_arm_apply: false,
+            wizard_done: Vec::new(),
+            wizard_failed: Vec::new(),
             log_lines: Vec::new(),
             log_suspects: Vec::new(),
             log_error_count: 0,
@@ -660,6 +889,481 @@ impl App {
         self.save_slots_cache = self.mod_manager.save_slots();
     }
 
+    /// Configure Save: load a slot's files into the wizard —
+    /// settings, finances, the recorded mod list — and seed
+    /// the loadout draft from them.
+    fn wizard_load_slot(&mut self, dir_name: &str) {
+        self.saves_selected = Some(dir_name.to_string());
+        self.wizard_arm_apply = false;
+        self.wizard_done.clear();
+        self.wizard_failed.clear();
+        self.wizard_autodrive = None;
+        let slot_path = self
+            .save_slots_cache
+            .iter()
+            .find(|s| s.dir_name == dir_name)
+            .map(|s| s.path.clone());
+        let Some(slot_path) = slot_path else {
+            self.wizard_original = None;
+            self.wizard_settings = None;
+            self.wizard_finances = None;
+            self.wizard_recorded = Vec::new();
+            self.wizard_missing = Vec::new();
+            self.wizard_seed_note = String::new();
+            self.saves_draft.clear();
+            return;
+        };
+        // The other slots' names, for the unique-name check.
+        self.wizard_other_names = self
+            .save_slots_cache
+            .iter()
+            .filter(|s| s.dir_name != dir_name)
+            .filter_map(|s| {
+                let xml =
+                    std::fs::read_to_string(s.path.join("careerSavegame.xml")).ok()?;
+                savegame::read_settings(&xml).savegame_name
+            })
+            .collect();
+        let loaded = savegame::load_slot(&slot_path);
+        self.wizard_cash = loaded
+            .finances
+            .money
+            .map(|m| m.to_string())
+            .unwrap_or_default();
+        self.wizard_loan = loaded
+            .finances
+            .loan
+            .map(|l| l.to_string())
+            .unwrap_or_default();
+        self.wizard_finances = Some(loaded.finances);
+        self.wizard_autodrive_existing = loaded.autodrive_present;
+        self.wizard_recorded = loaded.recorded;
+        self.wizard_original = Some(loaded.settings.clone());
+        self.wizard_settings = Some(loaded.settings);
+        self.wizard_seed_draft();
+    }
+
+    /// Seed (or reseed) the loadout draft: the save's own
+    /// recorded mod list when it has one — mods it names
+    /// that the library doesn't hold stay as missing, by
+    /// name — else the stored loadout for the slot, else
+    /// the current Active set.
+    fn wizard_seed_draft(&mut self) {
+        if !self.wizard_recorded.is_empty() {
+            let by_stem: HashMap<String, String> = self
+                .mod_manager
+                .get_mods()
+                .iter()
+                .map(|m| {
+                    (
+                        ModManager::mod_stem(&m.path).to_lowercase(),
+                        m.favorite_key(),
+                    )
+                })
+                .collect();
+            let mut draft = HashSet::new();
+            let mut missing = Vec::new();
+            for rec in &self.wizard_recorded {
+                match by_stem.get(&rec.mod_name.to_lowercase()) {
+                    Some(key) => {
+                        draft.insert(key.clone());
+                    }
+                    None => missing.push(
+                        rec.title.clone().unwrap_or_else(|| rec.mod_name.clone()),
+                    ),
+                }
+            }
+            let found = draft.len();
+            let total = self.wizard_recorded.len();
+            self.saves_draft = draft;
+            self.wizard_missing = missing;
+            self.wizard_seed_note = format!(
+                "Seeded from the save's own recorded mod list — {} of {} found in your library.",
+                found, total
+            );
+            return;
+        }
+        let stored = self
+            .saves_selected
+            .as_ref()
+            .map(|s| self.mod_manager.save_loadout(s))
+            .unwrap_or_default();
+        if !stored.is_empty() {
+            self.saves_draft = stored.into_iter().collect();
+            self.wizard_seed_note =
+                "Seeded from the loadout saved for this slot.".to_string();
+        } else {
+            self.saves_draft = self
+                .mod_manager
+                .get_mods()
+                .into_iter()
+                .filter(|m| m.state == ModState::Active)
+                .map(|m| m.favorite_key())
+                .collect();
+            self.wizard_seed_note =
+                "Seeded from your current Active set.".to_string();
+        }
+        self.wizard_missing = Vec::new();
+    }
+
+    /// The loadout step's three groups: the map's required
+    /// mods first, then the player's favourites, then the
+    /// rest of the library. One definition, shared by the
+    /// page and the group select/deselect buttons.
+    fn wizard_groups(&self) -> Vec<(String, String, Vec<WizardModEntry>)> {
+        let required_stems: HashSet<String> = self
+            .wizard_recorded
+            .iter()
+            .filter(|r| r.required)
+            .map(|r| r.mod_name.to_lowercase())
+            .collect();
+        let mut required = Vec::new();
+        let mut favourites = Vec::new();
+        let mut library = Vec::new();
+        for m in self.mod_manager.get_mods() {
+            let entry = WizardModEntry {
+                key: m.favorite_key(),
+                id: m.id.clone(),
+                name: m.name.clone(),
+                author: m.author.clone(),
+                version: m.version.clone(),
+                category: m.categories.first().cloned(),
+                required: required_stems
+                    .contains(&ModManager::mod_stem(&m.path).to_lowercase()),
+            };
+            if entry.required {
+                required.push(entry);
+            } else if self.mod_manager.is_favorite(&entry.key) {
+                favourites.push(entry);
+            } else {
+                library.push(entry);
+            }
+        }
+        let by_name = |a: &WizardModEntry, b: &WizardModEntry| {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        };
+        required.sort_by(by_name);
+        favourites.sort_by(by_name);
+        library.sort_by(by_name);
+        vec![
+            (
+                "required".to_string(),
+                "Required by Map".to_string(),
+                required,
+            ),
+            (
+                "favourites".to_string(),
+                "Favourites".to_string(),
+                favourites,
+            ),
+            ("library".to_string(), "Library".to_string(), library),
+        ]
+    }
+
+    fn wizard_group_entries(&self, group: &str) -> Vec<WizardModEntry> {
+        self.wizard_groups()
+            .into_iter()
+            .find(|(id, _, _)| id == group)
+            .map(|(_, _, entries)| entries)
+            .unwrap_or_default()
+    }
+
+    /// Settings-page edits, by key. Keys are the wizard's
+    /// own short names; the mapping to XML elements lives
+    /// in mod_manager::savegame.
+    fn wizard_set_bool(&mut self, key: &str, value: bool) {
+        if let Some(s) = &mut self.wizard_settings {
+            match key {
+                "traffic" => s.traffic_enabled = Some(value),
+                "snow" => s.snow_enabled = Some(value),
+                "fruit_destruction" => s.fruit_destruction = Some(value),
+                "plowing" => s.plowing_required_enabled = Some(value),
+                "stones" => s.stones_enabled = Some(value),
+                "lime" => s.lime_required = Some(value),
+                "weeds" => s.weeds_enabled = Some(value),
+                "motor_start" => s.automatic_motor_start_enabled = Some(value),
+                "stop_and_go" => s.stop_and_go_braking = Some(value),
+                "trailer_fill" => s.trailer_fill_limit = Some(value),
+                "helper_fuel" => s.helper_buy_fuel = Some(value),
+                "helper_seeds" => s.helper_buy_seeds = Some(value),
+                "helper_fertilizer" => s.helper_buy_fertilizer = Some(value),
+                "fixed_visual" => s.fixed_visual_month = Some(value),
+                _ => {}
+            }
+        }
+        self.wizard_arm_apply = false;
+    }
+
+    fn wizard_set_value(&mut self, key: &str, value: &str) {
+        if let Some(s) = &mut self.wizard_settings {
+            match key {
+                "difficulty" => {
+                    s.economic_difficulty = Some(value.to_string())
+                }
+                "growth" => s.growth_mode = value.parse().ok(),
+                "fuel" => s.fuel_usage = value.parse().ok(),
+                "timescale" => s.time_scale = value.parse().ok(),
+                "autosave" => s.auto_save_interval = value.parse().ok(),
+                "days" => s.planned_days_per_period = value.parse().ok(),
+                _ => {}
+            }
+        }
+        self.wizard_arm_apply = false;
+    }
+
+    /// What stands between the draft and an apply. Review
+    /// shows these, and Apply refuses while any remain —
+    /// the design's inline validation.
+    fn wizard_validation(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.saves_selected.is_none() {
+            problems.push("No save is picked.".to_string());
+            return problems;
+        }
+        if let Some(s) = &self.wizard_settings {
+            let name = s.savegame_name.as_deref().unwrap_or("").trim();
+            if name.is_empty() {
+                problems.push(
+                    "Please give your save a unique name before applying."
+                        .to_string(),
+                );
+            } else if self.wizard_other_names.iter().any(|n| n == name) {
+                problems.push(format!(
+                    "Another save already uses the name \"{}\". Please give your save a unique name before applying.",
+                    name
+                ));
+            }
+        }
+        for (label, text) in [
+            ("cash", &self.wizard_cash),
+            ("loan", &self.wizard_loan),
+        ] {
+            if !text.trim().is_empty() {
+                match parse_amount(text) {
+                    None => problems.push(format!(
+                        "The {} amount isn't a whole number.",
+                        label
+                    )),
+                    Some(v) if v < 0 => problems.push(format!(
+                        "The {} amount can't be negative.",
+                        label
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        problems
+    }
+
+    /// Configure Save's apply: backups first, then the
+    /// settings, the money, the route file, the stored
+    /// loadout, the mods folder's links, and the
+    /// gameSettings pointer — each landing on the results
+    /// page in its own words, success and failure apart.
+    fn wizard_apply(&mut self) {
+        let mut done: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        let Some(dir_name) = self.saves_selected.clone() else {
+            return;
+        };
+        let slot = self
+            .save_slots_cache
+            .iter()
+            .find(|s| s.dir_name == dir_name)
+            .cloned();
+        let Some(slot) = slot else {
+            self.wizard_failed =
+                vec!["The picked save is no longer in the slot list.".to_string()];
+            self.wizard_done = Vec::new();
+            self.wizard_step = 4;
+            return;
+        };
+        let slot_dir = slot.path.clone();
+        let career_path = slot_dir.join("careerSavegame.xml");
+        let farms_path = slot_dir.join("farms.xml");
+
+        // ---- Backups first ------------------------------
+        for path in [&career_path, &farms_path] {
+            if path.exists() {
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match savegame::backup_file(path) {
+                    Ok(dest) => done.push(format!(
+                        "Backed up {} to {}.",
+                        label,
+                        dest.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    )),
+                    Err(e) => {
+                        failed.push(format!("Backup of {} failed: {}", label, e))
+                    }
+                }
+            }
+        }
+
+        // ---- Settings -> careerSavegame.xml -------------
+        if let (Some(original), Some(edited)) =
+            (&self.wizard_original, &self.wizard_settings)
+        {
+            let original = original.clone();
+            let edited = edited.clone();
+            let changes = savegame::describe_changes(&original, &edited);
+            if changes.is_empty() {
+                done.push("Settings: nothing changed.".to_string());
+            } else {
+                match std::fs::read_to_string(&career_path) {
+                    Ok(xml) => {
+                        let (out, applied, skipped) =
+                            savegame::apply_settings_to_xml(&xml, &original, &edited);
+                        match std::fs::write(&career_path, out) {
+                            Ok(()) => done.push(format!(
+                                "Settings written to careerSavegame.xml ({}).",
+                                applied.join(", ")
+                            )),
+                            Err(e) => failed.push(format!(
+                                "Writing careerSavegame.xml failed: {}",
+                                e
+                            )),
+                        }
+                        for label in skipped {
+                            failed.push(format!(
+                                "{}: the element isn't in this save to rewrite.",
+                                label
+                            ));
+                        }
+                    }
+                    Err(e) => failed.push(format!(
+                        "Reading careerSavegame.xml failed: {}",
+                        e
+                    )),
+                }
+            }
+        }
+
+        // ---- Cash & loan -> farms.xml -------------------
+        if let Some(fin) = &self.wizard_finances {
+            let fin = fin.clone();
+            let new_money = parse_amount(&self.wizard_cash);
+            let new_loan = parse_amount(&self.wizard_loan);
+            let money_changed = new_money.is_some() && new_money != fin.money;
+            let loan_changed = new_loan.is_some() && new_loan != fin.loan;
+            if money_changed || loan_changed {
+                let money = if money_changed {
+                    new_money.unwrap()
+                } else {
+                    fin.money.unwrap_or(0)
+                };
+                let loan = if loan_changed {
+                    new_loan.unwrap()
+                } else {
+                    fin.loan.unwrap_or(0)
+                };
+                match std::fs::read_to_string(&farms_path) {
+                    Ok(xml) => {
+                        match savegame::apply_finances_to_xml(&xml, money, loan) {
+                            Some(out) => match std::fs::write(&farms_path, out) {
+                                Ok(()) => done.push(format!(
+                                    "Cash and loan written to farms.xml (cash {}, loan {}).",
+                                    money, loan
+                                )),
+                                Err(e) => failed.push(format!(
+                                    "Writing farms.xml failed: {}",
+                                    e
+                                )),
+                            },
+                            None => failed.push(
+                                "farms.xml has no farm to hold the cash and loan."
+                                    .to_string(),
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        failed.push(format!("Reading farms.xml failed: {}", e))
+                    }
+                }
+            } else {
+                done.push("Cash and loan: unchanged.".to_string());
+            }
+        }
+
+        // ---- AutoDrive route ----------------------------
+        if let Some(picked) = &self.wizard_autodrive {
+            let picked = picked.clone();
+            let dest = slot_dir.join("AutoDrive_config.xml");
+            match std::fs::copy(&picked, &dest) {
+                Ok(_) => done.push(
+                    "AutoDrive route installed: AutoDrive_config.xml replaced in the save folder."
+                        .to_string(),
+                ),
+                Err(e) => failed.push(format!(
+                    "Installing the AutoDrive route failed: {}",
+                    e
+                )),
+            }
+        }
+
+        // ---- Store the loadout --------------------------
+        let keys: Vec<String> = self.saves_draft.iter().cloned().collect();
+        match self.mod_manager.set_save_loadout(&dir_name, keys) {
+            Ok(()) => done.push(format!(
+                "Loadout saved for {} ({} mods).",
+                dir_name,
+                self.saves_draft.len()
+            )),
+            Err(e) => failed.push(format!("Saving the loadout failed: {}", e)),
+        }
+
+        // ---- Reconcile the mods folder (links only) -----
+        let game_dir = self.mod_manager.get_active_dir().clone();
+        let all_mods = self.mod_manager.get_mods();
+        let selected: Vec<Mod> = all_mods
+            .iter()
+            .filter(|m| self.saves_draft.contains(&m.favorite_key()))
+            .map(|m| (*m).clone())
+            .collect();
+        let library: Vec<Mod> = all_mods.iter().map(|m| (*m).clone()).collect();
+        let report = savegame::reconcile_mods_folder(&game_dir, &selected, &library);
+        done.push(format!(
+            "Mods folder: {} linked in, {} already there, {} unselected links removed.",
+            report.linked, report.already_present, report.removed
+        ));
+        failed.extend(report.notes);
+
+        // ---- gameSettings pointer -----------------------
+        if let Some(profile) = self.mod_manager.profile_dir() {
+            let want = game_dir.to_string_lossy().replace('\\', "/");
+            let current = game_files::read_mods_override(&profile);
+            let already = matches!(&current, Some((true, dir))
+                if dir.trim_end_matches('/') == want.trim_end_matches('/'));
+            if already {
+                done.push(
+                    "gameSettings.xml already points at the mods folder."
+                        .to_string(),
+                );
+            } else {
+                match game_files::set_mods_override(&profile, &game_dir) {
+                    Ok(()) => done.push(
+                        "gameSettings.xml now points at the mods folder."
+                            .to_string(),
+                    ),
+                    Err(e) => failed.push(format!(
+                        "Pointing gameSettings.xml at the mods folder failed: {}",
+                        e
+                    )),
+                }
+            }
+        }
+
+        self.wizard_done = done;
+        self.wizard_failed = failed;
+        self.wizard_step = 4;
+        self.refresh_save_slots();
+        self.status = "Configure Save applied — see the results.".to_string();
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // Any action other than a confirming second click disarms removal.
         if !matches!(message, Message::RemoveMod(_)) {
@@ -768,19 +1472,13 @@ impl App {
                 }
             }
             Message::SelectSaveSlot(dir_name) => {
-                self.saves_draft = self
-                    .mod_manager
-                    .save_loadout(&dir_name)
-                    .into_iter()
-                    .collect();
-                self.saves_selected = Some(dir_name);
-                self.saves_arm_apply = false;
+                self.wizard_load_slot(&dir_name);
             }
             Message::DraftToggle(key) => {
                 if !self.saves_draft.remove(&key) {
                     self.saves_draft.insert(key);
                 }
-                self.saves_arm_apply = false;
+                self.wizard_arm_apply = false;
             }
             Message::DraftUseActive => {
                 self.saves_draft = self
@@ -790,50 +1488,134 @@ impl App {
                     .filter(|m| m.state == ModState::Active)
                     .map(|m| m.favorite_key())
                     .collect();
-                self.saves_arm_apply = false;
+                self.wizard_missing = Vec::new();
+                self.wizard_seed_note =
+                    "Seeded from your current Active set.".to_string();
+                self.wizard_arm_apply = false;
             }
             Message::DraftEmpty => {
                 self.saves_draft.clear();
-                self.saves_arm_apply = false;
-            }
-            Message::SaveLoadout => {
-                if let Some(slot) = self.saves_selected.clone() {
-                    let keys: Vec<String> = self.saves_draft.iter().cloned().collect();
-                    match self.mod_manager.set_save_loadout(&slot, keys) {
-                        Ok(()) => {
-                            self.status = format!(
-                                "Loadout saved for {} ({} mods).",
-                                slot,
-                                self.saves_draft.len()
-                            );
-                            self.refresh_save_slots();
-                        }
-                        Err(e) => self.status = format!("Saving loadout failed: {}", e),
-                    }
-                }
-            }
-            Message::ApplyLoadout => {
-                if !self.saves_arm_apply {
-                    self.saves_arm_apply = true;
-                    self.status = "Click Apply again to confirm — this moves mods between Active and Archive. Make sure the game is not running.".to_string();
-                } else if let Some(slot) = self.saves_selected.clone() {
-                    self.saves_arm_apply = false;
-                    let keys: Vec<String> = self.saves_draft.iter().cloned().collect();
-                    let _ = self.mod_manager.set_save_loadout(&slot, keys.clone());
-                    match self.mod_manager.apply_loadout(&keys) {
-                        Ok((to_archive, to_active)) => {
-                            self.recompute_conflicts();
-                            self.refresh_save_slots();
-                            self.status = format!(
-                                "Loadout applied for {}: {} moved to archive, {} moved to active.",
-                                slot, to_archive, to_active
-                            );
-                        }
-                        Err(e) => self.status = format!("Applying loadout failed: {}", e),
-                    }
-                }
+                self.wizard_seed_note = "Starting from an empty loadout.".to_string();
+                self.wizard_arm_apply = false;
             }
             Message::SavesFilterChanged(filter) => self.saves_filter = filter,
+            Message::WizardStep(step) => {
+                if step >= 1 && step != 4 && self.saves_selected.is_none() {
+                    self.status =
+                        "Pick a save first — the rest of the wizard builds on it."
+                            .to_string();
+                } else {
+                    self.wizard_step = step;
+                    self.wizard_arm_apply = false;
+                }
+            }
+            Message::WizardSetBool(key, value) => {
+                self.wizard_set_bool(&key, value);
+            }
+            Message::WizardSetValue(key, value) => {
+                self.wizard_set_value(&key, &value);
+            }
+            Message::WizardNameChanged(value) => {
+                if let Some(s) = &mut self.wizard_settings {
+                    s.savegame_name = Some(value);
+                }
+                self.wizard_arm_apply = false;
+            }
+            Message::WizardCashChanged(value) => {
+                self.wizard_cash = value;
+                self.wizard_arm_apply = false;
+            }
+            Message::WizardLoanChanged(value) => {
+                self.wizard_loan = value;
+                self.wizard_arm_apply = false;
+            }
+            Message::WizardCashChip(delta) => {
+                let cur = parse_amount(&self.wizard_cash).unwrap_or(0);
+                self.wizard_cash = (cur + delta).max(0).to_string();
+                self.wizard_arm_apply = false;
+            }
+            Message::WizardLoanChip(delta) => {
+                let cur = parse_amount(&self.wizard_loan).unwrap_or(0);
+                self.wizard_loan = (cur + delta).max(0).to_string();
+                self.wizard_arm_apply = false;
+            }
+            Message::WizardUseSaveList => {
+                self.wizard_seed_draft();
+                self.wizard_arm_apply = false;
+            }
+            Message::WizardGroupToggle(group, select) => {
+                for entry in self.wizard_group_entries(&group) {
+                    if select {
+                        self.saves_draft.insert(entry.key);
+                    } else {
+                        self.saves_draft.remove(&entry.key);
+                    }
+                }
+                self.wizard_arm_apply = false;
+            }
+            Message::WizardCollapseGroup(group) => {
+                if !self.wizard_collapsed.remove(&group) {
+                    self.wizard_collapsed.insert(group);
+                }
+            }
+            Message::WizardBrowseAutoDrive => {
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title(
+                                "Choose the AutoDrive_config.xml to install",
+                            )
+                            .add_filter("AutoDrive route", &["xml"])
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::WizardAutoDrivePicked,
+                );
+            }
+            Message::WizardAutoDrivePicked(picked) => {
+                if picked.is_some() {
+                    self.wizard_autodrive = picked;
+                    self.wizard_arm_apply = false;
+                }
+            }
+            Message::WizardClearAutoDrive => {
+                self.wizard_autodrive = None;
+                self.wizard_arm_apply = false;
+            }
+            Message::WizardApply => {
+                let problems = self.wizard_validation();
+                if !problems.is_empty() {
+                    self.wizard_arm_apply = false;
+                    self.status = format!(
+                        "Fix this before applying: {}",
+                        problems.join(" ")
+                    );
+                } else if !self.wizard_arm_apply {
+                    self.wizard_arm_apply = true;
+                    self.status = "Click Generate Folder & Apply again to confirm — make sure the game is not running.".to_string();
+                } else {
+                    self.wizard_arm_apply = false;
+                    self.wizard_apply();
+                    return self.begin_load();
+                }
+            }
+            Message::WizardReset => {
+                self.wizard_step = 0;
+                self.saves_selected = None;
+                self.saves_draft.clear();
+                self.wizard_original = None;
+                self.wizard_settings = None;
+                self.wizard_finances = None;
+                self.wizard_recorded = Vec::new();
+                self.wizard_missing = Vec::new();
+                self.wizard_seed_note = String::new();
+                self.wizard_autodrive = None;
+                self.wizard_done.clear();
+                self.wizard_failed.clear();
+                self.wizard_arm_apply = false;
+                self.refresh_save_slots();
+            }
             Message::LayoutBuildPlan => {
                 if self.layout_running.is_some() {
                     self.status =
@@ -2674,8 +3456,13 @@ impl App {
             .into()
     }
 
-    /// Configure Save: pick a save slot, edit its mod loadout, apply
-    /// it (Active is reconciled to the loadout via the move system).
+    /// Configure Save (Roadmap #3): the five-step wizard —
+    /// pick the save, edit its settings, pick the loadout,
+    /// review, then apply and read the results. The header
+    /// frame (title, subtitle, breadcrumb) rides on every
+    /// step, and the whole wizard wears the app's current
+    /// design language — no Round A-era styling survives
+    /// inside it (design requirement, 2026-10-21).
     fn saves_view(&self) -> Element<'_, Message> {
         if self.mod_manager.profile_dir().is_none() {
             return container(
@@ -2685,145 +3472,1082 @@ impl App {
             .padding(16)
             .into();
         }
+        let body: Element<'_, Message> = match self.wizard_step {
+            0 => self.wizard_select_view(),
+            1 => self.wizard_settings_view(),
+            2 => self.wizard_loadout_view(),
+            3 => self.wizard_review_view(),
+            _ => self.wizard_results_view(),
+        };
+        column![self.wizard_header(), body]
+            .spacing(12)
+            .height(Length::Fill)
+            .into()
+    }
 
-        // ---- Slot list (left) ----
-        let mut slots_col = column![text("Savegames").size(17)].spacing(8);
+    /// The frame on every wizard page: the title, John's
+    /// subtitle, and the breadcrumb — finished steps and
+    /// the current one lit, each a jump target.
+    fn wizard_header(&self) -> Element<'_, Message> {
+        const STEPS: [&str; 5] =
+            ["Select Save", "Settings", "Pick Mods", "Review", "Results"];
+        let mut crumbs = row![].spacing(6);
+        for (i, label) in STEPS.iter().enumerate() {
+            let n = i as u8;
+            crumbs = crumbs.push(
+                button(text(format!("{} · {}", i + 1, label)).size(12))
+                    .style(theme::nav_pill(n <= self.wizard_step))
+                    .on_press(Message::WizardStep(n)),
+            );
+        }
+        column![
+            text("Configure Save Game").size(20).color(theme::TEXT),
+            text("Link an existing FS25 save with your mod loadout and settings")
+                .size(13)
+                .color(theme::TEXT_DIM),
+            crumbs,
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    fn wizard_step_buttons(
+        &self,
+        back: Option<u8>,
+        next: Option<(u8, &'static str)>,
+    ) -> Element<'_, Message> {
+        let mut r = row![].spacing(8);
+        if let Some(b) = back {
+            r = r.push(
+                button(text("Back"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::WizardStep(b)),
+            );
+        }
+        r = r.push(Space::with_width(Length::Fill));
+        if let Some((n, label)) = next {
+            r = r.push(
+                button(text(label))
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::WizardStep(n)),
+            );
+        }
+        r.into()
+    }
+
+    /// Step 1 — Select Save. Slots are cards in the current
+    /// language; each shows its own recorded mod count
+    /// (from its careerSavegame.xml), its map, play time,
+    /// money, and any stored loadout.
+    fn wizard_select_view(&self) -> Element<'_, Message> {
+        let mut col = column![
+            text("Pick the save to configure. Configure Save works on saves the game has already written: bounce into the map, save, come back out — then adjust settings, money, and mods here before you go back in.")
+                .size(13)
+                .color(theme::TEXT_DIM)
+                .width(Length::Fill),
+        ]
+        .spacing(10);
         if self.save_slots_cache.is_empty() {
-            slots_col = slots_col.push(text("No save slots found in the game profile folder.").size(13));
+            col = col.push(
+                text("No save slots found in the game profile folder.")
+                    .size(13)
+                    .color(theme::TEXT),
+            );
         }
         for slot in &self.save_slots_cache {
-            let loadout = self.mod_manager.save_loadout(&slot.dir_name);
-            let info = format!(
-                "{} · played {} · {}",
-                slot.map.as_deref().unwrap_or("unknown map"),
-                slot.play_time_display().as_deref().unwrap_or("?"),
-                slot.money
-                    .map(|m| format!("${}", m))
-                    .unwrap_or_else(|| "?".to_string())
-            );
-            let loadout_line = if loadout.is_empty() {
-                "No loadout saved".to_string()
-            } else {
-                format!("Loadout: {} mods", loadout.len())
+            let selected =
+                self.saves_selected.as_deref() == Some(slot.dir_name.as_str());
+            let mut lines: iced::widget::Column<'_, Message, iced::Theme, iced::Renderer> =
+                column![].spacing(2);
+            let title = match &slot.name {
+                Some(name) => format!("Savegame {} — {}", slot.slot, name),
+                None => format!("Savegame {}", slot.slot),
             };
-            let label = column![
-                text(format!("Savegame {}", slot.slot)).size(14),
-                text(info).size(12),
-                text(loadout_line).size(12),
-            ]
-            .spacing(2);
-            let is_selected = self.saves_selected.as_deref() == Some(slot.dir_name.as_str());
-            slots_col = slots_col.push(
-                button(label)
-                    .width(Length::Fill)
-                    .style(if is_selected {
-                        button::primary
-                    } else {
-                        button::secondary
-                    })
-                    .on_press(Message::SelectSaveSlot(slot.dir_name.clone())),
+            lines = lines.push(text(title).size(14).color(theme::TEXT));
+            lines = lines.push(
+                text(format!(
+                    "{} · {} mods recorded · played {} · {}",
+                    slot.map.as_deref().unwrap_or("unknown map"),
+                    slot.mod_count,
+                    slot.play_time_display().as_deref().unwrap_or("?"),
+                    slot.money
+                        .map(fmt_money)
+                        .unwrap_or_else(|| "?".to_string()),
+                ))
+                .size(12)
+                .color(theme::TEXT_DIM),
             );
-        }
-        let slots_panel: Element<'_, Message> = container(scrollable(slots_col))
-            .width(320)
-            .height(Length::Fill)
-            .into();
-
-        // ---- Loadout editor (right) ----
-        let editor: Element<'_, Message> = match &self.saves_selected {
-            None => container(text("Pick a savegame on the left to edit its loadout.").size(14))
-                .padding(16)
-                .into(),
-            Some(dir_name) => {
-                let slot_num = self
-                    .save_slots_cache
-                    .iter()
-                    .find(|s| &s.dir_name == dir_name)
-                    .map(|s| s.slot);
-                let title = match slot_num {
-                    Some(n) => format!("Loadout for Savegame {}", n),
-                    None => format!("Loadout for {}", dir_name),
-                };
-                let filter = self.saves_filter.to_lowercase();
-                let mut mods: Vec<&Mod> = self.mod_manager.get_mods().into_iter().collect();
-                mods.sort_by(|a, b| {
-                    let (ka, kb) = (a.favorite_key(), b.favorite_key());
-                    let (ia, ib) = (
-                        self.saves_draft.contains(&ka),
-                        self.saves_draft.contains(&kb),
-                    );
-                    ib.cmp(&ia)
-                        .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                });
-                let visible: Vec<&Mod> = mods
-                    .into_iter()
-                    .filter(|m| {
-                        if !filter.is_empty() {
-                            m.name.to_lowercase().contains(&filter)
-                        } else {
-                            self.saves_draft.contains(&m.favorite_key())
-                                || m.state == ModState::Active
-                        }
-                    })
-                    .collect();
-
-                let mut rows = column![].spacing(4);
-                for m in &visible {
-                    let key = m.favorite_key();
-                    let in_draft = self.saves_draft.contains(&key);
-                    rows = rows.push(
-                        row![
-                            button(text(if in_draft { "Remove" } else { "Add" }))
-                                .style(if in_draft {
-                                    button::danger
-                                } else {
-                                    button::secondary
-                                })
-                                .on_press(Message::DraftToggle(key)),
-                            text(m.name.clone()).size(13),
-                            text(format!("{:?}", m.state)).size(12),
-                        ]
-                        .spacing(8),
-                    );
-                }
-
-                let apply_label = if self.saves_arm_apply {
-                    "Click again to apply"
+            let loadout = self.mod_manager.save_loadout(&slot.dir_name);
+            lines = lines.push(
+                text(if loadout.is_empty() {
+                    "No loadout saved".to_string()
                 } else {
-                    "Apply loadout"
-                };
-                column![
-                    text(title).size(17),
-                    text(format!(
-                        "{} mods in this loadout. Applying moves mods between Active and Archive to match — don't apply while the game is running.",
-                        self.saves_draft.len()
-                    ))
-                    .size(12),
-                    row![
-                        button(text("Use current Active set"))
-                            .on_press(Message::DraftUseActive),
-                        button(text("Empty")).on_press(Message::DraftEmpty),
-                        button(text("Save loadout"))
-                            .style(button::primary)
-                            .on_press(Message::SaveLoadout),
-                        button(text(apply_label))
-                            .style(button::primary)
-                            .on_press(Message::ApplyLoadout),
-                    ]
-                    .spacing(8),
-                    text_input("Filter mods by name…", &self.saves_filter)
-                        .on_input(Message::SavesFilterChanged)
-                        .padding(8),
-                    text("With no filter, the list shows the loadout plus everything currently Active. Filter by name to find archived mods.")
-                        .size(12),
-                    scrollable(rows),
-                ]
-                .spacing(10)
+                    format!("Loadout: {} mods", loadout.len())
+                })
+                .size(12)
+                .color(theme::TEXT_DIM),
+            );
+            let card_btn = button(lines)
+                .width(Length::Fill)
+                .padding(10)
+                .style(move |_theme, _status| iced::widget::button::Style {
+                    background: Some(iced::Background::Color(theme::PANEL)),
+                    border: iced::Border {
+                        color: if selected {
+                            theme::ACCENT
+                        } else {
+                            theme::BASE
+                        },
+                        width: if selected { 2.0 } else { 1.0 },
+                        radius: 8.0.into(),
+                    },
+                    text_color: theme::TEXT,
+                    ..Default::default()
+                })
+                .on_press(Message::SelectSaveSlot(slot.dir_name.clone()));
+            col = col.push(card_btn);
+        }
+        let next: Element<'_, Message> = if self.saves_selected.is_some() {
+            self.wizard_step_buttons(None, Some((1, "Next: Settings")))
+        } else {
+            text("Pick a save to continue.")
+                .size(12)
+                .color(theme::TEXT_DIM)
                 .into()
+        };
+        column![scrollable(col).height(Length::Fill), next]
+            .spacing(10)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Step 2 — Settings. Every verified field, grouped as
+    /// the design groups them. A field the save doesn't
+    /// carry renders as "Not in this save yet" with no
+    /// control; a field whose labels aren't verified
+    /// (disaster state, dirt interval, helper sources)
+    /// shows its stored value and says so.
+    fn wizard_settings_view(&self) -> Element<'_, Message> {
+        let Some(s) = &self.wizard_settings else {
+            return column![
+                text("Pick a save first — its settings load here.").size(14),
+                self.wizard_step_buttons(Some(0), None),
+            ]
+            .spacing(10)
+            .into();
+        };
+        let s = s.clone();
+        let fin = self.wizard_finances.clone();
+        let num_key = |v: f64| -> String {
+            if v == v.trunc() {
+                format!("{}", v as i64)
+            } else {
+                format!("{}", v)
             }
         };
 
-        row![slots_panel, editor].spacing(14).height(Length::Fill).into()
+        // ---- General ------------------------------------
+        let mut general: Vec<Element<'_, Message>> = Vec::new();
+        general.push(wizard_opt_row(
+            "Save Name",
+            s.savegame_name.is_some(),
+            text_input("Save name", s.savegame_name.as_deref().unwrap_or(""))
+                .on_input(Message::WizardNameChanged)
+                .padding(8)
+                .into(),
+        ));
+        general.push(wizard_opt_row(
+            "Economic Difficulty",
+            s.economic_difficulty.is_some(),
+            wizard_segment(
+                "difficulty",
+                vec![
+                    ("EASY".to_string(), "Easy".to_string()),
+                    ("NORMAL".to_string(), "Normal".to_string()),
+                    ("HARD".to_string(), "Hard".to_string()),
+                ],
+                s.economic_difficulty.as_deref().unwrap_or(""),
+            ),
+        ));
+        general.push(wizard_opt_row(
+            "Timescale",
+            s.time_scale.is_some(),
+            wizard_segment(
+                "timescale",
+                [
+                    "0", "0.5", "1", "2", "3", "5", "6", "10", "15", "20",
+                    "30", "60", "120",
+                ]
+                .iter()
+                .map(|v| {
+                    (
+                        v.to_string(),
+                        if *v == "0" {
+                            "Pause".to_string()
+                        } else {
+                            format!("{}x", v)
+                        },
+                    )
+                })
+                .collect(),
+                &s.time_scale.map(num_key).unwrap_or_default(),
+            ),
+        ));
+        general.push(wizard_opt_row(
+            "Autosave Interval",
+            s.auto_save_interval.is_some(),
+            wizard_segment(
+                "autosave",
+                vec![
+                    ("0".to_string(), "Off".to_string()),
+                    ("5".to_string(), "5 min".to_string()),
+                    ("10".to_string(), "10 min".to_string()),
+                    ("15".to_string(), "15 min".to_string()),
+                    ("30".to_string(), "30 min".to_string()),
+                    ("60".to_string(), "60 min".to_string()),
+                ],
+                &s.auto_save_interval.map(num_key).unwrap_or_default(),
+            ),
+        ));
+        // Cash and loan: exact-value fields with preset
+        // chips, and the amount the save holds right now.
+        let money_now = |which: &str| -> String {
+            let v = match which {
+                "cash" => fin.as_ref().and_then(|f| f.money),
+                _ => fin.as_ref().and_then(|f| f.loan),
+            };
+            match v {
+                Some(v) => format!("In the save now: {}", fmt_money(v)),
+                None => "Not in this save".to_string(),
+            }
+        };
+        let mut cash_chips = row![].spacing(4);
+        for (label, delta) in [
+            ("+10,000", 10_000i64),
+            ("+100,000", 100_000),
+            ("+1,000,000", 1_000_000),
+            ("-10,000", -10_000),
+            ("-100,000", -100_000),
+        ] {
+            cash_chips = cash_chips.push(
+                button(text(label).size(11))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::WizardCashChip(delta)),
+            );
+        }
+        general.push(wizard_row(
+            "Adjust Cash",
+            column![
+                row![
+                    text_input("Cash", &self.wizard_cash)
+                        .on_input(Message::WizardCashChanged)
+                        .padding(8)
+                        .width(220),
+                    text(money_now("cash")).size(12).color(theme::TEXT_DIM),
+                ]
+                .spacing(8),
+                cash_chips,
+            ]
+            .spacing(6)
+            .into(),
+        ));
+        let mut loan_chips = row![].spacing(4);
+        for (label, delta) in [
+            ("+10,000", 10_000i64),
+            ("+50,000", 50_000),
+            ("+100,000", 100_000),
+            ("-10,000", -10_000),
+            ("-50,000", -50_000),
+        ] {
+            loan_chips = loan_chips.push(
+                button(text(label).size(11))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::WizardLoanChip(delta)),
+            );
+        }
+        general.push(wizard_row(
+            "Adjust Loan",
+            column![
+                row![
+                    text_input("Loan", &self.wizard_loan)
+                        .on_input(Message::WizardLoanChanged)
+                        .padding(8)
+                        .width(220),
+                    text(money_now("loan")).size(12).color(theme::TEXT_DIM),
+                ]
+                .spacing(8),
+                loan_chips,
+            ]
+            .spacing(6)
+            .into(),
+        ));
+        general.push(wizard_opt_row(
+            "Traffic",
+            s.traffic_enabled.is_some(),
+            wizard_bool_pills("traffic", s.traffic_enabled.unwrap_or(false), "Off", "On"),
+        ));
+        general.push(wizard_opt_row(
+            "Snow",
+            s.snow_enabled.is_some(),
+            wizard_bool_pills("snow", s.snow_enabled.unwrap_or(false), "Off", "On"),
+        ));
+
+        // ---- Seasons ------------------------------------
+        let mut seasons: Vec<Element<'_, Message>> = Vec::new();
+        seasons.push(wizard_opt_row(
+            "Seasonal Growth",
+            s.growth_mode.is_some(),
+            wizard_segment(
+                "growth",
+                vec![
+                    ("1".to_string(), "Seasonal".to_string()),
+                    ("2".to_string(), "Paused".to_string()),
+                    ("3".to_string(), "Off".to_string()),
+                ],
+                &s.growth_mode.map(|v| v.to_string()).unwrap_or_default(),
+            ),
+        ));
+        seasons.push(wizard_opt_row(
+            "Days per Month",
+            s.planned_days_per_period.is_some(),
+            row![
+                iced::widget::slider(
+                    1.0..=28.0,
+                    s.planned_days_per_period.unwrap_or(1) as f32,
+                    |v| Message::WizardSetValue(
+                        "days".to_string(),
+                        format!("{}", v.round() as i64),
+                    ),
+                )
+                .step(1.0_f32)
+                .width(220),
+                text(format!(
+                    "{} day{}",
+                    s.planned_days_per_period.unwrap_or(1),
+                    if s.planned_days_per_period == Some(1) {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ))
+                .size(13)
+                .color(theme::TEXT),
+            ]
+            .spacing(10)
+            .into(),
+        ));
+        seasons.push(wizard_opt_row(
+            "Fixed Visual Month",
+            s.fixed_visual_month.is_some(),
+            wizard_bool_pills(
+                "fixed_visual",
+                s.fixed_visual_month.unwrap_or(false),
+                "Off",
+                "On",
+            ),
+        ));
+
+        // ---- Crops and Growth ---------------------------
+        let mut crops: Vec<Element<'_, Message>> = Vec::new();
+        crops.push(wizard_opt_row(
+            "Crop Destruction",
+            s.fruit_destruction.is_some(),
+            wizard_bool_pills(
+                "fruit_destruction",
+                s.fruit_destruction.unwrap_or(false),
+                "Off",
+                "On",
+            ),
+        ));
+        crops.push(wizard_opt_row(
+            "Periodic Plowing Required",
+            s.plowing_required_enabled.is_some(),
+            wizard_bool_pills(
+                "plowing",
+                s.plowing_required_enabled.unwrap_or(false),
+                "Off",
+                "On",
+            ),
+        ));
+        crops.push(wizard_opt_row(
+            "Fieldstone",
+            s.stones_enabled.is_some(),
+            wizard_bool_pills("stones", s.stones_enabled.unwrap_or(false), "Off", "On"),
+        ));
+        crops.push(wizard_opt_row(
+            "Lime Required",
+            s.lime_required.is_some(),
+            wizard_bool_pills("lime", s.lime_required.unwrap_or(false), "Off", "On"),
+        ));
+        crops.push(wizard_opt_row(
+            "Weeds",
+            s.weeds_enabled.is_some(),
+            wizard_bool_pills("weeds", s.weeds_enabled.unwrap_or(false), "Off", "On"),
+        ));
+        crops.push(wizard_opt_row(
+            "Disaster Destruction",
+            s.disaster_destruction_state.is_some(),
+            row![
+                text(s.disaster_destruction_state.clone().unwrap_or_default())
+                    .size(13)
+                    .color(theme::TEXT),
+                text("Shown as stored — its other values aren't verified yet.")
+                    .size(11)
+                    .color(theme::TEXT_DIM),
+            ]
+            .spacing(8)
+            .into(),
+        ));
+
+        // ---- Vehicle Control ----------------------------
+        let mut vehicle: Vec<Element<'_, Message>> = Vec::new();
+        vehicle.push(wizard_opt_row(
+            "Dirt",
+            s.dirt_interval.is_some(),
+            row![
+                text(format!(
+                    "Stored value: {}",
+                    s.dirt_interval.unwrap_or(0)
+                ))
+                .size(13)
+                .color(theme::TEXT),
+                text("Its Off/Slow/Normal/Fast labels aren't verified yet.")
+                    .size(11)
+                    .color(theme::TEXT_DIM),
+            ]
+            .spacing(8)
+            .into(),
+        ));
+        vehicle.push(wizard_opt_row(
+            "Automatic Engine Start",
+            s.automatic_motor_start_enabled.is_some(),
+            wizard_bool_pills(
+                "motor_start",
+                s.automatic_motor_start_enabled.unwrap_or(false),
+                "Off",
+                "On",
+            ),
+        ));
+        vehicle.push(wizard_opt_row(
+            "Stop & Go Braking",
+            s.stop_and_go_braking.is_some(),
+            wizard_bool_pills(
+                "stop_and_go",
+                s.stop_and_go_braking.unwrap_or(false),
+                "Off",
+                "On",
+            ),
+        ));
+        vehicle.push(wizard_opt_row(
+            "Trailer Fill Limit",
+            s.trailer_fill_limit.is_some(),
+            wizard_bool_pills(
+                "trailer_fill",
+                s.trailer_fill_limit.unwrap_or(false),
+                "Off",
+                "On",
+            ),
+        ));
+        vehicle.push(wizard_opt_row(
+            "Fuel Usage",
+            s.fuel_usage.is_some(),
+            wizard_segment(
+                "fuel",
+                vec![
+                    ("1".to_string(), "Low".to_string()),
+                    ("2".to_string(), "Normal".to_string()),
+                    ("3".to_string(), "High".to_string()),
+                ],
+                &s.fuel_usage.map(|v| v.to_string()).unwrap_or_default(),
+            ),
+        ));
+
+        // ---- AI Workers ---------------------------------
+        let mut ai: Vec<Element<'_, Message>> = Vec::new();
+        ai.push(wizard_opt_row(
+            "Refill — Fuel",
+            s.helper_buy_fuel.is_some(),
+            wizard_bool_pills(
+                "helper_fuel",
+                s.helper_buy_fuel.unwrap_or(false),
+                "Off",
+                "Buy",
+            ),
+        ));
+        ai.push(wizard_opt_row(
+            "Refill — Seeds",
+            s.helper_buy_seeds.is_some(),
+            wizard_bool_pills(
+                "helper_seeds",
+                s.helper_buy_seeds.unwrap_or(false),
+                "Off",
+                "Buy",
+            ),
+        ));
+        ai.push(wizard_opt_row(
+            "Refill — Fertilizer",
+            s.helper_buy_fertilizer.is_some(),
+            wizard_bool_pills(
+                "helper_fertilizer",
+                s.helper_buy_fertilizer.unwrap_or(false),
+                "Off",
+                "Buy",
+            ),
+        ));
+        for (label, value) in [
+            ("Refill — Slurry Source", s.helper_slurry_source),
+            ("Refill — Manure Source", s.helper_manure_source),
+        ] {
+            ai.push(wizard_opt_row(
+                label,
+                value.is_some(),
+                row![
+                    text(format!("Stored value: {}", value.unwrap_or(0)))
+                        .size(13)
+                        .color(theme::TEXT),
+                    text("Its Farm/Buy labels aren't verified yet.")
+                        .size(11)
+                        .color(theme::TEXT_DIM),
+                ]
+                .spacing(8)
+                .into(),
+            ));
+        }
+
+        // ---- Auto Drive (owner's section, verbatim) -----
+        let mut ad: Vec<Element<'_, Message>> = Vec::new();
+        ad.push(
+            text("If AutoDrive is installed, please provide AutoDrive_Config to overwrite route configuration.")
+                .size(12)
+                .color(theme::TEXT_DIM)
+                .width(Length::Fill)
+                .into(),
+        );
+        let picked_label = match &self.wizard_autodrive {
+            Some(p) => p.display().to_string(),
+            None => "No file chosen".to_string(),
+        };
+        let mut box_row = row![
+            container(text(picked_label).size(12).color(theme::TEXT))
+                .width(Length::Fill)
+                .padding(8)
+                .style(wizard_inset),
+            button(text("Browse"))
+                .style(theme::nav_pill(false))
+                .on_press(Message::WizardBrowseAutoDrive),
+        ]
+        .spacing(8);
+        if self.wizard_autodrive.is_some() {
+            box_row = box_row.push(
+                button(text("Clear"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::WizardClearAutoDrive),
+            );
+        }
+        ad.push(box_row.into());
+        ad.push(
+            text(if self.wizard_autodrive_existing {
+                "This save already has an AutoDrive_config.xml — the picked file will replace it."
+            } else {
+                "This save has no AutoDrive_config.xml yet — the picked file will be added."
+            })
+            .size(12)
+            .color(theme::TEXT_DIM)
+            .into(),
+        );
+
+        let sections = column![
+            wizard_section("General", general),
+            wizard_section("Seasons", seasons),
+            wizard_section("Crops and Growth", crops),
+            wizard_section("Vehicle Control", vehicle),
+            wizard_section("AI Workers", ai),
+            wizard_section("Auto Drive", ad),
+        ]
+        .spacing(12);
+        column![
+            scrollable(sections).height(Length::Fill),
+            self.wizard_step_buttons(Some(0), Some((2, "Next: Pick Mods"))),
+        ]
+        .spacing(10)
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// How many card columns the loadout step fits across:
+    /// the Browse grid's arithmetic, at the wizard's card
+    /// width.
+    fn wizard_card_columns(&self) -> usize {
+        let available = self.window_size.width - SIDEBAR_W - 64.0;
+        ((available / 262.0).floor() as usize).clamp(1, 6)
+    }
+
+    /// One loadout card: icon, name, author, version, and
+    /// the badges (REQ MOD, category, Selected) — the mod
+    /// card's facts in the theme palette, clicked to toggle.
+    fn wizard_mod_card(&self, e: &WizardModEntry) -> Element<'_, Message> {
+        let selected = self.saves_draft.contains(&e.key);
+        let icon: Element<'_, Message> = match self.icons.get(&e.id) {
+            Some(handle) => iced::widget::image(handle.clone())
+                .width(46)
+                .height(46)
+                .content_fit(iced::ContentFit::Cover)
+                .into(),
+            None => container(text(""))
+                .width(46)
+                .height(46)
+                .style(wizard_inset)
+                .into(),
+        };
+        let mut info = column![text(e.name.clone()).size(13).color(theme::TEXT)]
+            .spacing(2);
+        if let Some(author) = &e.author {
+            info = info.push(text(author.clone()).size(11).color(theme::TEXT_DIM));
+        }
+        info = info.push(
+            text(format!("v{}", e.version))
+                .size(11)
+                .color(theme::TEXT_DIM),
+        );
+        let mut badges = row![].spacing(4);
+        if e.required {
+            badges = badges.push(wizard_pill(
+                "REQ MOD".to_string(),
+                theme::ACCENT,
+                theme::TEXT,
+            ));
+        }
+        if let Some(cat) = &e.category {
+            badges = badges.push(wizard_pill(
+                cat.clone(),
+                theme::BASE,
+                theme::TEXT_DIM,
+            ));
+        }
+        if selected {
+            badges = badges.push(wizard_pill(
+                "Selected".to_string(),
+                theme::ACCENT,
+                theme::TEXT,
+            ));
+        }
+        let content = column![row![icon, info].spacing(8), badges].spacing(6);
+        let card = container(content)
+            .width(252)
+            .padding(8)
+            .style(move |_| container::Style {
+                background: Some(iced::Background::Color(theme::PANEL)),
+                border: iced::Border {
+                    color: if selected {
+                        theme::ACCENT
+                    } else {
+                        theme::BASE
+                    },
+                    width: if selected { 2.0 } else { 1.0 },
+                    radius: 8.0.into(),
+                },
+                ..container::Style::default()
+            });
+        iced::widget::mouse_area(card)
+            .on_release(Message::DraftToggle(e.key.clone()))
+            .into()
+    }
+
+    /// Step 3 — Pick Mods. Collapsible card groups:
+    /// Required by Map (the save's own required mods,
+    /// badged REQ MOD, pre-selected by the seeding),
+    /// Favourites, then the rest of the library — each
+    /// with Select All / Deselect All. Mods the save
+    /// records that the library doesn't hold are named as
+    /// missing, never silently dropped.
+    fn wizard_loadout_view(&self) -> Element<'_, Message> {
+        let mut col = column![].spacing(10);
+        if !self.wizard_seed_note.is_empty() {
+            col = col.push(
+                text(self.wizard_seed_note.clone())
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .width(Length::Fill),
+            );
+        }
+        if !self.wizard_missing.is_empty() {
+            col = col.push(
+                container(
+                    column![
+                        text(format!(
+                            "In the save's list but not in your library ({}):",
+                            self.wizard_missing.len()
+                        ))
+                        .size(13)
+                        .color(theme::TEXT),
+                        text(self.wizard_missing.join(", "))
+                            .size(12)
+                            .color(theme::TEXT_DIM),
+                    ]
+                    .spacing(3),
+                )
+                .width(Length::Fill)
+                .padding(10)
+                .style(wizard_panel),
+            );
+        }
+        col = col.push(
+            row![
+                button(text("Use the save's list"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::WizardUseSaveList),
+                button(text("Use current Active set"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::DraftUseActive),
+                button(text("Empty"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::DraftEmpty),
+                text(format!(
+                    "{} mods in this loadout",
+                    self.saves_draft.len()
+                ))
+                .size(13)
+                .color(theme::TEXT),
+            ]
+            .spacing(8),
+        );
+        col = col.push(
+            text_input("Filter mods by name…", &self.saves_filter)
+                .on_input(Message::SavesFilterChanged)
+                .padding(8),
+        );
+        let filter = self.saves_filter.to_lowercase();
+        for (gid, title, entries) in self.wizard_groups() {
+            let visible: Vec<&WizardModEntry> = entries
+                .iter()
+                .filter(|e| {
+                    filter.is_empty() || e.name.to_lowercase().contains(&filter)
+                })
+                .collect();
+            let collapsed = self.wizard_collapsed.contains(&gid);
+            let sel_count = entries
+                .iter()
+                .filter(|e| self.saves_draft.contains(&e.key))
+                .count();
+            col = col.push(
+                row![
+                    button(text(format!(
+                        "{} — {} mods ({} selected)",
+                        title,
+                        entries.len(),
+                        sel_count
+                    ))
+                    .size(13))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::WizardCollapseGroup(gid.clone())),
+                    button(text("Select all").size(12))
+                        .style(theme::nav_pill(false))
+                        .on_press(Message::WizardGroupToggle(gid.clone(), true)),
+                    button(text("Deselect all").size(12))
+                        .style(theme::nav_pill(false))
+                        .on_press(Message::WizardGroupToggle(gid.clone(), false)),
+                ]
+                .spacing(6),
+            );
+            if collapsed {
+                continue;
+            }
+            if visible.is_empty() {
+                col = col.push(
+                    text("Nothing in this group matches the filter.")
+                        .size(12)
+                        .color(theme::TEXT_DIM),
+                );
+                continue;
+            }
+            let cols = self.wizard_card_columns();
+            let shown = visible.len().min(150);
+            let mut idx = 0;
+            while idx < shown {
+                let mut r = row![].spacing(10);
+                for _ in 0..cols {
+                    if idx < shown {
+                        r = r.push(self.wizard_mod_card(visible[idx]));
+                        idx += 1;
+                    }
+                }
+                col = col.push(r);
+            }
+            if visible.len() > shown {
+                col = col.push(
+                    text(format!(
+                        "Showing the first {} of {} — filter by name to find the rest.",
+                        shown,
+                        visible.len()
+                    ))
+                    .size(12)
+                    .color(theme::TEXT_DIM),
+                );
+            }
+        }
+        column![
+            scrollable(col).height(Length::Fill),
+            self.wizard_step_buttons(Some(1), Some((3, "Next: Review"))),
+        ]
+        .spacing(10)
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// Step 4 — Review. The summary table, every change
+    /// the apply will make, the honesty line naming what
+    /// apply touches (careerSavegame.xml AND farms.xml —
+    /// owner ruling, 2026-10-21), and the inline
+    /// validation that blocks applying.
+    fn wizard_review_view(&self) -> Element<'_, Message> {
+        let mut col = column![text("Ready to Apply").size(17).color(theme::TEXT)]
+            .spacing(10);
+        let slot = self
+            .save_slots_cache
+            .iter()
+            .find(|s| Some(&s.dir_name) == self.saves_selected.as_ref());
+        let s = self.wizard_settings.clone();
+        let o = self.wizard_original.clone();
+
+        // ---- Summary ------------------------------------
+        let mut summary: Vec<Element<'_, Message>> = Vec::new();
+        let save_line = match (slot, s.as_ref()) {
+            (Some(slot), Some(s)) => format!(
+                "{} (Savegame {})",
+                s.savegame_name.as_deref().unwrap_or(""),
+                slot.slot
+            ),
+            (Some(slot), None) => format!("Savegame {}", slot.slot),
+            _ => "—".to_string(),
+        };
+        summary.push(wizard_row("Save", text(save_line).size(13).into()));
+        summary.push(wizard_row(
+            "Map",
+            text(
+                slot.and_then(|s| s.map.clone())
+                    .unwrap_or_else(|| "—".to_string()),
+            )
+            .size(13)
+            .into(),
+        ));
+        summary.push(wizard_row(
+            "Mod Folder",
+            text(self.mod_manager.get_active_dir().display().to_string())
+                .size(13)
+                .into(),
+        ));
+        summary.push(wizard_row(
+            "Mods selected",
+            text(format!("{}", self.saves_draft.len()))
+                .size(13)
+                .into(),
+        ));
+        summary.push(wizard_row(
+            "Difficulty",
+            text(
+                s.as_ref()
+                    .and_then(|s| s.economic_difficulty.clone())
+                    .unwrap_or_else(|| "—".to_string()),
+            )
+            .size(13)
+            .into(),
+        ));
+        summary.push(wizard_row(
+            "Timescale",
+            text(
+                s.as_ref()
+                    .and_then(|s| s.time_scale)
+                    .map(|v| {
+                        if v == 0.0 {
+                            "Pause".to_string()
+                        } else {
+                            format!("{}x", v)
+                        }
+                    })
+                    .unwrap_or_else(|| "—".to_string()),
+            )
+            .size(13)
+            .into(),
+        ));
+        col = col.push(wizard_section("Summary", summary));
+
+        // ---- Changes ------------------------------------
+        let mut changes: Vec<Element<'_, Message>> = Vec::new();
+        if let (Some(o), Some(s)) = (&o, &s) {
+            let lines = savegame::describe_changes(o, s);
+            if lines.is_empty() {
+                changes.push(
+                    text("Settings: no changes.").size(12).color(theme::TEXT_DIM).into(),
+                );
+            }
+            for line in lines {
+                changes.push(text(line).size(12).color(theme::TEXT).into());
+            }
+        }
+        if let Some(fin) = &self.wizard_finances {
+            let new_money = parse_amount(&self.wizard_cash);
+            let new_loan = parse_amount(&self.wizard_loan);
+            if new_money.is_some() && new_money != fin.money {
+                changes.push(
+                    text(format!(
+                        "Cash: {} → {} (farms.xml)",
+                        fin.money.map(fmt_money).unwrap_or_else(|| "—".to_string()),
+                        fmt_money(new_money.unwrap())
+                    ))
+                    .size(12)
+                    .color(theme::TEXT)
+                    .into(),
+                );
+            }
+            if new_loan.is_some() && new_loan != fin.loan {
+                changes.push(
+                    text(format!(
+                        "Loan: {} → {} (farms.xml)",
+                        fin.loan.map(fmt_money).unwrap_or_else(|| "—".to_string()),
+                        fmt_money(new_loan.unwrap())
+                    ))
+                    .size(12)
+                    .color(theme::TEXT)
+                    .into(),
+                );
+            }
+        }
+        if let Some(picked) = &self.wizard_autodrive {
+            changes.push(
+                text(format!(
+                    "AutoDrive route: {} will replace AutoDrive_config.xml in the save folder.",
+                    picked
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ))
+                .size(12)
+                .color(theme::TEXT)
+                .into(),
+            );
+        }
+        changes.push(
+            text(format!(
+                "Loadout: {} mods will be in the mods folder; the loadout is saved for this slot.",
+                self.saves_draft.len()
+            ))
+            .size(12)
+            .color(theme::TEXT)
+            .into(),
+        );
+        if !self.wizard_missing.is_empty() {
+            changes.push(
+                text(format!(
+                    "{} of the save's recorded mods aren't in your library and can't be added: {}",
+                    self.wizard_missing.len(),
+                    self.wizard_missing.join(", ")
+                ))
+                .size(12)
+                .color(theme::TEXT_DIM)
+                .into(),
+            );
+        }
+        col = col.push(wizard_section("Changes", changes));
+
+        // ---- Honesty line + validation + apply ---------
+        let slot_name = self
+            .saves_selected
+            .as_deref()
+            .unwrap_or("the save folder");
+        col = col.push(
+            text(format!(
+                "What apply touches: careerSavegame.xml and farms.xml in {} (a .playground-backup copy of each is written first), the links in the mods folder, and gameSettings.xml's mods-directory line if it doesn't already point at the mods folder. Nothing is touched until you apply — and don't apply while the game is running.",
+                slot_name
+            ))
+            .size(12)
+            .color(theme::TEXT_DIM)
+            .width(Length::Fill),
+        );
+        let problems = self.wizard_validation();
+        for p in &problems {
+            col = col.push(text(p.clone()).size(13).color(theme::DANGER));
+        }
+        let apply_label = if self.wizard_arm_apply {
+            "Click again to apply"
+        } else {
+            "Generate Folder & Apply"
+        };
+        let mut apply_btn = button(text(apply_label))
+            .style(theme::nav_pill(true));
+        if problems.is_empty() {
+            apply_btn = apply_btn.on_press(Message::WizardApply);
+        }
+        col = col.push(
+            row![
+                button(text("Back"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::WizardStep(2)),
+                Space::with_width(Length::Fill),
+                apply_btn,
+            ]
+            .spacing(8),
+        );
+        scrollable(col).height(Length::Fill).into()
+    }
+
+    /// Step 5 — Results: two lists, what succeeded and
+    /// what may have failed, kept apart so a failure never
+    /// reads as a success.
+    fn wizard_results_view(&self) -> Element<'_, Message> {
+        let mut col = column![text("Results").size(17).color(theme::TEXT)]
+            .spacing(10);
+        if self.wizard_done.is_empty() && self.wizard_failed.is_empty() {
+            col = col.push(
+                text("Nothing has been applied yet.")
+                    .size(13)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        if !self.wizard_done.is_empty() {
+            let mut list =
+                column![text("What succeeded").size(14).color(theme::TEXT)]
+                    .spacing(3);
+            for line in &self.wizard_done {
+                list = list.push(text(line.clone()).size(12).color(theme::TEXT));
+            }
+            col = col.push(
+                container(list)
+                    .width(Length::Fill)
+                    .padding(10)
+                    .style(wizard_panel),
+            );
+        }
+        if !self.wizard_failed.is_empty() {
+            let mut list = column![
+                text("What may have failed").size(14).color(theme::DANGER)
+            ]
+            .spacing(3);
+            for line in &self.wizard_failed {
+                list = list.push(text(line.clone()).size(12).color(theme::TEXT));
+            }
+            col = col.push(
+                container(list)
+                    .width(Length::Fill)
+                    .padding(10)
+                    .style(wizard_panel),
+            );
+        } else if !self.wizard_done.is_empty() {
+            col = col.push(
+                text("Nothing failed.").size(13).color(theme::TEXT),
+            );
+        }
+        col = col.push(
+            row![
+                button(text("Configure another save"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::WizardReset),
+                button(text("Back to Browse"))
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::TabSelected(Tab::Browse)),
+            ]
+            .spacing(8),
+        );
+        scrollable(col).height(Length::Fill).into()
     }
 
     /// Log Reader: the game's log.txt from the profile folder,
@@ -3340,7 +5064,7 @@ impl App {
                 .style(theme::danger_pill())
                 .on_press(Message::Scan),
             nav(format!("Conflicts ({})", self.conflicts.len()), Tab::Conflicts),
-            nav("Configure Save (wip)".to_string(), Tab::Saves),
+            nav("Configure Save".to_string(), Tab::Saves),
             nav("Layout".to_string(), Tab::Layout),
             nav("Log Reader".to_string(), Tab::Log),
             nav("Settings".to_string(), Tab::Settings),

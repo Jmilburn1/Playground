@@ -284,9 +284,45 @@ pub enum Message {
     DraftToggle(String),
     DraftUseActive,
     DraftEmpty,
-    SaveLoadout,
-    ApplyLoadout,
     SavesFilterChanged(String),
+    /// Configure Save wizard: jump to a step (0-based:
+    /// 0 Select, 1 Settings, 2 Loadout, 3 Review,
+    /// 4 Results). Navigation past Select needs a slot.
+    WizardStep(u8),
+    /// Configure Save wizard: a boolean settings field set
+    /// by its key (see ui::app's settings key table).
+    WizardSetBool(String, bool),
+    /// Configure Save wizard: an enum/number settings field
+    /// set by key, value in the game's own storage shape.
+    WizardSetValue(String, String),
+    /// Configure Save wizard: the save-name text field.
+    WizardNameChanged(String),
+    /// Configure Save wizard: cash / loan exact-value
+    /// fields, and the preset chips that adjust them.
+    WizardCashChanged(String),
+    WizardLoanChanged(String),
+    WizardCashChip(i64),
+    WizardLoanChip(i64),
+    /// Configure Save wizard: reseed the loadout draft from
+    /// the save's own recorded mod list.
+    WizardUseSaveList,
+    /// Configure Save wizard: select/deselect a whole
+    /// loadout group ("required" / "favourites" / "library").
+    WizardGroupToggle(String, bool),
+    /// Configure Save wizard: collapse/expand a loadout
+    /// group on the page.
+    WizardCollapseGroup(String),
+    /// Configure Save wizard: the Auto Drive section's
+    /// Browse button and its outcome.
+    WizardBrowseAutoDrive,
+    WizardAutoDrivePicked(Option<PathBuf>),
+    WizardClearAutoDrive,
+    /// Configure Save wizard: the Review page's apply
+    /// (arm-to-confirm, like the Layout page's).
+    WizardApply,
+    /// Configure Save wizard: leave the results and start
+    /// over at Select with a clean draft.
+    WizardReset,
     /// Layout page: build (or rebuild) the read-only
     /// plan preview for the current folders.
     LayoutBuildPlan,

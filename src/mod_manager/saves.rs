@@ -21,9 +21,14 @@ pub struct SaveSlot {
     pub dir_name: String,
     pub path: PathBuf,
     pub map: Option<String>,
+    /// The save's own name (careerSavegame's savegameName).
+    pub name: Option<String>,
     pub saved_at: Option<String>,
     pub play_minutes: Option<f64>,
     pub money: Option<i64>,
+    /// How many mods the save itself records in its
+    /// careerSavegame.xml (Configure Save, Step 1).
+    pub mod_count: usize,
 }
 
 impl SaveSlot {
@@ -51,16 +56,20 @@ pub fn list_save_slots(profile_dir: &Path) -> Vec<SaveSlot> {
             dir_name,
             path: dir.clone(),
             map: None,
+            name: None,
             saved_at: None,
             play_minutes: None,
             money: None,
+            mod_count: 0,
         };
         if let Ok(xml) = std::fs::read_to_string(&career) {
             slot.map = tag_text(&xml, &["mapTitle", "mapName", "mapId"]);
+            slot.name = tag_text(&xml, &["savegameName"]);
             slot.saved_at = tag_text(&xml, &["saveDateTime", "saveDate", "lastSaveDate"]);
             slot.play_minutes =
                 tag_text(&xml, &["playTime", "playtime", "totalPlayTime"])
                     .and_then(|t| t.parse::<f64>().ok());
+            slot.mod_count = super::savegame::recorded_mods(&xml).len();
         }
         let farms = dir.join("farms.xml");
         if let Ok(xml) = std::fs::read_to_string(&farms) {
