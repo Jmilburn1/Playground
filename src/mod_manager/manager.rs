@@ -321,7 +321,14 @@ impl ModManager {
     /// always produced:
     ///
     /// - a `.zip` file at the root is a candidate, as are
-    ///   a folder mod's own files one level down;
+    ///   a folder mod's own files one level down; a `.dlc`
+    ///   pack (GIANTS' official DLC: one encrypted file,
+    ///   no readable modDesc) is a file-mod candidate at
+    ///   both levels too — `Mod::new` gives it the same
+    ///   filename-based fallback record an unparseable
+    ///   zip gets, and a library holding one must not
+    ///   lose it from the list when it is laid out
+    ///   (owner's strawHarvestPack.dlc, 2026-10-21);
     /// - a root folder holding a `modDesc.xml` at its top
     ///   is a folder mod — a candidate itself;
     /// - a root folder without one whose children include
@@ -342,15 +349,16 @@ impl ModManager {
             Err(_) => return Vec::new(),
         };
         top.sort();
-        let is_zip = |p: &std::path::Path| {
+        let is_mod_file = |p: &std::path::Path| {
             p.is_file()
-                && p.extension()
-                    .map_or(false, |e| e.eq_ignore_ascii_case("zip"))
+                && p.extension().map_or(false, |e| {
+                    e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("dlc")
+                })
         };
         let mut out: Vec<PathBuf> = Vec::new();
         for path in top {
             if path.is_file() {
-                if is_zip(&path) {
+                if is_mod_file(&path) {
                     out.push(path);
                 }
             } else if path.is_dir() {
@@ -367,7 +375,7 @@ impl ModManager {
                 children.sort();
                 let mod_children: Vec<PathBuf> = children
                     .iter()
-                    .filter(|c| c.is_dir() || is_zip(c))
+                    .filter(|c| c.is_dir() || is_mod_file(c))
                     .cloned()
                     .collect();
                 if !mod_children.is_empty() {
@@ -1724,6 +1732,15 @@ mod tests {
         std::fs::write(path, zip_bytes(entries)).unwrap();
     }
 
+    /// A .dlc pack: opaque bytes, deliberately not a
+    /// zip — GIANTS' DLC files are encrypted, so no
+    /// modDesc is readable and the scan record is the
+    /// filename-based fallback `Mod::new` builds.
+    fn write_dlc_file(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"\x7fDLC opaque pack bytes, not a zip").unwrap();
+    }
+
     fn write_folder_mod(dir: &std::path::Path, desc: &str, files: &[(&str, &[u8])]) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("modDesc.xml"), desc).unwrap();
@@ -1951,6 +1968,16 @@ mod tests {
                 &desc_plain("1.0.0.0", "Eq Folder"),
                 &[("data.bin", b"folder-data")],
             );
+            // DLC packs (owner's strawHarvestPack.dlc,
+            // 2026-10-21): one at the root in BOTH worlds
+            // — the layout engine plans no move for a
+            // .dlc, so the root is where it stays — and
+            // one filed under Other when migrated, at
+            // the root when flat. Both must list in both
+            // worlds, or the migrated list loses records
+            // the flat list has.
+            write_dlc_file(&lib.join("EqDlcPack.dlc"));
+            write_dlc_file(&at(&lib, "Other", "EqFiledDlc.dlc"));
             // Active set: the tractor and the folder mod,
             // plus a game-only mod — the same in both
             // worlds (links after migration, copies
@@ -2003,18 +2030,39 @@ mod tests {
         let (mig_base, mig_lib, mig_game) = build("mig", true);
         let mig_mods = scan_scratch(&mig_base, &mig_lib, &mig_game);
 
-        assert_eq!(flat_mods.len(), 6, "flat census: {:?}", flat_mods.iter().map(|m| m.file_name()).collect::<Vec<_>>());
+        assert_eq!(flat_mods.len(), 8, "flat census: {:?}", flat_mods.iter().map(|m| m.file_name()).collect::<Vec<_>>());
         assert_eq!(
             shape(&flat_mods),
             shape(&mig_mods),
             "the migrated mod list must equal the flat one"
         );
         // And the trees really do differ underneath: the
-        // migrated records point into category folders.
+        // migrated records point into category folders —
+        // all but the root DLC pack, which the layout
+        // files nowhere and which therefore stays home.
         assert!(mig_mods
             .iter()
             .filter(|m| m.path.starts_with(&mig_lib))
+            .filter(|m| m.file_name() != "EqDlcPack.dlc")
             .all(|m| m.path.parent() != Some(mig_lib.as_path())));
+
+        // The DLC packs list in both worlds with the
+        // fallback record shape: the file name for a
+        // name, the default version, Uncategorized,
+        // Archived, type Unknown.
+        for mods in [&flat_mods, &mig_mods] {
+            for name in ["EqDlcPack.dlc", "EqFiledDlc.dlc"] {
+                let rec = mods
+                    .iter()
+                    .find(|m| m.file_name() == name)
+                    .unwrap_or_else(|| panic!("{} missing from the scan", name));
+                assert_eq!(rec.name, name);
+                assert_eq!(rec.version, "1.0.0");
+                assert_eq!(rec.categories, vec!["Uncategorized".to_string()]);
+                assert_eq!(rec.state, ModState::Archived);
+                assert_eq!(rec.mod_type, ModType::Unknown);
+            }
+        }
 
         std::fs::remove_dir_all(&flat_base).ok();
         std::fs::remove_dir_all(&mig_base).ok();

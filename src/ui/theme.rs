@@ -112,11 +112,62 @@ pub fn nav_pill(selected: bool) -> impl Fn(&Theme, button::Status) -> button::St
     }
 }
 
+/// The details panel's close button (John, 2026-10-21):
+/// a round accent button — the steel teal with a pale-ice
+/// glyph, lightening on hover and settling toward the
+/// base when pressed, in the danger pill's rhythm. The
+/// caller sizes it square; the radius-100 border closes
+/// it into a circle by construction (see `pill_border`).
+pub fn close_button() -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let fill = match status {
+            button::Status::Hovered => mix(ACCENT, TEXT_DIM, 0.18),
+            button::Status::Pressed => mix(ACCENT, BASE, 0.25),
+            _ => ACCENT,
+        };
+        button::Style {
+            background: Some(Background::Color(fill)),
+            text_color: TEXT,
+            border: pill_border(),
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+/// The Browse Show: field (John, 2026-10-21): the field
+/// wears the highlighted buttons' color — the accent the
+/// selected menu pill wears — instead of its old flat
+/// grey. Hover lightens the same way the selected pill's
+/// does. The border is the field's own long-standing one,
+/// unchanged: only the fill moved into the palette.
+pub fn dropdown_field() -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let fill = match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                mix(ACCENT, TEXT_DIM, 0.18)
+            }
+            _ => ACCENT,
+        };
+        button::Style {
+            background: Some(Background::Color(fill)),
+            text_color: TEXT,
+            border: Border {
+                color: Color::from_rgb(0.35, 0.36, 0.40),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
 /// #8E2A23 — deep oxide red: NOT a palette color. The one
-/// sanctioned exception (John, 2026-10-21), worn only by
-/// the Rescan pill: red warns against the heavy action
-/// and stands out from the steel-and-petrol scheme at the
-/// same time. TEXT on it runs ~6:1 — clears the 4.5:1 bar.
+/// sanctioned exception (John, 2026-10-21), worn by the
+/// Rescan pill and the details panel's Remove pill (the
+/// two things that can hurt you, same red): red warns
+/// against the heavy action and stands out from the
+/// steel-and-petrol scheme at the same time. TEXT on it
+/// runs ~6:1 — clears the 4.5:1 bar.
 pub const DANGER: Color = Color {
     r: 0x8E as f32 / 255.0,
     g: 0x2A as f32 / 255.0,

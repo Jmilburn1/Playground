@@ -593,3 +593,39 @@ impl<Message> iced::widget::canvas::Program<Message> for StarIcon {
         vec![frame.into_geometry()]
     }
 }
+
+/// A small filled down-triangle drawn with canvas paths — the
+/// Show: dropdown field's tick. Drawn rather than typed because
+/// the UI font has no ▾ glyph (U+25BE rendered as a hollow box on
+/// John's Windows build, the same failure as the star — see
+/// mod_card). White, matching the field button's text color.
+pub struct DropdownTick;
+
+impl<Message> iced::widget::canvas::Program<Message> for DropdownTick {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        _renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{Frame, Path};
+        let mut frame = Frame::new(_renderer, bounds.size());
+        // A squat triangle like the ▾ glyph: full width, roughly
+        // three-fifths of the height, centered vertically.
+        let w = bounds.width;
+        let h = bounds.height * 0.62;
+        let top = (bounds.height - h) / 2.0;
+        let triangle = Path::new(|b| {
+            b.move_to(iced::Point::new(0.0, top));
+            b.line_to(iced::Point::new(w, top));
+            b.line_to(iced::Point::new(w / 2.0, top + h));
+            b.close();
+        });
+        frame.fill(&triangle, Color::WHITE);
+        vec![frame.into_geometry()]
+    }
+}

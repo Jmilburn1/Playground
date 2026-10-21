@@ -14,7 +14,7 @@
     "Playground Update Fill", with one daily trigger per
     time in -Times. Re-running the script simply
     re-registers the task (-Force): no duplicates, no
-    leftovers — the registration is idempotent.
+    leftovers -- the registration is idempotent.
 
     The task runs as the user who registers it, only when
     that user is logged on, and Task Scheduler will start
@@ -29,7 +29,7 @@
 
 .PARAMETER Times
     Local times of day for the fill. THE DEFAULTS ARE
-    06:00, 14:00 and 22:00 — change them to whatever
+    06:00, 14:00 and 22:00 -- change them to whatever
     suits the household; they are just defaults.
     Example: -Times '07:30','19:30' for twice a day.
 
@@ -63,7 +63,7 @@ if ($Remove) {
         Write-Host "Removed scheduled task '$TaskName'."
     }
     else {
-        Write-Host "Scheduled task '$TaskName' is not registered — nothing to remove."
+        Write-Host "Scheduled task '$TaskName' is not registered -- nothing to remove."
     }
     return
 }
@@ -75,7 +75,7 @@ $ExePath = (Resolve-Path $UpdateExe).Path
 $ExeDir = Split-Path $ExePath
 
 # The verb is explicit: 'update' is the fill. (Bare
-# update.exe runs the fill too — the scheduler passes the
+# update.exe runs the fill too -- the scheduler passes the
 # verb so the task's command line reads as what it does.)
 $Action = New-ScheduledTaskAction -Execute $ExePath -Argument 'update' -WorkingDirectory $ExeDir
 
@@ -93,7 +93,7 @@ $Settings = New-ScheduledTaskSettingsSet `
 
 $Principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 
-$Description = 'Playground: refresh the personal update database (catalog-home.json) — scan facts + ModHub catalog join + link polls. Runs update.exe (the isolated update program). Registered by tools\register-update-schedule.ps1.'
+$Description = 'Playground: refresh the personal update database (catalog-home.json) -- scan facts + ModHub catalog join + link polls. Runs update.exe (the isolated update program). Registered by tools\register-update-schedule.ps1.'
 
 # -Force makes re-running this script a clean
 # re-registration instead of a duplicate or an error.

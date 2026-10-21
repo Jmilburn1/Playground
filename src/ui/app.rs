@@ -11,9 +11,9 @@ use crate::ui::components::update_types::{UpdateInfo, UpdateState};
 use crate::ui::theme;
 use crate::update_db::{self, UpdateRow};
 use crate::ui::components::{
-    format_size, mod_card, BrowseView, FolderTarget, LoadEvent, LoadOutcome,
-    LoadPhase, LogKind, LogLine, LogOutcome, Message, ScanOutcome, Tab,
-    UpdateDbPresentation, UpdateJudgement,
+    format_size, mod_card, BrowseView, DropdownTick, FolderTarget, LoadEvent,
+    LoadOutcome, LoadPhase, LogKind, LogLine, LogOutcome, Message,
+    ScanOutcome, Tab, UpdateDbPresentation, UpdateJudgement,
 };
 use futures::SinkExt as _;
 use iced::widget::image::Handle as ImageHandle;
@@ -39,6 +39,41 @@ const SPLASH_H: f32 = 392.0;
 const SIDEBAR_W: f32 = 232.0;
 const GRID_SPACING: f32 = 12.0;
 const DETAILS_W: f32 = 344.0;
+
+/// A lone button label, centered across the button's full
+/// width (John, 2026-10-21: button text centered, app-wide).
+/// Iced 0.13 lays a button's content out from its top-left
+/// corner, so a single label in a wide button hugs the left
+/// edge; wrapping the label in a Fill-width container that
+/// centers its child is what puts it in the middle. Only
+/// wide buttons need the wrap — a shrink-width button hugs
+/// its label with symmetric padding, so its label is
+/// already centered by construction (and a Fill wrap inside
+/// one would balloon its width).
+fn centered_label<'a>(label: iced::widget::text::Text<'a>) -> Element<'a, Message> {
+    container(label)
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .into()
+}
+
+/// The Browse tiles' counts, tallied from the record set
+/// itself: total records, and how many sit in each of the
+/// two states the Browse filters name. A record in any
+/// other state (Conflict, Error) counts toward the total
+/// alone — the tiles never fudge it into either column.
+fn tally_states(states: impl Iterator<Item = ModState>) -> (usize, usize, usize) {
+    let (mut total, mut active, mut archived) = (0usize, 0usize, 0usize);
+    for state in states {
+        total += 1;
+        match state {
+            ModState::Active => active += 1,
+            ModState::Archived => archived += 1,
+            _ => {}
+        }
+    }
+    (total, active, archived)
+}
 
 pub struct App {
     mod_manager: ModManager,
@@ -1298,13 +1333,15 @@ impl App {
         cats.sort();
         cats.dedup();
         view_options.extend(cats.into_iter().map(BrowseView::Category));
-        // Stat boxes across the top (John, round 4 — Hub's tiles):
-        // installed / favourited / maps / available updates. The
-        // fourth tile was DISK USAGE until 2026-10-18: that
-        // figure already lives in the sidebar, so John swapped
-        // the tile to the update count from the database —
-        // the number that changes something.
+        // Stat boxes across the top (John, round 4 — Hub's tiles).
+        // Six since 2026-10-21 (John's order, his labels): total /
+        // active / archived / favorite / maps / updates available.
+        // The state tallies come from the records themselves, the
+        // same `state` field the Browse filters match on, so a
+        // tile can never disagree with the list it names.
         let all_mods = self.mod_manager.get_mods();
+        let (total_count, active_count, archived_count) =
+            tally_states(all_mods.iter().map(|m| m.state.clone()));
         let maps_count = all_mods
             .iter()
             .filter(|m| m.categories.iter().any(|c| c == "Maps"))
@@ -1332,8 +1369,10 @@ impl App {
             })
         };
         let tiles = row![
-            tile(all_mods.len().to_string(), "INSTALLED"),
-            tile(self.mod_manager.favorites_count().to_string(), "FAVOURITED"),
+            tile(total_count.to_string(), "TOTAL MODS"),
+            tile(active_count.to_string(), "ACTIVE MODS"),
+            tile(archived_count.to_string(), "ARCHIVED MODS"),
+            tile(self.mod_manager.favorites_count().to_string(), "FAVORITE MODS"),
             tile(maps_count.to_string(), "MAPS"),
             tile(
                 match self.db_generated_at {
@@ -1358,7 +1397,7 @@ impl App {
                         .to_string(),
                     None => "–".to_string(),
                 },
-                "AVAILABLE UPDATES",
+                "UPDATES AVAILABLE",
             ),
         ]
         .spacing(10);
@@ -1381,32 +1420,26 @@ impl App {
                 row![
                     text(format!("{}", self.view_filter)),
                     Space::with_width(Length::Fill),
-                    text("\u{25be}").size(12),
+                    // Drawn, not typed: the UI font has no ▾
+                    // glyph (it rendered as a hollow box on
+                    // John's build) — same fix as the star,
+                    // including its fixed-size container wrap,
+                    // mirroring the star badge's usage exactly.
+                    container(iced::widget::canvas(DropdownTick).width(12).height(12))
+                        .width(12)
+                        .height(12)
+                        .center_x(12)
+                        .center_y(12),
                 ]
                 .spacing(8),
             )
             .width(200)
             .padding(8)
             .on_press(Message::ToggleShowMenu)
-            .style(|_theme, status| {
-                let bg = match status {
-                    iced::widget::button::Status::Hovered
-                    | iced::widget::button::Status::Pressed => {
-                        iced::Color::from_rgb(0.45, 0.45, 0.46)
-                    }
-                    _ => iced::Color::from_rgb(0.396, 0.4, 0.4),
-                };
-                iced::widget::button::Style {
-                    background: Some(iced::Background::Color(bg)),
-                    text_color: iced::Color::WHITE,
-                    border: iced::Border {
-                        color: iced::Color::from_rgb(0.35, 0.36, 0.40),
-                        width: 1.0,
-                        radius: 8.0.into(),
-                    },
-                    ..Default::default()
-                }
-            }),
+            // The field wears the highlighted buttons' color
+            // now (John, 2026-10-21) — the accent from
+            // ui::theme, not the old flat grey.
+            .style(theme::dropdown_field()),
             text_input("Search mods...", &self.search_query)
                 .on_input(Message::SearchChanged)
                 .padding(8)
@@ -1549,7 +1582,7 @@ impl App {
             for opt in view_options {
                 let selected = opt == self.view_filter;
                 options_col = options_col.push(
-                    button(text(format!("{}", opt)))
+                    button(centered_label(text(format!("{}", opt))))
                         .width(200)
                         .padding([6, 10])
                         .on_press(Message::BrowseViewChanged(opt))
@@ -1620,12 +1653,28 @@ impl App {
             "Add to favorites"
         };
 
+        // The close button leads the header now (John,
+        // 2026-10-21): on the LEFT, round, in the accent —
+        // a styled button, so the circle is a quad and
+        // shows in captures. Its glyph rides a fixed-size
+        // centered container, the star badge's pattern.
+        let close_btn = button(
+            container(text("X").size(13))
+                .width(28)
+                .height(28)
+                .center_x(28)
+                .center_y(28),
+        )
+        .width(28)
+        .height(28)
+        .padding(0)
+        .style(theme::close_button())
+        .on_press(Message::CloseDetails);
+
         let mut col = column![
-            row![
-                text(&m.name).size(20),
-                Space::with_width(Length::Fill),
-                button(text("X").size(14)).on_press(Message::CloseDetails),
-            ],
+            row![close_btn, text(&m.name).size(20)]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
             text(format!("Version {}", m.version)).size(14),
         ]
         .spacing(8);
@@ -1688,11 +1737,6 @@ impl App {
         }
 
         col = col.push(Space::with_height(8));
-        col = col.push(
-            button(text(fav_label))
-                .width(Length::Fill)
-                .on_press(Message::ToggleFavorite(m.id.clone())),
-        );
 
         // Updates (GitHub): link this mod to its repo, check the
         // latest release, and install over the old file in place.
@@ -1783,34 +1827,19 @@ impl App {
                 text("Not in the update database yet — it lands at the next fill.").size(12),
             );
         }
-        col = col.push(text("Updates (GitHub):").size(13));
-        col = col.push(
-            row![
-                text_input("owner/repo or repo URL", &self.link_input)
-                    .on_input(Message::LinkInputChanged)
-                    .size(13),
-                button(text(if linked.is_some() { "Save link" } else { "Link" }).size(13))
-                    .on_press(Message::SaveModLink(m.id.clone())),
-            ]
-            .spacing(6),
-        );
         // Updates (ModHub): link by page URL or numeric mod_id.
-        // The check button below serves both sources.
+        // The check button in the update box serves both sources.
+        // The link fields themselves are built at the panel's
+        // bottom now (John, 2026-10-21: fill boxes last).
         let mh_linked = self
             .mod_manager
             .modhub_link(&stem)
             .map(|s| s.to_string());
-        col = col.push(text("Updates (ModHub):").size(13));
-        col = col.push(
-            row![
-                text_input("ModHub page URL or mod id", &self.modhub_input)
-                    .on_input(Message::ModHubInputChanged)
-                    .size(13),
-                button(text(if mh_linked.is_some() { "Save link" } else { "Link" }).size(13))
-                    .on_press(Message::SaveModHubLink(m.id.clone())),
-            ]
-            .spacing(6),
-        );
+
+        // The update box rides above the action cluster
+        // (John, 2026-10-21): the status printout over a
+        // Check button wearing the cluster's pill, then
+        // the install button when an update is on offer.
         if linked.is_some() || mh_linked.is_some() {
             let state_line = match self.update_status.get(&m.id) {
                 Some(UpdateState::Checking) => "Checking for updates…".to_string(),
@@ -1824,14 +1853,15 @@ impl App {
             };
             col = col.push(text(state_line).size(12));
             col = col.push(
-                button(text("Check for update"))
+                button(centered_label(text("Check for update")))
                     .width(Length::Fill)
+                    .style(theme::nav_pill(true))
                     .on_press(Message::CheckUpdate(m.id.clone())),
             );
             if let Some(UpdateState::Available(info)) = self.update_status.get(&m.id) {
                 let label = format!("Download && install v{}", info.version);
                 col = col.push(
-                    button(text(label))
+                    button(centered_label(text(label)))
                         .width(Length::Fill)
                         .on_press(Message::InstallUpdate(m.id.clone())),
                 );
@@ -1857,7 +1887,7 @@ impl App {
             );
             let label = format!("Download && install v{}", info.version);
             col = col.push(
-                button(text(label))
+                button(centered_label(text(label)))
                     .width(Length::Fill)
                     .on_press(Message::InstallUpdate(m.id.clone())),
             );
@@ -1866,42 +1896,108 @@ impl App {
                     text("Update installs work on .zip mods; this is a folder mod.").size(12),
                 );
             }
-        } else {
-            col = col.push(
-                text("Link this mod to its GitHub repo to check it for updates.").size(12),
-            );
         }
-        if m.state == ModState::Active {
-            col = col.push(
-                button(text("Move to Archive"))
-                    .width(Length::Fill)
-                    .on_press(Message::MoveToArchive(m.id.clone())),
-            );
+        // The primary actions, together (John, 2026-10-21):
+        // favourite, move, and remove used to be scattered
+        // down the panel with the whole updates section
+        // between them. Now they sit in one cluster of pills
+        // in the menu's language — the highlighted pill's
+        // accent for favourite and move, the Rescan pill's
+        // danger red for remove. Same messages, same labels,
+        // same arm-to-confirm flow as before.
+        let move_label = if m.state == ModState::Active {
+            "Move to Archive"
         } else {
-            col = col.push(
-                button(text("Move to Active"))
-                    .width(Length::Fill)
-                    .on_press(Message::MoveToActive(m.id.clone())),
-            );
-        }
+            "Move to Active"
+        };
+        let move_message = if m.state == ModState::Active {
+            Message::MoveToArchive(m.id.clone())
+        } else {
+            Message::MoveToActive(m.id.clone())
+        };
         let remove_label = if self.pending_remove.as_deref() == Some(m.id.as_str()) {
             "Confirm delete (permanent)"
         } else {
             "Remove mod"
         };
         col = col.push(
-            button(text(remove_label))
-                .style(button::danger)
-                .width(Length::Fill)
-                .on_press(Message::RemoveMod(m.id.clone())),
+            column![
+                button(centered_label(text(fav_label).size(14)))
+                    .width(Length::Fill)
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::ToggleFavorite(m.id.clone())),
+                button(centered_label(text(move_label).size(14)))
+                    .width(Length::Fill)
+                    .style(theme::nav_pill(true))
+                    .on_press(move_message),
+                button(centered_label(text(remove_label).size(14)))
+                    .width(Length::Fill)
+                    .style(theme::danger_pill())
+                    .on_press(Message::RemoveMod(m.id.clone())),
+            ]
+            .spacing(6),
         );
+
+        // Link this mod — the fill boxes close the panel
+        // (John, 2026-10-21): the GitHub and ModHub link
+        // fields and their buttons sit below all other
+        // content, with the linking hint when neither a
+        // hand link nor a database offer exists.
+        col = col.push(text("Updates (GitHub):").size(13));
+        col = col.push(
+            row![
+                text_input("owner/repo or repo URL", &self.link_input)
+                    .on_input(Message::LinkInputChanged)
+                    .size(13),
+                button(text(if linked.is_some() { "Save link" } else { "Link" }).size(13))
+                    .on_press(Message::SaveModLink(m.id.clone())),
+            ]
+            .spacing(6),
+        );
+        col = col.push(text("Updates (ModHub):").size(13));
+        col = col.push(
+            row![
+                text_input("ModHub page URL or mod id", &self.modhub_input)
+                    .on_input(Message::ModHubInputChanged)
+                    .size(13),
+                button(text(if mh_linked.is_some() { "Save link" } else { "Link" }).size(13))
+                    .on_press(Message::SaveModHubLink(m.id.clone())),
+            ]
+            .spacing(6),
+        );
+        if linked.is_none()
+            && mh_linked.is_none()
+            && !matches!(
+                self.update_status.get(&m.id),
+                Some(UpdateState::Available(_))
+            )
+        {
+            col = col.push(
+                text("Link this mod to its GitHub repo to check it for updates.").size(12),
+            );
+        }
 
         Some(
             container(scrollable(col))
                 .width(DETAILS_W)
                 .height(Length::Fill)
                 .padding(14)
-                .style(container::bordered_box)
+                .style(|_| container::Style {
+                    // The sidebar's ground and edge (John,
+                    // 2026-10-21: the panel background is the
+                    // menu's background), plus the buttons'
+                    // pale ice as the panel's text color —
+                    // mirrors theme::sidebar_container, with
+                    // the text color that style leaves unset.
+                    background: Some(iced::Background::Color(theme::BASE)),
+                    text_color: Some(theme::TEXT),
+                    border: iced::Border {
+                        color: theme::PANEL,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..container::Style::default()
+                })
                 .into(),
         )
     }
@@ -2511,7 +2607,7 @@ impl App {
             .on_press(Message::LibraryFilter(view))
         };
         let nav = |label: String, tab: Tab| {
-            button(text(label).size(14))
+            button(centered_label(text(label).size(14)))
                 .width(Length::Fill)
                 // The current page's pill is the accent
                 // (John, 2026-10-21) — supersedes the 2026-
@@ -2552,22 +2648,24 @@ impl App {
             // navigation — Mods was working overtime doing
             // Browse's job, so it holds the job officially
             // now, from its place under LIBRARY.
-            button(text("Rescan").size(14))
+            button(centered_label(text("Rescan").size(14)))
                 .width(Length::Fill)
                 .style(theme::danger_pill())
                 .on_press(Message::Scan),
             nav(format!("Conflicts ({})", self.conflicts.len()), Tab::Conflicts),
             nav("Configure Save (wip)".to_string(), Tab::Saves),
-            // Favourites sits in the features block, under
-            // Configure Save (John, 2026-10-21 — moved out
-            // of LIBRARY, brought down two): it is a view of
-            // the library, reached like a feature, and it
-            // lights when that view is on screen.
-            lib_row("Favourites", self.mod_manager.favorites_count(), BrowseView::Favorites),
             nav("Log Reader".to_string(), Tab::Log),
             nav("Settings".to_string(), Tab::Settings),
             text("LIBRARY").size(11),
             lib_row("Mods", all.len(), BrowseView::All),
+            // Favourites lives in LIBRARY, directly under
+            // Mods (John, 2026-10-21 — his later call the
+            // same day reverses its brief stay in the
+            // features block): a library view in the library
+            // rows' label+count dress, its count the same
+            // favorites_count the FAVORITE MODS tile reads,
+            // and it lights when that view is on screen.
+            lib_row("Favourites", self.mod_manager.favorites_count(), BrowseView::Favorites),
             lib_row("Maps", count_cat("Maps"), BrowseView::Category("Maps".to_string())),
             lib_row(
                 "Scripts",
@@ -2580,7 +2678,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.3.1  © 2026 Farmer Jay.")
+            text("V1.3.3  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -3435,6 +3533,34 @@ mod tests {
     /// own size: a landed restore (1280x800) and any
     /// hand-resized window must both leave the stateful
     /// decorations toggle untouched.
+    /// The tiles' tallies: every record counts once toward
+    /// the total, Active and Archived take only their own
+    /// state, and a neither-state record (Conflict, Error)
+    /// lands in the total alone — total = active + archived
+    /// exactly when no such record exists.
+    #[test]
+    fn tally_states_counts_each_record_once() {
+        let (total, active, archived) = tally_states(
+            [
+                ModState::Active,
+                ModState::Archived,
+                ModState::Active,
+                ModState::Archived,
+                ModState::Archived,
+            ]
+            .into_iter(),
+        );
+        assert_eq!((total, active, archived), (5, 2, 3));
+        assert_eq!(total, active + archived);
+
+        let (total, active, archived) = tally_states(
+            [ModState::Active, ModState::Conflict, ModState::Error].into_iter(),
+        );
+        assert_eq!((total, active, archived), (3, 1, 0));
+
+        assert_eq!(tally_states(std::iter::empty()), (0, 0, 0));
+    }
+
     #[test]
     fn splash_size_trigger_matches_only_the_splash() {
         assert!(App::still_splash_sized(Size::new(SPLASH_W, SPLASH_H)));
