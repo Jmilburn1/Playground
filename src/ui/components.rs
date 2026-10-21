@@ -251,6 +251,19 @@ pub enum Message {
     ApplyLoadout,
     SavesFilterChanged(String),
     WindowResized(iced::Size),
+    /// Boot handover (splash -> main window): the window
+    /// id read answered. The handover collects this fact
+    /// and the splash's position, then fires frame + size
+    /// + centering as ONE batched shape change.
+    RestoreWindowId(Option<iced::window::Id>),
+    /// Boot handover: the splash position read answered.
+    RestoreWindowPosition(Option<iced::Point>),
+    /// Boot handover: the clock tick driving the position
+    /// deadline and the verify net's schedule. The
+    /// subscription runs only while a handover is live.
+    RestoreTick,
+    /// Boot handover: the verify net's size read-back.
+    RestoreVerifySize(iced::Size),
     GridScrolled(iced::widget::scrollable::Viewport),
     ToggleShowMenu,
 }

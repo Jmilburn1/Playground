@@ -36,6 +36,25 @@ const CARD_H: f32 = 258.0;
 /// either side of it.
 const SPLASH_W: f32 = 516.0;
 const SPLASH_H: f32 = 392.0;
+/// How long the boot handover waits for the splash's
+/// position read before restoring shape without the
+/// centering move. A healthy shell answers within a
+/// frame or two; the deadline exists because the read
+/// rides a oneshot task whose stream can end silently —
+/// the wait must be bounded, or the never-answer case
+/// would take the whole restore with it (the v1.2.1
+/// field bug; see restore_window).
+const RESTORE_POSITION_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(500);
+/// How long after the batched restore fires before the
+/// verify net reads the window's size back: long enough
+/// that a landed restore demonstrably reads 1280x800,
+/// so a splash-sized read means the restore truly
+/// never landed.
+const RESTORE_VERIFY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(600);
+/// The boot handover's clock interval while it is live.
+const RESTORE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 const SIDEBAR_W: f32 = 232.0;
 const GRID_SPACING: f32 = 12.0;
 const DETAILS_W: f32 = 344.0;
@@ -73,6 +92,56 @@ fn tally_states(states: impl Iterator<Item = ModState>) -> (usize, usize, usize)
         }
     }
     (total, active, archived)
+}
+
+/// The boot handover (splash -> main window) as a small
+/// state machine, driven by the Restore* messages and a
+/// short-lived clock subscription. It exists so the
+/// frame, the 1280x800 resize, and the centering move
+/// can be collected first and fired as ONE batched shape
+/// change (owner, 2026-10-21: the previous sequence
+/// landed as three visible steps — the frame appeared
+/// at splash size, the window blew out to full size
+/// wherever it sat, then hopped to center).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreState {
+    /// No handover in flight: before the boot load
+    /// lands, during every later load, and once a
+    /// handover has fully settled.
+    Idle,
+    /// The window id is in; the splash position read is
+    /// in flight. When it lands, the batched restore
+    /// fires whole. If it has not landed by the deadline,
+    /// the restore fires without the centering move
+    /// instead: the read is a oneshot that can end
+    /// silently, so it is never load-bearing for the
+    /// window's shape (the v1.2.1 field bug).
+    Collecting {
+        id: iced::window::Id,
+        deadline: std::time::Instant,
+    },
+    /// The batched restore has been issued; the verify
+    /// net's size read comes due at `check_at`.
+    Verifying {
+        id: iced::window::Id,
+        check_at: std::time::Instant,
+    },
+    /// The verify net's size read is in flight.
+    VerifyRead { id: iced::window::Id },
+    /// The handover is over: the net read the size back
+    /// and acted (or found nothing to do).
+    Settled,
+}
+
+impl RestoreState {
+    /// Whether the handover clock should be running:
+    /// only the timed states need it.
+    fn ticking(&self) -> bool {
+        matches!(
+            self,
+            RestoreState::Collecting { .. } | RestoreState::Verifying { .. }
+        )
+    }
 }
 
 pub struct App {
@@ -163,6 +232,9 @@ pub struct App {
     grid_view_h: f32,
     /// Whether the Show: menu (custom dropdown) is open.
     show_menu_open: bool,
+    /// Boot handover (splash -> main window) state; see
+    /// RestoreState. Stays Idle for every load after boot.
+    window_restore: RestoreState,
 }
 
 impl App {
@@ -227,6 +299,7 @@ impl App {
             grid_offset: 0.0,
             grid_view_h: 0.0,
             show_menu_open: false,
+            window_restore: RestoreState::Idle,
         }
     }
 
@@ -546,11 +619,7 @@ impl App {
                     self.status = format!("Loaded {} mods — loading icons…", count);
                     let icons = self.begin_icon_load();
                     if was_booting {
-                        return Task::batch(vec![
-                            icons,
-                            Self::restore_window(),
-                            Self::verify_window_restored(),
-                        ]);
+                        return Task::batch(vec![icons, Self::restore_window()]);
                     }
                     return icons;
                 }
@@ -566,10 +635,7 @@ impl App {
                     // window (carrying the error in its status
                     // line) gets its ordinary shape back too.
                     if was_booting {
-                        return Task::batch(vec![
-                            Self::restore_window(),
-                            Self::verify_window_restored(),
-                        ]);
+                        return Self::restore_window();
                     }
                     return Task::none();
                 }
@@ -1283,6 +1349,119 @@ impl App {
             },
             Message::LogErrorsOnlyToggled(on) => self.log_errors_only = on,
             Message::WindowResized(size) => self.window_size = size,
+            Message::RestoreWindowId(id) => {
+                // The handover's first fact. Collection
+                // starts exactly once per process:
+                // restore_window is returned only by the
+                // boot transition, and any repeat finds
+                // the state past Idle and is dropped —
+                // the frame restore must never be set in
+                // motion twice (the decorations toggle is
+                // stateful; a second issue could flip a
+                // restored window's frame back off).
+                if !matches!(self.window_restore, RestoreState::Idle) {
+                    return Task::none();
+                }
+                match id {
+                    Some(id) => {
+                        self.window_restore = RestoreState::Collecting {
+                            id,
+                            deadline: std::time::Instant::now()
+                                + RESTORE_POSITION_WAIT,
+                        };
+                        return iced::window::get_position(id)
+                            .map(Message::RestoreWindowPosition);
+                    }
+                    // No window exists to hand over (the
+                    // shell is gone): nothing to collect,
+                    // nothing to verify.
+                    None => {
+                        self.window_restore = RestoreState::Settled;
+                        return Task::none();
+                    }
+                }
+            }
+            Message::RestoreWindowPosition(pos) => {
+                let RestoreState::Collecting { id, .. } = self.window_restore
+                else {
+                    // A late answer, after the deadline
+                    // fallback already restored the window:
+                    // dropped on purpose. Applying the
+                    // move now would be a second, separate
+                    // shape change — the lurch the batched
+                    // handover exists to remove.
+                    return Task::none();
+                };
+                self.window_restore = RestoreState::Verifying {
+                    id,
+                    check_at: std::time::Instant::now() + RESTORE_VERIFY_DELAY,
+                };
+                return match pos {
+                    // Both facts are in: frame, size, and
+                    // centering land as ONE batched shape
+                    // change.
+                    Some(pos) => Task::batch(vec![
+                        iced::window::toggle_decorations(id),
+                        iced::window::resize(id, Size::new(1280.0, 800.0)),
+                        iced::window::move_to(id, Self::main_top_left(pos)),
+                    ]),
+                    // The read answered with no position:
+                    // shape without the move.
+                    None => Self::restore_shape(id),
+                };
+            }
+            Message::RestoreTick => return match self.window_restore {
+                RestoreState::Collecting { id, deadline }
+                    if std::time::Instant::now() >= deadline =>
+                {
+                    // The position read never answered
+                    // (its oneshot stream can end with no
+                    // output at all): the deadline, not
+                    // the read, is what guarantees the
+                    // restore fires. Shape without the
+                    // move — off-center beats misshapen.
+                    self.window_restore = RestoreState::Verifying {
+                        id,
+                        check_at: std::time::Instant::now()
+                            + RESTORE_VERIFY_DELAY,
+                    };
+                    Self::restore_shape(id)
+                }
+                RestoreState::Verifying { id, check_at }
+                    if std::time::Instant::now() >= check_at =>
+                {
+                    self.window_restore = RestoreState::VerifyRead { id };
+                    iced::window::get_size(id).map(Message::RestoreVerifySize)
+                }
+                _ => Task::none(),
+            },
+            Message::RestoreVerifySize(size) => {
+                let RestoreState::VerifyRead { id } = self.window_restore
+                else {
+                    return Task::none();
+                };
+                self.window_restore = RestoreState::Settled;
+                if Self::still_splash_sized(size) {
+                    // The batched restore demonstrably
+                    // never landed, so issue it once more.
+                    // The stateful decorations toggle
+                    // rides along safely: it is only ever
+                    // re-issued when the coupled resize is
+                    // provably missing too, so it cannot
+                    // flip a restored window's frame back
+                    // off. The centering rides its own
+                    // chain here, as the net's always has
+                    // — at this point correctness beats
+                    // choreography. One check, at most
+                    // one re-issue, per boot: no retry
+                    // loop.
+                    return Task::batch(vec![
+                        iced::window::toggle_decorations(id),
+                        iced::window::resize(id, Size::new(1280.0, 800.0)),
+                        Self::center_main_window(id),
+                    ]);
+                }
+            }
             Message::ToggleShowMenu => {
                 self.show_menu_open = !self.show_menu_open
             }
@@ -2678,7 +2857,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.3.3  © 2026 Farmer Jay.")
+            text("V1.3.4  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -2821,98 +3000,105 @@ impl App {
     }
 
     /// Hand the window back its ordinary shape when the
-    /// boot ends. The launch window is borderless (see
-    /// `run`), so: re-decorate it, and resize it to the
-    /// app's standard 1280x800. Both are runtime window
-    /// actions Iced 0.13 implements — the winit shell
-    /// answers ToggleDecorations with
-    /// `set_decorations(!is_decorated())` and Resize with
-    /// `request_inner_size` — and nothing toggles the
-    /// decorations between launch and this call, so the
-    /// toggle lands deterministically on decorated.
+    /// boot ends, as ONE shape change. The launch window
+    /// is borderless (see `run`), so the handover is:
+    /// re-decorate it, resize it to the app's standard
+    /// 1280x800, and re-center it on the splash's center
+    /// point (the splash launched centered — John,
+    /// 2026-10-21; inheriting its top-left would push
+    /// the bigger window off the right and bottom
+    /// edges).
+    ///
+    /// The three actions fire as a single Task::batch
+    /// once BOTH facts are collected — the window id
+    /// (get_latest; the shell answers GetLatest
+    /// unconditionally) and the splash's position
+    /// (get_position) — in the RestoreWindowPosition
+    /// handler, with the RestoreState machine keeping
+    /// the sequence honest. Before v1.3.4 the frame and
+    /// size fired immediately and the move landed
+    /// whenever its own chain answered, which the owner
+    /// saw as a lurch: frame at splash size, blow out to
+    /// full size wherever the window sat, then a hop to
+    /// center.
+    ///
+    /// STRUCTURE IS THE SAFETY (field bug, 2026-10-21:
+    /// every launch on the owner's Windows stayed
+    /// splash-shaped and borderless with the main UI
+    /// inside it): the frame and size must never again
+    /// depend on get_position. It is a oneshot task, and
+    /// if the shell's answer never arrives the chained
+    /// continuation silently never executes (the
+    /// runtime's oneshot stream ends with no output),
+    /// taking the whole restore with it and logging
+    /// nothing. So the position read is collected under
+    /// a deadline (RESTORE_POSITION_WAIT, driven by the
+    /// RestoreTick subscription): if it has not answered
+    /// in time, RestoreTick fires frame + size without
+    /// the move (see restore_shape), and a position
+    /// answer arriving after that is dropped rather than
+    /// applied as a second, separate move. Off-center
+    /// beats misshapen; one shape change beats two.
+    ///
+    /// The decorations action is a stateful toggle (Iced
+    /// 0.13's runtime offers no set-decorations): the
+    /// winit shell answers ToggleDecorations with
+    /// `set_decorations(!is_decorated())` and Resize
+    /// with `request_inner_size`. Nothing toggles the
+    /// decorations between launch and the handover, so
+    /// the toggle lands deterministically on decorated;
+    /// and the state machine issues it exactly once per
+    /// boot — the one exception is the verify net's
+    /// guarded re-issue (see the RestoreVerifySize
+    /// handler), which fires only when the window
+    /// provably still wears the splash's size, i.e.
+    /// when the coupled resize — and so the toggle
+    /// ahead of it — demonstrably never landed.
+    ///
     /// Transparency needs no undo: it is a creation-time
     /// property (window::Settings::transparent), and the
-    /// moment `booting` drops, the theme closure in `run`
-    /// returns Theme::Dark again and the shell's clear
-    /// color goes back to Dark's opaque background — no
-    /// trace of the clear window remains in the main one.
-    /// The splash launched centered (John, 2026-10-21), so
-    /// the main window is re-centered on the same point:
-    /// inheriting the splash's top-left would push a
-    /// 1280x800 window off the right and bottom edges.
-    ///
-    /// STRUCTURE IS THE FIX (field bug, 2026-10-21: every
-    /// launch on the owner's Windows stayed splash-shaped
-    /// and borderless with the main UI inside it): the
-    /// frame and size are built DIRECTLY in get_latest's
-    /// continuation — the shell answers GetLatest
-    /// unconditionally, so that continuation always runs.
-    /// They must never again be built downstream of
-    /// `window::get_position`: it is a oneshot task, and
-    /// if the shell's answer never arrives the chained
-    /// continuation silently never executes (the runtime's
-    /// oneshot stream ends with no output), taking the
-    /// whole restore with it and logging nothing. The
-    /// centering move therefore rides its own independent
-    /// chain (see center_main_window): its worst case is
-    /// a main window that keeps the splash's top-left —
-    /// never a window that keeps the splash's shape.
+    /// moment `booting` drops, the theme closure in
+    /// `run` returns Theme::Dark again and the shell's
+    /// clear color goes back to Dark's opaque
+    /// background — no trace of the clear window
+    /// remains in the main one.
     fn restore_window() -> Task<Message> {
-        iced::window::get_latest().then(|id| match id {
-            Some(id) => Task::batch(vec![
-                iced::window::toggle_decorations(id),
-                iced::window::resize(id, Size::new(1280.0, 800.0)),
-                Self::center_main_window(id),
-            ]),
-            None => Task::none(),
-        })
+        iced::window::get_latest().map(Message::RestoreWindowId)
     }
 
-    /// Re-center the (now 1280x800) main window on the
-    /// splash's center point. Independent of the frame
-    /// restore by design: the position read is the one
-    /// fallible step in the handover, so only the move is
-    /// allowed to ride on it. A lost answer costs the
-    /// centering and nothing else.
+    /// Frame and full size, without the centering move:
+    /// the handover's fallback when the splash's
+    /// position can't be known (the read answered None,
+    /// or never answered at all). See restore_window for
+    /// why the shape never rides on the position read.
+    fn restore_shape(id: iced::window::Id) -> Task<Message> {
+        Task::batch(vec![
+            iced::window::toggle_decorations(id),
+            iced::window::resize(id, Size::new(1280.0, 800.0)),
+        ])
+    }
+
+    /// The main window's top-left when it is centered on
+    /// the splash's center point: the splash sits at
+    /// `splash_pos` at SPLASH_W x SPLASH_H, and the main
+    /// window is 1280x800 around the same center.
+    fn main_top_left(splash_pos: iced::Point) -> iced::Point {
+        iced::Point::new(
+            splash_pos.x + SPLASH_W / 2.0 - 640.0,
+            splash_pos.y + SPLASH_H / 2.0 - 400.0,
+        )
+    }
+
+    /// Re-center the main window on the splash's center
+    /// point, reading the position on its own chain.
+    /// Only the verify net's re-issue uses this separate
+    /// form: when the batched handover demonstrably
+    /// never landed, correctness beats choreography and
+    /// the move rides the position read exactly as it
+    /// did before the batching.
     fn center_main_window(id: iced::window::Id) -> Task<Message> {
         iced::window::get_position(id).then(move |pos| match pos {
-            Some(pos) => {
-                let center_x = pos.x + SPLASH_W / 2.0;
-                let center_y = pos.y + SPLASH_H / 2.0;
-                iced::window::move_to(
-                    id,
-                    iced::Point::new(center_x - 640.0, center_y - 400.0),
-                )
-            }
-            None => Task::none(),
-        })
-    }
-
-    /// One-shot safety net behind restore_window, run
-    /// once per boot handover: read the window's size
-    /// back, and if it is still exactly the splash's size
-    /// the restore batch demonstrably never landed, so
-    /// issue it once more. Any other size — restored, or
-    /// already resized by hand — leaves the window
-    /// strictly alone; in particular the stateful
-    /// decorations toggle is only ever re-issued when
-    /// the coupled resize is provably missing too, so
-    /// the net cannot flip a restored window's frame
-    /// back off. There is no retry loop: one check, at
-    /// most one re-issue, per boot.
-    fn verify_window_restored() -> Task<Message> {
-        iced::window::get_latest().then(|id| match id {
-            Some(id) => iced::window::get_size(id).then(move |size| {
-                if Self::still_splash_sized(size) {
-                    Task::batch(vec![
-                        iced::window::toggle_decorations(id),
-                        iced::window::resize(id, Size::new(1280.0, 800.0)),
-                        Self::center_main_window(id),
-                    ])
-                } else {
-                    Task::none()
-                }
-            }),
+            Some(pos) => iced::window::move_to(id, Self::main_top_left(pos)),
             None => Task::none(),
         })
     }
@@ -3135,12 +3321,25 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::event::listen_with(|event, _status, _id| match event {
+        let events = iced::event::listen_with(|event, _status, _id| match event {
             iced::Event::Window(iced::window::Event::Resized(size)) => {
                 Some(Message::WindowResized(size))
             }
             _ => None,
-        })
+        });
+        // The boot handover's clock: it runs only while a
+        // handover is live (the position deadline and the
+        // verify net's schedule) and is gone the moment
+        // the handover settles, so the app carries no
+        // timer for the rest of its life.
+        if self.window_restore.ticking() {
+            Subscription::batch(vec![
+                events,
+                iced::time::every(RESTORE_TICK).map(|_| Message::RestoreTick),
+            ])
+        } else {
+            events
+        }
     }
 }
 
@@ -3571,5 +3770,23 @@ mod tests {
         assert!(!App::still_splash_sized(Size::new(1280.0, 800.0)));
         assert!(!App::still_splash_sized(Size::new(1000.0, 700.0)));
         assert!(!App::still_splash_sized(Size::new(SPLASH_W, 800.0)));
+    }
+
+    /// The batched handover centers the main window on
+    /// the splash's own center point: on the owner's
+    /// 1920x1080 screen the centered splash sits at
+    /// (702, 344) and the main window must land at
+    /// (320, 140); on the sandbox rig's 2560x1600 screen
+    /// it is (1022, 604) -> (640, 400).
+    #[test]
+    fn main_top_left_centers_on_the_splash_center() {
+        assert_eq!(
+            App::main_top_left(iced::Point::new(702.0, 344.0)),
+            iced::Point::new(320.0, 140.0)
+        );
+        assert_eq!(
+            App::main_top_left(iced::Point::new(1022.0, 604.0)),
+            iced::Point::new(640.0, 400.0)
+        );
     }
 }
