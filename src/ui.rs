@@ -1,5 +1,6 @@
 mod app;
 mod components;
+pub(crate) mod theme;
 
 use crate::mod_manager::ModManager;
 

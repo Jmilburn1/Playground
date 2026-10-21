@@ -17,5 +17,4 @@ Thumbs.db
 !Cargo.lock
 
 # Logs
-*.log/Playground/
-/Playground tests/
+*.log

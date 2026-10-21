@@ -8,15 +8,18 @@ use crate::mod_manager::types::{Mod, ModState};
 use crate::mod_manager::ModManager;
 use crate::sources::github::GithubSource;
 use crate::ui::components::update_types::{UpdateInfo, UpdateState};
+use crate::ui::theme;
 use crate::update_db::{self, UpdateRow};
 use crate::ui::components::{
-    format_size, mod_card, BrowseView, FolderTarget, LogKind, LogLine, LogOutcome,
-    Message, ScanOutcome, Tab,
+    format_size, mod_card, BrowseView, FolderTarget, LoadEvent, LoadOutcome,
+    LoadPhase, LogKind, LogLine, LogOutcome, Message, ScanOutcome, Tab,
+    UpdateDbPresentation, UpdateJudgement,
 };
+use futures::SinkExt as _;
 use iced::widget::image::Handle as ImageHandle;
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
-    Space,
+    button, checkbox, column, container, progress_bar, row, scrollable, stack,
+    text, text_input, Space,
 };
 use iced::{Element, Length, Size, Subscription, Task, Theme};
 use rayon::prelude::*;
@@ -24,6 +27,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 const CARD_H: f32 = 258.0;
+/// Splash window size, px (John, 2026-10-21): the logo at
+/// full native 1254 overflowed his screen — half cut off.
+/// His sizing call, measured off his own grid: the splash
+/// should run about 516 x 392 — roughly 4 grid squares.
+/// The logo is square art, so it draws at the window's
+/// height (392) and centers, the desktop showing through
+/// either side of it.
+const SPLASH_W: f32 = 516.0;
+const SPLASH_H: f32 = 392.0;
 const SIDEBAR_W: f32 = 232.0;
 const GRID_SPACING: f32 = 12.0;
 const DETAILS_W: f32 = 344.0;
@@ -50,6 +62,17 @@ pub struct App {
     pending_status: Option<String>,
     status: String,
     loading: bool,
+    /// True from launch until the first load finishes both its
+    /// phases: while it holds, the splash owns the window and
+    /// the main UI isn't rendered at all. Later loads (Rescan,
+    /// folder changes) never set it again — they report
+    /// progress through the status line like before.
+    booting: bool,
+    /// The running load's progress, fed by LoadEvent ticks:
+    /// which phase is working and its real counts.
+    load_phase: LoadPhase,
+    load_done: usize,
+    load_total: usize,
     /// Set when a card's star badge is clicked: the same click also
     /// reaches the card's select handler (nested widgets), and this
     /// flag tells it to stand down once.
@@ -72,7 +95,7 @@ pub struct App {
     /// the details panel's repo link field.
     update_status: HashMap<String, UpdateState>,
     /// Update database (the reader): rows by stem, read
-    /// silently from updates.json at every scan load — the
+    /// silently from catalog-home.json at every scan load — the
     /// launch answers come from the last fill, never from a
     /// click-time crawl. No database file yet = no rows, and
     /// the app simply has nothing to present.
@@ -103,6 +126,8 @@ pub struct App {
     /// viewport height (see the grid build in browse_view).
     grid_offset: f32,
     grid_view_h: f32,
+    /// Whether the Show: menu (custom dropdown) is open.
+    show_menu_open: bool,
 }
 
 impl App {
@@ -133,6 +158,10 @@ impl App {
             pending_status: None,
             status: "Loading mods…".to_string(),
             loading: true,
+            booting: true,
+            load_phase: LoadPhase::Mods,
+            load_done: 0,
+            load_total: 0,
             just_toggled_favorite: false,
             save_slots_cache: Vec::new(),
             saves_selected: None,
@@ -162,69 +191,77 @@ impl App {
             window_size: Size::new(1280.0, 800.0),
             grid_offset: 0.0,
             grid_view_h: 0.0,
+            show_menu_open: false,
         }
     }
 
-    /// Kick off a background library load — scan both folders and
-    /// detect conflicts off the UI thread, then chain into icon
-    /// loading. The window stays responsive throughout, however big
-    /// the library is.
+    /// Kick off a background library load — both phases (scan
+    /// the folders, then read and judge the update database)
+    /// run on a worker thread that streams real progress ticks
+    /// back as it goes, then chain into icon loading when the
+    /// load lands. The window stays responsive throughout,
+    /// however big the library is.
     fn begin_load(&mut self) -> Task<Message> {
         self.loading = true;
-        self.status = "Loading mods in the background…".to_string();
+        self.load_phase = LoadPhase::Mods;
+        self.load_done = 0;
+        self.load_total = 0;
+        if !self.booting {
+            self.status = "Loading mods in the background…".to_string();
+        }
         let (archive, active, parallel) = self.mod_manager.scan_params();
-        Task::perform(
-            async move { scan_job(archive, active, parallel) },
-            Message::ScanLoaded,
-        )
+        // A generous buffer, and progress sends that drop when
+        // it's full: a tick the UI is too busy to take is a tick
+        // it doesn't need — the next one is already coming. The
+        // finish event is sent with a blocking send instead, so
+        // it can never be dropped.
+        let (tx, rx) = futures::channel::mpsc::channel::<LoadEvent>(128);
+        std::thread::spawn(move || load_job(archive, active, parallel, tx));
+        Task::run(rx, Message::LoadEvent)
     }
 
-    /// Read the personal update database and present it —
-    /// silently, locally, in milliseconds, with no network.
-    /// Runs at every scan load, so a fill that lands while
-    /// the app is open is picked up on the next rescan.
+    /// Present the update database the load's second phase
+    /// read and judged (see `updates_job`) — silently, locally,
+    /// with no network. Runs at every load, so a fill that
+    /// lands while the app is open is picked up on the next
+    /// rescan.
     ///
-    /// Rows are judged against the versions actually on disk
-    /// right now, not the versions the fill recorded. A row
-    /// whose source offers more becomes an installable
-    /// UpdateState built from the row (the existing install
-    /// flow consumes it unchanged — the "modhub:" repo marker
-    /// tells it to download with the mod page as referer).
+    /// Rows were judged against the versions actually on disk,
+    /// not the versions the fill recorded. A row whose source
+    /// offers more becomes an installable UpdateState built
+    /// from the row (the existing install flow consumes it
+    /// unchanged — the "modhub:" repo marker tells it to
+    /// download with the mod page as referer).
     /// Downgrade-blocked rows are NEVER turned into an offer:
     /// no state, no pill, no button — the details panel reads
     /// the row itself and explains the block.
-    fn apply_update_db(&mut self) {
-        let Some(db) = update_db::load_default() else {
+    fn apply_update_presentation(&mut self, presentation: UpdateDbPresentation) {
+        if !presentation.present {
             self.db_rows.clear();
             self.db_generated_at = None;
             self.db_summary = update_db::DbSummary::default();
             self.db_applied.clear();
             return;
-        };
-        self.db_generated_at = Some(db.generated_at);
-        self.db_rows = db
-            .rows
-            .iter()
-            .map(|r| (r.stem.clone(), r.clone()))
-            .collect();
-        let installed: HashMap<String, String> = self
-            .mod_manager
-            .get_mods()
-            .iter()
-            .map(|m| (ModManager::mod_stem(&m.path), m.version.clone()))
-            .collect();
-        self.db_summary = update_db::summarize(&db, &installed);
-        for m in self.mod_manager.get_mods() {
-            if self.update_status.contains_key(&m.id)
-                && !self.db_applied.contains(&m.id)
+        }
+        self.db_generated_at = presentation.generated_at;
+        self.db_rows = presentation.rows;
+        self.db_summary = presentation.summary;
+        for judgement in presentation.judged {
+            let id = judgement.id;
+            let Some(version) = self
+                .mod_manager
+                .get_mod(&id)
+                .map(|m| m.version.clone())
+            else {
+                continue;
+            };
+            if self.update_status.contains_key(&id)
+                && !self.db_applied.contains(&id)
             {
                 continue; // a live result from this session stands
             }
-            let stem = ModManager::mod_stem(&m.path);
-            let Some(row) = self.db_rows.get(&stem).cloned() else {
-                continue;
-            };
-            match update_db::status_of(&m.version, row.latest_version.as_deref()) {
+            let row = judgement.row;
+            match update_db::status_of(&version, row.latest_version.as_deref()) {
                 "update_available" => {
                     if let (Some(latest), Some(url)) =
                         (row.latest_version.clone(), row.download_url.clone())
@@ -244,7 +281,7 @@ impl App {
                             )
                         };
                         self.update_status.insert(
-                            m.id.clone(),
+                            id.clone(),
                             UpdateState::Available(UpdateInfo {
                                 version: latest,
                                 tag,
@@ -253,27 +290,27 @@ impl App {
                                 repo,
                             }),
                         );
-                        self.db_applied.insert(m.id.clone());
+                        self.db_applied.insert(id.clone());
                     } else {
                         // The database knows a newer version
                         // exists but recorded no downloadable
                         // asset for it — visible in the details
                         // panel via the row, never a dead button.
-                        self.update_status.remove(&m.id);
-                        self.db_applied.remove(&m.id);
+                        self.update_status.remove(&id);
+                        self.db_applied.remove(&id);
                     }
                 }
                 "up_to_date" => {
                     self.update_status
-                        .insert(m.id.clone(), UpdateState::UpToDate);
-                    self.db_applied.insert(m.id.clone());
+                        .insert(id.clone(), UpdateState::UpToDate);
+                    self.db_applied.insert(id.clone());
                 }
                 _ => {
                     // ahead_blocked / unknown: no state, no
                     // pill, no offer. The details panel reads
                     // the row and says why.
-                    self.update_status.remove(&m.id);
-                    self.db_applied.remove(&m.id);
+                    self.update_status.remove(&id);
+                    self.db_applied.remove(&id);
                 }
             }
         }
@@ -432,34 +469,53 @@ impl App {
                     return self.begin_load();
                 }
             }
-            Message::ScanLoaded(outcome) => match outcome {
-                Ok(outcome) => {
-                    let count = outcome.mods.len();
+            Message::LoadEvent(event) => match event {
+                LoadEvent::Progress { phase, done, total } => {
+                    self.load_phase = phase;
+                    self.load_done = done;
+                    self.load_total = total;
+                }
+                LoadEvent::Finished(Ok(outcome)) => {
+                    let count = outcome.scan.mods.len();
                     self.mod_manager.install_mods(
                         outcome
+                            .scan
                             .mods
                             .into_iter()
                             .map(|m| (m.id.clone(), m))
                             .collect(),
                     );
-                    self.conflicts = outcome.conflicts;
-                    // The reader: present the update database
-                    // against the library just loaded.
-                    self.apply_update_db();
+                    self.conflicts = outcome.scan.conflicts;
+                    // The reader's results, computed in the
+                    // load's second phase: present them against
+                    // the library just loaded — the Updates
+                    // counts are already true from this moment.
+                    self.apply_update_presentation(outcome.updates);
                     if let Some(id) = &self.selected_mod {
                         if self.mod_manager.get_mod(id).is_none() {
                             self.selected_mod = None;
                         }
                     }
+                    // Both phases are done: the splash hands
+                    // over to the main window — which first
+                    // gets its ordinary shape back (decorated,
+                    // 1280x800; see restore_window). (Icons
+                    // keep loading behind it, as before.)
+                    self.booting = false;
                     self.status = format!("Loaded {} mods — loading icons…", count);
-                    return self.begin_icon_load();
+                    return Task::batch(vec![self.begin_icon_load(), Self::restore_window()]);
                 }
-                Err(e) => {
+                LoadEvent::Finished(Err(e)) => {
                     self.loading = false;
+                    self.booting = false;
                     self.status = format!("Scan failed: {}", e);
                     if let Some(note) = self.pending_status.take() {
                         self.status = note;
                     }
+                    // Even a failed boot hands over: the main
+                    // window (carrying the error in its status
+                    // line) gets its ordinary shape back too.
+                    return Self::restore_window();
                 }
             },
             Message::IconsLoaded(loaded) => {
@@ -775,55 +831,123 @@ impl App {
                             .to_string();
                     return Task::none();
                 }
-                // Catalog hits link instantly, no searching.
-                let total = jobs.len();
+                // Classify every job by the run order
+                // (owner, 2026-10-20): Stevie mods are never
+                // searched and mods homed in catalog-other
+                // are not ModHub candidates — both leave the
+                // pass here; catalog hits link instantly;
+                // remembered misses are settled without a
+                // search; only the residue — present in NO
+                // store — goes live.
+                use crate::sources::catalog_miss::Decision;
                 let mut instant = 0usize;
+                let mut known_missed = 0usize;
                 let mut live: Vec<(String, String, String)> = Vec::new();
                 for (stem, file_name, title) in jobs {
-                    match catalog.get(&stem) {
-                        Some(id) => {
-                            let _ = self
-                                .mod_manager
-                                .set_modhub_link(&stem, Some(id.clone()));
+                    match self.mod_manager.detect_decision(
+                        &file_name,
+                        &stem,
+                        catalog.contains_key(&stem),
+                    ) {
+                        Decision::InCatalog => {
+                            let _ = self.mod_manager.set_modhub_link(
+                                &stem,
+                                Some(catalog[&stem].clone()),
+                            );
+                            self.mod_manager.forget_miss(&file_name, &stem);
                             instant += 1;
                         }
-                        None => live.push((stem, file_name, title)),
+                        Decision::KnownMiss => known_missed += 1,
+                        Decision::Stevie | Decision::InOther => {}
+                        Decision::Search => live.push((stem, file_name, title)),
                     }
                 }
+                let total = instant + known_missed + live.len();
                 if live.is_empty() {
-                    self.status = format!(
-                        "ModHub auto-detect done — all {} mods linked from the catalog, no live searching needed. Run Check for updates to see what's newer.",
-                        instant
-                    );
+                    self.status = if total == 0 {
+                        "ModHub auto-detect done — nothing to search: every unlinked .zip mod is homed in catalog-other or a Stevie manual install."
+                            .to_string()
+                    } else if known_missed == 0 {
+                        format!(
+                            "ModHub auto-detect done — all {} mods linked from the catalog, no live searching needed. Run Check for updates to see what's newer.",
+                            instant
+                        )
+                    } else if instant == 0 {
+                        format!(
+                            "ModHub auto-detect done — {} mods already known not to be on ModHub (remembered misses), and nothing else needed a search. Run Check for updates to see what's newer.",
+                            known_missed
+                        )
+                    } else {
+                        format!(
+                            "ModHub auto-detect done — {} mods linked from the catalog, {} already known not to be on ModHub (remembered misses); no live searching needed. Run Check for updates to see what's newer.",
+                            instant, known_missed
+                        )
+                    };
                     return Task::none();
                 }
                 self.detect_total = total;
-                self.detect_done = instant;
+                self.detect_done = instant + known_missed;
                 self.detect_found = instant;
-                self.detect_missed = 0;
+                self.detect_missed = known_missed;
                 self.detect_jobs = live;
-                self.status = format!(
-                    "Detecting ModHub links — {} of {} checked ({} linked instantly from the catalog). Links save every batch, so closing the app loses nothing.",
-                    self.detect_done, self.detect_total, instant
-                );
+                self.status = if known_missed == 0 {
+                    format!(
+                        "Detecting ModHub links — {} of {} checked ({} linked instantly from the catalog). Links save every batch, so closing the app loses nothing.",
+                        self.detect_done, self.detect_total, instant
+                    )
+                } else {
+                    format!(
+                        "Detecting ModHub links — {} of {} checked ({} linked instantly from the catalog, {} remembered misses skipped). Links save every batch, so closing the app loses nothing.",
+                        self.detect_done, self.detect_total, instant, known_missed
+                    )
+                };
                 return self.next_detect_batch();
             }
             Message::DetectBatchDone {
                 found,
                 missed,
+                missed_keys,
                 processed,
+                throttled,
             } => {
                 // Save this batch's links immediately, tally,
                 // drop the processed jobs, and chain the next
                 // batch (or finish).
                 for (stem, id) in &found {
                     let _ = self.mod_manager.set_modhub_link(stem, Some(id.clone()));
+                    // Linked after all: no miss record may
+                    // shadow it.
+                    if let Some((_, file_name, _)) =
+                        self.detect_jobs.iter().find(|(s, _, _)| s == stem)
+                    {
+                        let file_name = file_name.clone();
+                        self.mod_manager.forget_miss(&file_name, stem);
+                    }
+                }
+                // Write down the true not-founds: a miss is
+                // remembered like a link, so none of these
+                // is ever searched again.
+                for (stem, file_name) in &missed_keys {
+                    self.mod_manager.record_miss(file_name, stem);
                 }
                 self.detect_found += found.len();
                 self.detect_missed += missed;
                 self.detect_done += processed;
                 self.detect_jobs.drain(..processed.min(self.detect_jobs.len()));
-                if self.detect_jobs.is_empty() {
+                if throttled {
+                    // THE TRIPWIRE (owner, 2026-10-19): GIANTS
+                    // answered 403/429 — the pass stops here.
+                    // The jobs not yet searched are dropped
+                    // unsearched; the links and misses saved
+                    // so far stand.
+                    self.detect_jobs.clear();
+                    self.status = format!(
+                        "ModHub auto-detect HALTED — GIANTS throttled the pass (HTTP 403/429). {} mods linked before the halt; the rest were not searched. Links and misses already saved stand; run Rescan later to retry the rest.",
+                        self.detect_found
+                    );
+                    self.detect_total = 0;
+                    self.detect_done = 0;
+                } else if self.detect_jobs.is_empty() {
                     self.status = format!(
                         "ModHub auto-detect done — {} mods linked, {} not found on ModHub. Run Check for updates to see what's newer.",
                         self.detect_found, self.detect_missed
@@ -843,6 +967,7 @@ impl App {
                 // older in-flight tasks land harmlessly.
             }
             Message::SearchChanged(query) => {
+                self.show_menu_open = false;
                 self.search_query = query;
                 self.grid_offset = 0.0;
                 return iced::widget::scrollable::scroll_to(
@@ -851,6 +976,7 @@ impl App {
                 );
             }
             Message::LibraryFilter(view) => {
+                self.show_menu_open = false;
                 self.current_tab = Tab::Browse;
                 self.view_filter = view;
                 self.favorites_only = false;
@@ -861,6 +987,7 @@ impl App {
                 );
             }
             Message::TabSelected(tab) => {
+                self.show_menu_open = false;
                 if tab == Tab::Saves {
                     self.refresh_save_slots();
                 }
@@ -870,6 +997,7 @@ impl App {
                 }
             }
             Message::BrowseViewChanged(view) => {
+                self.show_menu_open = false;
                 self.view_filter = view;
                 self.grid_offset = 0.0;
                 return iced::widget::scrollable::scroll_to(
@@ -878,6 +1006,7 @@ impl App {
                 );
             }
             Message::SelectMod(id) => {
+                self.show_menu_open = false;
                 // A click on a card's star badge also lands here (the
                 // badge is nested in the card) — the favorite toggle
                 // sets this flag first, so ignore that one selection.
@@ -1098,6 +1227,9 @@ impl App {
             },
             Message::LogErrorsOnlyToggled(on) => self.log_errors_only = on,
             Message::WindowResized(size) => self.window_size = size,
+            Message::ToggleShowMenu => {
+                self.show_menu_open = !self.show_menu_open
+            }
             Message::GridScrolled(viewport) => {
                 self.grid_offset = viewport.absolute_offset().y;
                 self.grid_view_h = viewport.bounds().height;
@@ -1108,18 +1240,23 @@ impl App {
     }
 
     fn tab_button(&self, label: String, tab: Tab) -> Element<'_, Message> {
-        let style = if self.current_tab == tab {
-            button::primary
-        } else {
-            button::secondary
-        };
+        // Palette pills, like the sidebar's menu (John,
+        // 2026-10-21) — this helper predates the sidebar
+        // layout and currently has no callers, but it speaks
+        // the same style so the two never drift apart.
         button(text(label))
-            .style(style)
+            .style(theme::nav_pill(self.current_tab == tab))
             .on_press(Message::TabSelected(tab))
             .into()
     }
 
-    fn browse_view(&self) -> (Element<'_, Message>, Element<'_, Message>) {
+    fn browse_view(
+        &self,
+    ) -> (
+        Element<'_, Message>,
+        Option<Element<'_, Message>>,
+        Element<'_, Message>,
+    ) {
         let mods = self.filtered_mods();
 
         // One dropdown picks what the grid shows: every mod, one
@@ -1179,7 +1316,25 @@ impl App {
             tile(maps_count.to_string(), "MAPS"),
             tile(
                 match self.db_generated_at {
-                    Some(_) => self.db_summary.updates.to_string(),
+                    // The tile counts the SAME live map the
+                    // Updates filter reads (John, 2026-10-20):
+                    // it used to read the database summary,
+                    // which is only recomputed when the
+                    // database is applied, so applying an
+                    // update never moved the number until a
+                    // rescan or a restart. Counting the live
+                    // states makes the tile drop the moment an
+                    // update lands — and the tile can never
+                    // disagree with the list it names again.
+                    Some(_) => self
+                        .update_status
+                        .values()
+                        .filter(|st| matches!(
+                            st,
+                            crate::ui::components::update_types::UpdateState::Available(_)
+                        ))
+                        .count()
+                        .to_string(),
                     None => "–".to_string(),
                 },
                 "AVAILABLE UPDATES",
@@ -1194,17 +1349,42 @@ impl App {
         // Both boxes get rounded corners (John).
         let toolbar = row![
             text("Show:"),
-            pick_list(
-                view_options,
-                Some(self.view_filter.clone()),
-                Message::BrowseViewChanged
+            // Custom dropdown (John, 2026-10-20): the pick_list's
+            // overlay menu leaked clicks through to the card under
+            // the menu, popping its details open on every pick.
+            // The replacement is a plain button here plus a menu
+            // of real buttons drawn in the stack's top layer (see
+            // the end of this function) — buttons capture their
+            // own clicks, so nothing reaches the grid beneath.
+            button(
+                row![
+                    text(format!("{}", self.view_filter)),
+                    Space::with_width(Length::Fill),
+                    text("\u{25be}").size(12),
+                ]
+                .spacing(8),
             )
-            .style(|theme, status| {
-                let mut s = pick_list::default(theme, status);
-                s.border.radius = 8.0.into();
-                s.border.width = 1.0;
-                s.border.color = iced::Color::from_rgb(0.35, 0.36, 0.40);
-                s
+            .width(200)
+            .padding(8)
+            .on_press(Message::ToggleShowMenu)
+            .style(|_theme, status| {
+                let bg = match status {
+                    iced::widget::button::Status::Hovered
+                    | iced::widget::button::Status::Pressed => {
+                        iced::Color::from_rgb(0.45, 0.45, 0.46)
+                    }
+                    _ => iced::Color::from_rgb(0.396, 0.4, 0.4),
+                };
+                iced::widget::button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: iced::Color::WHITE,
+                    border: iced::Border {
+                        color: iced::Color::from_rgb(0.35, 0.36, 0.40),
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..Default::default()
+                }
             }),
             text_input("Search mods...", &self.search_query)
                 .on_input(Message::SearchChanged)
@@ -1337,10 +1517,73 @@ impl App {
             content
         };
 
+        // The Show: menu, when open: real buttons in a row set
+        // into the stack's top layer by view() (outside the
+        // header zone's opaque slab, so the grid shows around
+        // it). Aligned under the field button: the "Show:" label
+        // plus the toolbar spacing puts the field at x = 52.
+        let menu: Option<Element<'_, Message>> = if self.show_menu_open {
+            let option_count = view_options.len();
+            let mut options_col = column![].spacing(0).width(200);
+            for opt in view_options {
+                let selected = opt == self.view_filter;
+                options_col = options_col.push(
+                    button(text(format!("{}", opt)))
+                        .width(200)
+                        .padding([6, 10])
+                        .on_press(Message::BrowseViewChanged(opt))
+                        .style(move |_theme, status| {
+                            let bg = if selected {
+                                iced::Color::from_rgb(0.2, 0.349, 0.855)
+                            } else {
+                                match status {
+                                    iced::widget::button::Status::Hovered
+                                    | iced::widget::button::Status::Pressed => {
+                                        iced::Color::from_rgb(0.45, 0.45, 0.46)
+                                    }
+                                    _ => iced::Color::from_rgb(0.396, 0.4, 0.4),
+                                }
+                            };
+                            iced::widget::button::Style {
+                                background: Some(iced::Background::Color(bg)),
+                                text_color: iced::Color::WHITE,
+                                ..Default::default()
+                            }
+                        }),
+                );
+            }
+            let menu_inner: Element<'_, Message> =
+                if option_count > 12 {
+                    scrollable(options_col).height(336).into()
+                } else {
+                    options_col.into()
+                };
+            Some(
+                row![
+                    Space::with_width(52),
+                    container(menu_inner).style(|_| container::Style {
+                        background: Some(iced::Background::Color(
+                            iced::Color::from_rgb(0.396, 0.4, 0.4),
+                        )),
+                        border: iced::Border {
+                            color: iced::Color::from_rgb(0.35, 0.36, 0.40),
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..Default::default()
+                    }),
+                ]
+                .into(),
+            )
+        } else {
+            None
+        };
+
         // The tiles/toolbar and the body are returned separately:
         // view() draws them in different stack layers (see there).
         (
             column![tiles, toolbar].spacing(8).into(),
+            menu,
             body,
         )
     }
@@ -1450,6 +1693,14 @@ impl App {
                     "Source: GitHub — {}",
                     row.source_ref.clone().unwrap_or_default()
                 ),
+                "kingmods" => format!(
+                    "Source: KingMods — {}",
+                    row.source_ref.clone().unwrap_or_default()
+                ),
+                "itch" => format!(
+                    "Source: itch.io — {}",
+                    row.source_ref.clone().unwrap_or_default()
+                ),
                 _ => "Source: none recorded".to_string(),
             };
             col = col.push(text(source_line).size(12));
@@ -1489,6 +1740,27 @@ impl App {
                     text(format!("Database filled {}.", fmt_time(when))).size(12),
                 );
             }
+        } else if let Some(other) = self
+            .mod_manager
+            .other_row_for_file(&m.file_name())
+            .or_else(|| self.mod_manager.other_row(&stem))
+        {
+            // No fill has recorded this mod yet, but the
+            // catalog-other store knows its home — show the
+            // link straight from the store, no pasting.
+            let kind_label = match other.source_kind.as_str() {
+                "github" => "GitHub",
+                "kingmods" => "KingMods",
+                "itch" => "itch.io",
+                other_kind => other_kind,
+            };
+            col = col.push(text("Other site:").size(13));
+            col = col.push(
+                text(format!("Source: {} — {}", kind_label, other.source_ref)).size(12),
+            );
+            col = col.push(
+                text("Not in the update database yet — it lands at the next fill.").size(12),
+            );
         }
         col = col.push(text("Updates (GitHub):").size(13));
         col = col.push(
@@ -1864,7 +2136,7 @@ impl App {
     fn saves_view(&self) -> Element<'_, Message> {
         if self.mod_manager.profile_dir().is_none() {
             return container(
-                text("Savegames appear here when the Active folder is a game's mods folder (its parent holds the savegame folders).")
+                text("Savegames appear here once FS25 has written its profile folder (Documents/My Games/FarmingSimulator2025).")
                     .size(14),
             )
             .padding(16)
@@ -2017,7 +2289,7 @@ impl App {
     fn log_view(&self) -> Element<'_, Message> {
         if self.mod_manager.profile_dir().is_none() {
             return container(
-                text("The game log appears here when the Active folder is a game's mods folder (log.txt sits in its profile folder).")
+                text("The game log appears here once FS25 has written log.txt in its profile folder (Documents/My Games/FarmingSimulator2025).")
                     .size(14),
             )
             .padding(16)
@@ -2196,7 +2468,15 @@ impl App {
                 .filter(|m| m.categories.iter().any(|c| c == name))
                 .count()
         };
+        // The sidebar's menu wears the palette now (John,
+        // 2026-10-21: pill-shaped buttons, and "the color is
+        // bad currently"): every row below is a pill from
+        // ui::theme — the library row for the view on screen
+        // and the current page's nav pill wear the accent,
+        // the rest sit in petrol.
         let lib_row = |label: &str, count: usize, view: BrowseView| {
+            let selected =
+                self.current_tab == Tab::Browse && self.view_filter == view;
             button(
                 row![
                     text(label.to_string()).size(13),
@@ -2206,17 +2486,19 @@ impl App {
                 .width(Length::Fill),
             )
             .width(Length::Fill)
-            .style(button::secondary)
+            .style(theme::nav_pill(selected))
             .on_press(Message::LibraryFilter(view))
         };
         let nav = |label: String, tab: Tab| {
             button(text(label).size(14))
                 .width(Length::Fill)
-                // All nav buttons grey (John, 2026-10-18):
-                // Rescan is the sidebar's one blue button —
-                // a blue Browse next to it just read as noise,
-                // and the tab itself is obvious from the page.
-                .style(button::secondary)
+                // The current page's pill is the accent
+                // (John, 2026-10-21) — supersedes the 2026-
+                // 10-18 all-grey ruling: in the palette the
+                // accent is quiet enough to mark the page
+                // without shouting, and Rescan (above) is
+                // told apart by wearing the warning red.
+                .style(theme::nav_pill(self.current_tab == tab))
                 .on_press(Message::TabSelected(tab))
         };
         // The update count used to live here too, until the
@@ -2239,20 +2521,31 @@ impl App {
                 .height(184),
                 Space::with_width(Length::Fill),
             ],
-            // Rescan leads the sidebar, above Browse (John,
-            // 2026-10-18) — and detection rides along with
-            // every rescan now (see Message::Scan).
+            // Rescan leads the sidebar (John, 2026-10-18) —
+            // and detection rides along with every rescan
+            // now (see Message::Scan). It wears the danger
+            // pill (John, 2026-10-21): red, to warn against
+            // the one heavy action and stand out at the same
+            // time. There is no Browse pill (John, 2026-10-
+            // 21): the LIBRARY rows below ARE the grid's
+            // navigation — Mods was working overtime doing
+            // Browse's job, so it holds the job officially
+            // now, from its place under LIBRARY.
             button(text("Rescan").size(14))
                 .width(Length::Fill)
-                .style(button::primary)
+                .style(theme::danger_pill())
                 .on_press(Message::Scan),
-            nav("Browse".to_string(), Tab::Browse),
             nav(format!("Conflicts ({})", self.conflicts.len()), Tab::Conflicts),
             nav("Configure Save (wip)".to_string(), Tab::Saves),
+            // Favourites sits in the features block, under
+            // Configure Save (John, 2026-10-21 — moved out
+            // of LIBRARY, brought down two): it is a view of
+            // the library, reached like a feature, and it
+            // lights when that view is on screen.
+            lib_row("Favourites", self.mod_manager.favorites_count(), BrowseView::Favorites),
             nav("Log Reader".to_string(), Tab::Log),
             nav("Settings".to_string(), Tab::Settings),
             text("LIBRARY").size(11),
-            lib_row("Favourites", self.mod_manager.favorites_count(), BrowseView::Favorites),
             lib_row("Mods", all.len(), BrowseView::All),
             lib_row("Maps", count_cat("Maps"), BrowseView::Category("Maps".to_string())),
             lib_row(
@@ -2266,7 +2559,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.1.3  © 2026 Farmer Jay.")
+            text("V1.2.1  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -2285,17 +2578,7 @@ impl App {
             .width(SIDEBAR_W)
             .height(Length::Fill)
             .padding(12)
-            .style(|_| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgb(
-                    0.09, 0.10, 0.12,
-                ))),
-                border: iced::Border {
-                    color: iced::Color::from_rgb(0.25, 0.26, 0.30),
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                ..container::Style::default()
-            })
+            .style(theme::sidebar_container)
             .into()
     }
 
@@ -2322,6 +2605,8 @@ impl App {
                 let src = crate::sources::mod_hub::ModHubSource::new();
                 let mut found = Vec::new();
                 let mut missed = 0usize;
+                let mut missed_keys: Vec<(String, String)> = Vec::new();
+                let mut throttled = false;
                 for group in batch.chunks(4) {
                     let results = futures::future::join_all(
                         group
@@ -2331,25 +2616,48 @@ impl App {
                                 async move {
                                     (
                                         stem.clone(),
+                                        file_name.clone(),
                                         src.find_mod_id(file_name, title, 2).await,
                                     )
                                 }
                             }),
                     )
                     .await;
-                    for (stem, res) in results {
+                    for (stem, file_name, res) in results {
                         match res {
                             Ok(Some(id)) => found.push((stem, id)),
-                            _ => missed += 1,
+                            // Searched, and ModHub had
+                            // nothing: a true miss, written
+                            // down so it is never searched
+                            // again.
+                            Ok(None) => {
+                                missed += 1;
+                                missed_keys.push((stem, file_name));
+                            }
+                            // A failed search found nothing
+                            // out: tallied as missed, as
+                            // always, but NOT written down —
+                            // the next pass retries it. A
+                            // THROTTLE failure (403/429) is
+                            // the tripwire: it also raises
+                            // the flag that stops the pass.
+                            Err(e) => {
+                                missed += 1;
+                                if crate::sources::throttle::is_throttled(&e) {
+                                    throttled = true;
+                                }
+                            }
                         }
                     }
                 }
-                (found, missed, batch.len())
+                (found, missed, missed_keys, batch.len(), throttled)
             },
-            |(found, missed, processed)| Message::DetectBatchDone {
+            |(found, missed, missed_keys, processed, throttled)| Message::DetectBatchDone {
                 found,
                 missed,
+                missed_keys,
                 processed,
+                throttled,
             },
         )
     }
@@ -2359,6 +2667,12 @@ impl App {
     /// part of Rescan: it starts from IconsLoaded whenever
     /// the scan that just finished was user-triggered.
     fn start_detect(&mut self) -> Task<Message> {
+        // Run order, step 1 (owner, 2026-10-20): reconcile
+        // the miss store against catalog-other — a mod
+        // that gained a link there loses its miss record.
+        // Runs every time the detect path opens, whether
+        // or not a search follows.
+        self.mod_manager.prune_misses();
         if !self.detect_jobs.is_empty() {
             self.status =
                 "ModHub detection is already running — watch the counter; every batch is saved as it lands."
@@ -2387,7 +2701,126 @@ impl App {
         )
     }
 
+    /// Hand the window back its ordinary shape when the
+    /// boot ends. The launch window is borderless (see
+    /// `run`), so: re-decorate it, and resize it to the
+    /// app's standard 1280x800. Both are runtime window
+    /// actions Iced 0.13 implements — the winit shell
+    /// answers ToggleDecorations with
+    /// `set_decorations(!is_decorated())` and Resize with
+    /// `request_inner_size` — and nothing toggles the
+    /// decorations between launch and this call, so the
+    /// toggle lands deterministically on decorated.
+    /// Transparency needs no undo: it is a creation-time
+    /// property (window::Settings::transparent), and the
+    /// moment `booting` drops, the theme closure in `run`
+    /// returns Theme::Dark again and the shell's clear
+    /// color goes back to Dark's opaque background — no
+    /// trace of the clear window remains in the main one.
+    /// The splash launched centered (John, 2026-10-21), so
+    /// the main window is re-centered on the same point:
+    /// inheriting the splash's top-left would push a
+    /// 1280x800 window off the right and bottom edges.
+    fn restore_window() -> Task<Message> {
+        iced::window::get_latest().then(|id| match id {
+            Some(id) => iced::window::get_position(id).then(move |pos| {
+                let mut tasks = vec![
+                    iced::window::toggle_decorations(id),
+                    iced::window::resize(id, Size::new(1280.0, 800.0)),
+                ];
+                if let Some(pos) = pos {
+                    let center_x = pos.x + SPLASH_W / 2.0;
+                    let center_y = pos.y + SPLASH_H / 2.0;
+                    tasks.push(iced::window::move_to(
+                        id,
+                        iced::Point::new(center_x - 640.0, center_y - 400.0),
+                    ));
+                }
+                Task::batch(tasks)
+            }),
+            None => Task::none(),
+        })
+    }
+
+    /// The launch splash (John, 2026-10-21): the Playground
+    /// logo itself at his measured splash size (SPLASH_W x
+    /// SPLASH_H — full native 1254 overflowed his screen),
+    /// floating
+    /// on the desktop in its own shape — the window is
+    /// launched borderless and transparent (see `run`) and
+    /// the shell wears the transparent splash theme while
+    /// `booting` holds (see ui::theme::splash_theme), so
+    /// nothing shows but the artwork and the readout laid
+    /// over its lower edge: the version in light steel, the
+    /// bar steel-teal on petrol, the phase counts in pale
+    /// ice, all from the palette in ui::theme. It owns the
+    /// window until the first load finishes BOTH phases —
+    /// mods, then updates judged — so the main window never
+    /// opens onto numbers that are still settling.
+    fn splash_view(&self) -> Element<'_, Message> {
+        let logo = iced::widget::image(iced::widget::image::Handle::from_bytes(
+            include_bytes!("../../assets/logo.png").to_vec(),
+        ))
+        .filter_method(iced::widget::image::FilterMethod::Linear)
+        .width(SPLASH_H)
+        .height(SPLASH_H);
+        let label = match self.load_phase {
+            LoadPhase::Mods => "Loading mods…",
+            LoadPhase::Updates => "Loading updates…",
+        };
+        let counts = if self.load_total > 0 {
+            format!("{}  {} / {}", label, self.load_done, self.load_total)
+        } else {
+            label.to_string()
+        };
+        let value = if self.load_total > 0 {
+            self.load_done as f32 / self.load_total as f32
+        } else {
+            0.0
+        };
+        // The readout rides the logo's lower edge: mostly
+        // clear glass and dark art down there, so the pale
+        // counts read cleanly with no plate behind them.
+        let readout = column![
+            text(format!("Playground v{}", env!("CARGO_PKG_VERSION")))
+                .size(15)
+                .color(theme::TEXT_DIM),
+            progress_bar(0.0..=1.0, value)
+                .width(260)
+                .height(14)
+                .style(theme::splash_bar),
+            text(counts).size(16).color(theme::TEXT),
+        ]
+        .spacing(10)
+        .align_x(iced::Alignment::Center);
+        let overlay = column![
+            Space::with_height(Length::Fill),
+            readout,
+            Space::with_height(18),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::Center);
+        // The square logo centers in the wider window:
+        // Fill spaces either side let the desktop show
+        // through where the artwork isn't.
+        let stage = row![
+            Space::with_width(Length::Fill),
+            logo,
+            Space::with_width(Length::Fill),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill);
+        stack![stage, overlay]
+            .width(SPLASH_W)
+            .height(SPLASH_H)
+            .into()
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
+        if self.booting {
+            return self.splash_view();
+        }
         // Header (John, 2026-10-18): his FS25 banner alone —
         // no text beside it, and no buttons at all. The old
         // header actions are gone by his ruling: Detect is
@@ -2424,28 +2857,32 @@ impl App {
         // toolbar 36 + spacing 8) at the top, status 17 + spacing
         // 10 at the bottom; the slabs' extra padding (8 bottom /
         // 10 top) covers the spacing gaps at the grid's edges.
-        let (top_controls, content, top_hole): (
+        let (top_controls, menu, content, top_hole): (
             Element<'_, Message>,
+            Option<Element<'_, Message>>,
             Element<'_, Message>,
             f32,
         ) = match self.current_tab {
             Tab::Browse => {
-                let (top, body) = self.browse_view();
-                (top, body, 165.0)
+                let (top, menu, body) = self.browse_view();
+                (top, menu, body, 165.0)
             }
             Tab::Conflicts => (
                 Space::with_height(0).into(),
+                None,
                 self.conflicts_view(),
                 50.0,
             ),
             Tab::Saves => (
                 Space::with_height(0).into(),
+                None,
                 self.saves_view(),
                 50.0,
             ),
-            Tab::Log => (Space::with_height(0).into(), self.log_view(), 50.0),
+            Tab::Log => (Space::with_height(0).into(), None, self.log_view(), 50.0),
             Tab::Settings => (
                 Space::with_height(0).into(),
+                None,
                 self.settings_view(),
                 50.0,
             ),
@@ -2478,6 +2915,14 @@ impl App {
                     background: Some(iced::Background::Color(window_bg)),
                     ..Default::default()
                 }),
+            // The Show: menu floats here when open (Browse only):
+            // its own buttons over a transparent row, so the grid
+            // stays visible and clickable everywhere it doesn't
+            // cover.
+            match menu {
+                Some(m) => m,
+                None => Space::with_height(0).into(),
+            },
             Space::with_height(Length::Fill),
             container(status)
                 .padding(iced::Padding {
@@ -2633,16 +3078,121 @@ fn to_handle(icon: LoadedIcon) -> ImageHandle {
     }
 }
 
-/// Background job: scan both folders and detect conflicts.
-fn scan_job(archive: PathBuf, active: PathBuf, parallel: usize) -> Result<ScanOutcome, String> {
-    let mods = ModManager::scan_directories(archive, active, parallel)
-        .map_err(|e| e.to_string())?;
-    let mod_list: Vec<Mod> = mods.into_values().collect();
-    let conflicts = ConflictDetector::detect_conflicts(&mod_list);
-    Ok(ScanOutcome {
-        mods: mod_list,
-        conflicts,
-    })
+/// Background job for one full library load, run on a worker
+/// thread: phase 1 scans both folders (and detects conflicts),
+/// phase 2 reads the update database and judges it against the
+/// library just scanned. Progress streams to the app over the
+/// channel as the work happens — real counts, ticking — and
+/// the finished load follows at the end. Progress sends may
+/// drop when the channel is full (the next tick is already
+/// coming); the finish event uses a blocking send, so the
+/// result itself can never be lost.
+fn load_job(
+    archive: PathBuf,
+    active: PathBuf,
+    parallel: usize,
+    mut tx: futures::channel::mpsc::Sender<LoadEvent>,
+) {
+    // The senders the progress closures share: futures'
+    // try_send wants &mut, the scan's callback wants a shared
+    // &Sync — a mutex bridges the two.
+    let progress_tx = std::sync::Arc::new(std::sync::Mutex::new(tx.clone()));
+    let scan = {
+        let progress_tx = progress_tx.clone();
+        ModManager::scan_directories_with_progress(archive, active, parallel, &move |done, total| {
+            if let Ok(mut sender) = progress_tx.lock() {
+                let _ = sender.try_send(LoadEvent::Progress {
+                    phase: LoadPhase::Mods,
+                    done,
+                    total,
+                });
+            }
+        })
+    };
+    let finished = match scan {
+        Ok(mods) => {
+            let mod_list: Vec<Mod> = mods.into_values().collect();
+            let conflicts = ConflictDetector::detect_conflicts(&mod_list);
+            let updates = updates_job(&mod_list, &|done, total| {
+                if let Ok(mut sender) = progress_tx.lock() {
+                    let _ = sender.try_send(LoadEvent::Progress {
+                        phase: LoadPhase::Updates,
+                        done,
+                        total,
+                    });
+                }
+            });
+            Ok(LoadOutcome {
+                scan: ScanOutcome {
+                    mods: mod_list,
+                    conflicts,
+                },
+                updates,
+            })
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    let _ = futures::executor::block_on(tx.send(LoadEvent::Finished(finished)));
+}
+
+/// The load's second phase: read the update database (if a
+/// fill has landed one) and judge it against the library —
+/// the summary that feeds the Updates tile and filter, and
+/// the per-mod rows the app turns into update states. This is
+/// the computation that used to run on the UI thread when a
+/// scan landed; running it here is what lets the splash
+/// promise — and prove — that the counts are already true at
+/// handoff.
+///
+/// Progress covers the whole phase under one total: every
+/// database row examined (the summary pass), then every mod
+/// matched against its row (the judgement pass).
+fn updates_job(
+    mods: &[Mod],
+    report: &dyn Fn(usize, usize),
+) -> UpdateDbPresentation {
+    let Some(db) = update_db::load_default() else {
+        report(1, 1);
+        return UpdateDbPresentation {
+            present: false,
+            rows: HashMap::new(),
+            generated_at: None,
+            summary: update_db::DbSummary::default(),
+            judged: Vec::new(),
+        };
+    };
+    let rows_total = db.rows.len();
+    let total = rows_total + mods.len();
+    let installed: HashMap<String, String> = mods
+        .iter()
+        .map(|m| (ModManager::mod_stem(&m.path), m.version.clone()))
+        .collect();
+    let summary = update_db::summarize_with_progress(&db, &installed, &|done, _| {
+        report(done, total)
+    });
+    let rows: HashMap<String, UpdateRow> = db
+        .rows
+        .iter()
+        .map(|r| (r.stem.clone(), r.clone()))
+        .collect();
+    let mut judged = Vec::new();
+    for (i, m) in mods.iter().enumerate() {
+        let stem = ModManager::mod_stem(&m.path);
+        if let Some(row) = rows.get(&stem) {
+            judged.push(UpdateJudgement {
+                id: m.id.clone(),
+                row: row.clone(),
+            });
+        }
+        report(rows_total + i + 1, total);
+    }
+    UpdateDbPresentation {
+        present: true,
+        rows,
+        generated_at: Some(db.generated_at),
+        summary,
+        judged,
+    }
 }
 
 /// Background job: load every mod's icon, in parallel.
@@ -2738,14 +3288,49 @@ pub fn run(mod_manager: ModManager) -> anyhow::Result<()> {
         None,
     )
     .ok();
-    let result = iced::application("Playground", App::update, App::view)
+    let result = iced::application(
+        |_: &App| format!("Playground v{}", env!("CARGO_PKG_VERSION")),
+        App::update,
+        App::view,
+    )
         .subscription(App::subscription)
-        .theme(|_: &App| Theme::Dark)
+        .theme(|app: &App| {
+            // While the boot load runs, the shell wears the
+            // splash theme — a transparent background, so
+            // the window the logo floats in is truly clear
+            // (the shell clears with the theme's background
+            // color). The moment `booting` drops, this
+            // returns Dark and the clear goes opaque with
+            // it: the main window is the ordinary app.
+            if app.booting {
+                theme::splash_theme()
+            } else {
+                Theme::Dark
+            }
+        })
         .window(iced::window::Settings {
+            // The launch window is the splash's stage
+            // (John, 2026-10-21): SPLASH_W x SPLASH_H, his
+            // measured size (about 4 grid squares — the
+            // logo's native 1254 overflowed his screen),
+            // borderless and transparent, so the
+            // artwork floats on the desktop in its own
+            // shape. At handoff it is resized to 1280x800,
+            // re-decorated, and re-centered on the same
+            // screen center (see App::restore_window) —
+            // the main window's size and decorations are
+            // the pre-splash ones, arrived at by restore
+            // rather than by launch.
+            size: Size::new(SPLASH_W, SPLASH_H),
+            // Dead center of the screen (John, 2026-10-21):
+            // the splash used to come up wherever the OS
+            // defaulted it — mid-left on his screen.
+            position: iced::window::Position::Centered,
+            decorations: false,
+            transparent: true,
             icon,
             ..iced::window::Settings::default()
         })
-        .window_size((1280.0, 800.0))
         .run_with(move || {
             let mut app = App::new(mod_manager);
             let task = app.begin_load();

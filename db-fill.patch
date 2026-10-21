@@ -1,0 +1,35 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -9,6 +9,7 @@
+ mod mod_manager;
+ mod scanner;
+ mod sources;
++mod update_db;
+ mod config;
+ mod ui;
+ 
+@@ -268,6 +269,16 @@
+                 });
+             }
+         }
++        Some("db-fill") => {
++            // The one swipe: fill the personal update
++            // database (scan facts + catalog join + link
++            // polls) and write updates.json beside the
++            // catalog cache. Built to run scheduled and
++            // unattended; the summary also lands in
++            // updates-summary.txt next to the database.
++            let runtime = tokio::runtime::Runtime::new()?;
++            runtime.block_on(async { crate::update_db::fill(mod_manager).await })?;
++        }
+         Some("update") => {
+             let Some(stem) = args.get(1).map(|s| s.to_lowercase()) else {
+                 println!("Usage: cli update <mod file stem>");
+@@ -865,6 +876,7 @@
+     println!("  cli detect-modhub [limit] - Auto-link mods to ModHub by verified filename match");
+     println!("  cli catalog-fetch - Download/refresh the published ModHub catalog into the local cache");
+     println!("  cli catalog-build <catalog.json> [--pages N] [--max N] [--ids a,b] [--refresh] - Build/refresh the static ModHub catalog");
++    println!("  cli db-fill - Fill the personal update database (updates.json): scan + catalog join + link polls, in one swipe");
+     println!("  cli help - Show this help");
+     println!("  (no args) - Launch GUI");
+ }

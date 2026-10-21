@@ -20,10 +20,14 @@
 //! The database is private: it records the user's own links,
 //! so unlike the published catalog it never leaves the
 //! machine. It lives beside the catalog cache:
-//! ~/.config/fs-mod-manager/updates.json
+//! ~/.config/fs-mod-manager/catalog-home.json — the owner's
+//! name for it ("your mods") since the 2026-10-19 naming.
+//! It was born as updates.json; the one-time migration in
+//! `resolve_db_path` renames it on first run (the old file
+//! is copied, never moved, and left in place).
 
 use crate::mod_manager::{ModManager, ModState};
-use crate::sources::{catalog, github, mod_hub};
+use crate::sources::{catalog, github, itch, kingmods, mod_hub};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -46,7 +50,7 @@ pub struct UpdateRow {
     /// Archived, ...). A hardlinked file can wear both the
     /// library and the game-folder name at once.
     pub locations: Vec<String>,
-    /// modhub | github | none
+    /// modhub | github | kingmods | itch | none
     pub source_kind: String,
     /// The locator at the source: the ModHub page URL, or
     /// the GitHub owner/repo. None for the residue.
@@ -90,24 +94,57 @@ impl UpdateDb {
     }
 }
 
-/// Where the database lives: beside config.toml and the
-/// catalog cache.
-pub fn db_path() -> Option<PathBuf> {
+/// The database's file name (owner's naming, 2026-10-19).
+pub const DB_FILE_NAME: &str = "catalog-home.json";
+
+/// The name the database was born with, before the rename.
+pub const LEGACY_DB_FILE_NAME: &str = "updates.json";
+
+/// The folder every store in this project shares: beside
+/// config.toml and the catalog cache.
+pub fn data_dir() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    Some(
-        home.join(".config")
-            .join("fs-mod-manager")
-            .join("updates.json"),
-    )
+    Some(home.join(".config").join("fs-mod-manager"))
 }
 
-fn summary_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(
-        home.join(".config")
-            .join("fs-mod-manager")
-            .join("updates-summary.txt"),
-    )
+/// The one-time rename (owner, 2026-10-19): when
+/// catalog-home.json is absent and updates.json exists, the
+/// old file is COPIED to the new name — never moved, so
+/// the old file stays in place exactly as it was, and
+/// nothing is re-entered. Runs at most once: once the new
+/// file exists it is the database, and the legacy file is
+/// never consulted (or overwritten) again. Returns true
+/// when this call performed the migration.
+pub fn migrate_legacy_in(dir: &std::path::Path) -> bool {
+    let new = dir.join(DB_FILE_NAME);
+    let legacy = dir.join(LEGACY_DB_FILE_NAME);
+    if new.exists() || !legacy.exists() {
+        return false;
+    }
+    match std::fs::copy(&legacy, &new) {
+        Ok(_) => {
+            eprintln!(
+                "update database: migrated {} -> {} (the old file was left in place)",
+                LEGACY_DB_FILE_NAME, DB_FILE_NAME
+            );
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The database path to read in a folder: migrates the
+/// legacy file first (see `migrate_legacy_in`), then names
+/// the new file — whether or not it exists yet.
+pub fn resolve_db_path_in(dir: &std::path::Path) -> PathBuf {
+    migrate_legacy_in(dir);
+    dir.join(DB_FILE_NAME)
+}
+
+/// `resolve_db_path_in` for the standard data folder.
+pub fn resolve_db_path() -> Option<PathBuf> {
+    let dir = data_dir()?;
+    Some(resolve_db_path_in(&dir))
 }
 
 fn now_secs() -> u64 {
@@ -136,7 +173,10 @@ pub fn status_of(installed: &str, latest: Option<&str>) -> &'static str {
 /// unreadable database is not an error — it just means no
 /// fill has run yet, and launch proceeds without answers.
 pub fn load_default() -> Option<UpdateDb> {
-    let path = db_path()?;
+    // Resolution runs the one-time legacy migration, so a
+    // pre-rename updates.json is still the database the GUI
+    // reads on its first launch after the rename ships.
+    let path = resolve_db_path()?;
     UpdateDb::load(&path).ok()
 }
 
@@ -162,9 +202,24 @@ pub struct DbSummary {
     pub with_source: usize,
 }
 
-pub fn summarize(db: &UpdateDb, installed: &HashMap<String, String>) -> DbSummary {
+/// Judge the database's rows against the library, with
+/// progress: the callback receives (judged, total) as each
+/// row is examined — every row in the database counts,
+/// matched or not, because examining it IS the work. The
+/// launch splash's second phase is driven by this.
+pub fn summarize_with_progress(
+    db: &UpdateDb,
+    installed: &HashMap<String, String>,
+    on_progress: &dyn Fn(usize, usize),
+) -> DbSummary {
+    let total = db.rows.len();
+    on_progress(0, total);
     let mut s = DbSummary::default();
-    for row in &db.rows {
+    for (i, row) in db.rows.iter().enumerate() {
+        // Tick first: an unmatched row was still examined, and
+        // a `continue` below must not leave the bar short of
+        // its total.
+        on_progress(i + 1, total);
         let Some(inst) = installed.get(&row.stem) else {
             continue;
         };
@@ -188,6 +243,7 @@ pub struct FillSummary {
     pub total: usize,
     pub modhub_rows: usize,
     pub github_rows: usize,
+    pub other_rows: usize,
     pub residue: usize,
     pub updates_available: usize,
     pub ahead_blocked: usize,
@@ -199,32 +255,88 @@ impl FillSummary {
         format!(
             "Playground update database fill — unix {}\n\
              file: {}\n\
-             rows: {} (ModHub {}, GitHub {}, no source {})\n\
+             rows: {} (ModHub {}, GitHub {}, other sites {}, no source {})\n\
              updates available: {}\n\
              ahead of source (downgrade-blocked): {}\n\
              rows whose latest version changed since the last fill: {}\n",
             when, db_file, self.total, self.modhub_rows, self.github_rows,
-            self.residue, self.updates_available, self.ahead_blocked,
-            self.changed_since_last_fill
+            self.other_rows, self.residue, self.updates_available,
+            self.ahead_blocked, self.changed_since_last_fill
         )
     }
 }
 
+/// Copy a previous fill's facts into a row whose source
+/// section has halted (throttled) — the row keeps its
+/// previous state rather than being blanked.
+fn carry_prev(
+    prev: Option<&UpdateRow>,
+    latest_version: &mut Option<String>,
+    download_url: &mut Option<String>,
+    checked_at: &mut u64,
+) {
+    if let Some(p) = prev {
+        *latest_version = p.latest_version.clone();
+        *download_url = p.download_url.clone();
+        *checked_at = p.checked_at;
+    }
+}
+
 /// The one swipe: local facts, the catalog join, link polls,
-/// residue. Writes updates.json (and a human-readable
+/// residue. Writes catalog-home.json (and a human-readable
 /// summary beside it) and returns the counts. Intended to
 /// run scheduled and unattended; every per-source failure is
-/// reported and skipped, never fatal.
+/// reported and skipped, never fatal — with one exception:
+/// the GIANTS tripwire (see `fill_at`).
 pub async fn fill(mm: &ModManager) -> Result<FillSummary> {
-    // Previous fill, for the delta: stem -> latest version.
-    let prev_latest: HashMap<String, String> = db_path()
-        .and_then(|p| UpdateDb::load(&p).ok())
+    let mh = mod_hub::ModHubSource::new();
+    fill_with(mm, &mh).await
+}
+
+/// `fill` with the ModHub leg supplied by the caller — the
+/// seam tests use to point the leg at a stub instead of the
+/// real GIANTS (production always passes a stock source).
+pub async fn fill_with(mm: &ModManager, mh: &mod_hub::ModHubSource) -> Result<FillSummary> {
+    let dir = data_dir();
+    fill_at(mm, mh, dir.as_deref()).await
+}
+
+/// The fill itself, against an explicit data folder (None:
+/// compute everything, write nothing — the no-home case).
+///
+/// The pass is STAGED: rows are computed in memory and the
+/// database is written only when the whole pass completes.
+/// The GIANTS TRIPWIRE (owner, 2026-10-19): a 403/429 from
+/// GIANTS ModHub aborts the pass with an error before any
+/// write — a half-finished pass never lands over the good
+/// database, which stays on disk byte-identical. A 403/429
+/// from KingMods or itch halts only that source's section:
+/// its remaining rows keep their previous state (the last
+/// fill's facts) instead of being blanked, and the rest of
+/// the pass completes and writes normally.
+async fn fill_at(
+    mm: &ModManager,
+    mh: &mod_hub::ModHubSource,
+    dir: Option<&std::path::Path>,
+) -> Result<FillSummary> {
+    // Previous fill: the delta (stem -> latest version)
+    // and the full rows, for the delta and for carrying a
+    // halted section's rows over with their state intact.
+    // Resolution runs the one-time legacy migration first.
+    let prev_db = dir
+        .map(resolve_db_path_in)
+        .and_then(|p| UpdateDb::load(&p).ok());
+    let prev_latest: HashMap<String, String> = prev_db
+        .as_ref()
         .map(|db| {
             db.rows
-                .into_iter()
-                .filter_map(|r| r.latest_version.map(|v| (r.stem, v)))
+                .iter()
+                .filter_map(|r| r.latest_version.clone().map(|v| (r.stem.clone(), v)))
                 .collect()
         })
+        .unwrap_or_default();
+    let prev_rows: HashMap<String, UpdateRow> = prev_db
+        .map(|db| db.rows.into_iter().map(|r| (r.stem.clone(), r)).collect())
         .unwrap_or_default();
 
     // Local facts, grouped by stem. The same file can be
@@ -247,8 +359,15 @@ pub async fn fill(mm: &ModManager) -> Result<FillSummary> {
 
     let (base, token) = mm.github_endpoint();
     let gh = github::GithubSource::new(token);
-    let mh = mod_hub::ModHubSource::new();
+    let km = kingmods::KingModsSource::new();
+    let it = itch::ItchSource::new();
     let now = now_secs();
+
+    // Per-source throttle halts (the HTTP status that
+    // stopped the section). GIANTS has no entry here: its
+    // throttle aborts the whole pass on the spot.
+    let mut km_halt: Option<u16> = None;
+    let mut it_halt: Option<u16> = None;
 
     let mut summary = FillSummary::default();
     let mut rows: Vec<UpdateRow> = Vec::new();
@@ -285,6 +404,10 @@ pub async fn fill(mm: &ModManager) -> Result<FillSummary> {
         let mut latest_version: Option<String> = None;
         let mut download_url: Option<String> = None;
         let mut checked_at: u64 = 0;
+        // True when this row's facts were carried over from
+        // the previous fill because its source's section
+        // halted (throttled) before the row could be asked.
+        let mut carried = false;
 
         if let Some(repo) = gh_links.get(stem) {
             // An explicit link is the well this copy drinks
@@ -324,7 +447,155 @@ pub async fn fill(mm: &ModManager) -> Result<FillSummary> {
                         checked_at = now;
                     }
                     Err(e) => {
+                        // THE TRIPWIRE: GIANTS said stop.
+                        // Abort the whole pass — the staged
+                        // rows are dropped with this return,
+                        // and the database on disk is never
+                        // touched.
+                        if let Some(status) =
+                            crate::sources::throttle::throttle_status(&e)
+                        {
+                            return Err(e.context(format!(
+                                "TRIPWIRE: GIANTS ModHub throttled this fill (HTTP {}) — the pass is discarded and the database on disk was left untouched",
+                                status
+                            )));
+                        }
                         eprintln!("db-fill: {} (ModHub {}): page check failed: {}", stem, id, e);
+                    }
+                }
+            }
+        }
+
+        if source_kind == "none" {
+            // The catalog-other store: the mod's home is a
+            // KingMods or itch.io page, and the row's link
+            // is polled by that site's leg like any other
+            // source. A page whose own file name contradicts
+            // this mod's (KingMods captured one, itch's
+            // uploads tie to a different mod) is UNVERIFIED:
+            // the row keeps the link and the check time, but
+            // no version is judged from it — the identity
+            // rule is the exact file name, and a page that
+            // names another file is not this mod's page
+            // anymore. The fill's stderr notes say which
+            // rows were left unjudged and why.
+            // (GitHub store rows never reach here: they ride
+            // in with the links above and are judged by the
+            // GitHub leg like any config link.)
+            if let Some(other) = mm.other_row(stem) {
+                if other.source_kind == "kingmods" {
+                    source_kind = "kingmods";
+                    source_ref = Some(other.source_ref.clone());
+                    if km_halt.is_some() {
+                        // Section halted: keep the previous
+                        // fill's facts for this row.
+                        carry_prev(
+                            prev_rows.get(stem),
+                            &mut latest_version,
+                            &mut download_url,
+                            &mut checked_at,
+                        );
+                        carried = true;
+                    } else {
+                        match km.fetch_info(&other.source_ref).await {
+                            Ok(Some(info)) => {
+                                checked_at = now;
+                                match &info.file_name {
+                                    Some(dl) if *dl != file_name => {
+                                        eprintln!(
+                                            "db-fill: {} (KingMods): the page's download file is {} — not this mod's file; version left unjudged",
+                                            file_name, dl
+                                        );
+                                    }
+                                    _ => {
+                                        latest_version = Some(info.version);
+                                        download_url = info.download_url;
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                checked_at = now;
+                            }
+                            Err(e) => {
+                                if let Some(status) =
+                                    crate::sources::throttle::throttle_status(&e)
+                                {
+                                    // Section tripwire: KingMods
+                                    // halts here; this row and
+                                    // every KingMods row after it
+                                    // keep their previous state.
+                                    km_halt = Some(status);
+                                    eprintln!(
+                                        "db-fill: KingMods throttled this fill (HTTP {}) — the KingMods section halts here; its remaining rows keep their previous state",
+                                        status
+                                    );
+                                    carry_prev(
+                                        prev_rows.get(stem),
+                                        &mut latest_version,
+                                        &mut download_url,
+                                        &mut checked_at,
+                                    );
+                                    carried = true;
+                                } else {
+                                    eprintln!(
+                                        "db-fill: {} (KingMods): page check failed: {}",
+                                        stem, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else if other.source_kind == "itch" {
+                    source_kind = "itch";
+                    source_ref = Some(other.source_ref.clone());
+                    if it_halt.is_some() {
+                        carry_prev(
+                            prev_rows.get(stem),
+                            &mut latest_version,
+                            &mut download_url,
+                            &mut checked_at,
+                        );
+                        carried = true;
+                    } else {
+                        match it.fetch_latest(&other.source_ref, &file_name).await {
+                            Ok(Some(info)) => {
+                                checked_at = now;
+                                if info.mismatch {
+                                    eprintln!(
+                                        "db-fill: {} (itch): the page's uploads belong to a different mod; version left unjudged",
+                                        file_name
+                                    );
+                                } else {
+                                    latest_version = info.version;
+                                }
+                            }
+                            Ok(None) => {
+                                checked_at = now;
+                            }
+                            Err(e) => {
+                                if let Some(status) =
+                                    crate::sources::throttle::throttle_status(&e)
+                                {
+                                    it_halt = Some(status);
+                                    eprintln!(
+                                        "db-fill: itch.io throttled this fill (HTTP {}) — the itch section halts here; its remaining rows keep their previous state",
+                                        status
+                                    );
+                                    carry_prev(
+                                        prev_rows.get(stem),
+                                        &mut latest_version,
+                                        &mut download_url,
+                                        &mut checked_at,
+                                    );
+                                    carried = true;
+                                } else {
+                                    eprintln!(
+                                        "db-fill: {} (itch): page check failed: {}",
+                                        stem, e
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -333,6 +604,7 @@ pub async fn fill(mm: &ModManager) -> Result<FillSummary> {
         match source_kind {
             "modhub" => summary.modhub_rows += 1,
             "github" => summary.github_rows += 1,
+            "kingmods" | "itch" => summary.other_rows += 1,
             _ => summary.residue += 1,
         }
         match status_of(&rep.version, latest_version.as_deref()) {
@@ -363,8 +635,16 @@ pub async fn fill(mm: &ModManager) -> Result<FillSummary> {
             locations,
             source_kind: source_kind.to_string(),
             source_ref,
+            // A row carried over a halted section reports
+            // its own (unchanged) latest as the previous
+            // latest, so the halt never masquerades as a
+            // version change in the next launch's delta.
+            prev_latest_version: if carried {
+                latest_version.clone()
+            } else {
+                prev
+            },
             latest_version,
-            prev_latest_version: prev,
             download_url,
             checked_at,
         });
@@ -393,15 +673,16 @@ pub async fn fill(mm: &ModManager) -> Result<FillSummary> {
         generated_at: now,
         rows,
     };
-    if let Some(path) = db_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+    // The commit point: everything above was staging. The
+    // database is written only here, on a completed pass —
+    // a tripwire abort returned long before this line, so
+    // the file on disk is still the last good fill.
+    if let Some(dir) = dir {
+        let _ = std::fs::create_dir_all(dir);
+        let path = resolve_db_path_in(dir);
         db.save(&path)?;
         let text = summary.text(&path.to_string_lossy(), now);
-        if let Some(sp) = summary_path() {
-            let _ = std::fs::write(&sp, &text);
-        }
+        let _ = std::fs::write(dir.join("updates-summary.txt"), &text);
         print!("{}", text);
     }
     Ok(summary)
@@ -473,10 +754,244 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let s = summarize(&db, &installed);
+        let s = summarize_with_progress(&db, &installed, &|_, _| {});
         assert_eq!(s.updates, 1);
         assert_eq!(s.ahead_blocked, 1);
         assert_eq!(s.changed, 1);
         assert_eq!(s.with_source, 3);
     }
+
+    #[test]
+    fn summarize_progress_ticks_every_row_and_ends_at_total() {
+        let db = UpdateDb {
+            format: 1,
+            generated_at: 0,
+            rows: vec![
+                row("installed", "modhub", Some("2.0.0"), None),
+                // Not installed: no judging outcome, but the
+                // row is still examined, so it still ticks —
+                // the launch bar must reach its total.
+                row("not_installed", "modhub", Some("9.9.9"), None),
+                row("residue", "none", None, None),
+            ],
+        };
+        let installed: HashMap<String, String> = [
+            ("installed".to_string(), "1.0.0".to_string()),
+            ("residue".to_string(), "3.0.0".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let ticks = std::sync::Mutex::new(Vec::new());
+        let s = summarize_with_progress(&db, &installed, &|done, total| {
+            ticks.lock().unwrap().push((done, total))
+        });
+        assert_eq!(s.updates, 1);
+        let ticks = ticks.lock().unwrap();
+        assert_eq!(
+            *ticks,
+            vec![(0, 3), (1, 3), (2, 3), (3, 3)],
+            "one tick per row, monotonic, ending exactly at the total"
+        );
+    }
+
+    // ---- The rename: updates.json -> catalog-home.json ----
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mm-updatedb-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn legacy_db_migrates_once_and_is_left_in_place() {
+        let dir = scratch("migrate");
+        let legacy = dir.join(LEGACY_DB_FILE_NAME);
+        std::fs::write(&legacy, b"{\"format\":1}").unwrap();
+        let resolved = resolve_db_path_in(&dir);
+        assert_eq!(resolved, dir.join(DB_FILE_NAME));
+        assert_eq!(std::fs::read(&resolved).unwrap(), b"{\"format\":1}");
+        assert!(legacy.exists(), "the migration copies; it never moves");
+        // Once the new file exists it IS the database: a
+        // later change to the legacy file is not re-migrated
+        // over it.
+        std::fs::write(&legacy, b"changed later").unwrap();
+        let _ = resolve_db_path_in(&dir);
+        assert_eq!(std::fs::read(&resolved).unwrap(), b"{\"format\":1}");
+    }
+
+    #[test]
+    fn existing_catalog_home_wins_over_legacy() {
+        let dir = scratch("both-exist");
+        std::fs::write(dir.join(DB_FILE_NAME), b"new").unwrap();
+        std::fs::write(dir.join(LEGACY_DB_FILE_NAME), b"old").unwrap();
+        let resolved = resolve_db_path_in(&dir);
+        assert_eq!(std::fs::read(&resolved).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(dir.join(LEGACY_DB_FILE_NAME)).unwrap(),
+            b"old",
+            "the legacy file is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn no_legacy_no_migration() {
+        let dir = scratch("neither");
+        let resolved = resolve_db_path_in(&dir);
+        assert_eq!(resolved, dir.join(DB_FILE_NAME));
+        assert!(!resolved.exists(), "resolution alone creates nothing");
+    }
+
+    // ---- The GIANTS tripwire, proven by injection ----
+
+    /// Loopback stub answering every request with the given
+    /// status and body — the tripwire is proven here, never
+    /// by provoking the real GIANTS.
+    fn stub_http(status_line: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status_line.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    fn write_zip_mod(path: &std::path::Path, version: &str) {
+        use std::io::Write as _;
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("modDesc.xml", opts).unwrap();
+        zip.write_all(
+            format!(
+                "<modDesc><author>T</author><title><en>Probe</en></title><version>{}</version></modDesc>",
+                version
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+    }
+
+    /// A manager over a scratch library holding one zip mod
+    /// linked to ModHub id 424242, with the catalog disabled
+    /// (so the fill must ask the "page" — the stub — itself).
+    fn probe_manager(base: &std::path::Path) -> ModManager {
+        use crate::config::{Config, GameDirectories, ModSources, Settings};
+        let archive = base.join("archive");
+        let active = base.join("active");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::create_dir_all(&active).unwrap();
+        write_zip_mod(&archive.join("FS25_Tripwire_Probe.zip"), "1.0.0.0");
+        let config = Config {
+            game_directories: GameDirectories {
+                fs17: None,
+                fs19: None,
+                fs22: None,
+                fs25: None,
+            },
+            mod_sources: ModSources {
+                mod_hub: vec![],
+                github: vec![],
+                kingmods: vec![],
+            },
+            settings: Settings {
+                archive_directory: archive,
+                active_directory: active,
+                auto_update: false,
+                check_conflicts: true,
+                parallel_scans: 2,
+                cache_ttl_hours: 24,
+                favorites: vec![],
+                save_loadouts: HashMap::new(),
+                game_directory: None,
+                mod_links: HashMap::new(),
+                modhub_links: [(
+                    "fs25_tripwire_probe".to_string(),
+                    "424242".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+                catalog_url: String::new(),
+            },
+        };
+        ModManager::new(config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn fill_halts_on_giants_403_and_leaves_the_database_untouched() {
+        let base = scratch("tripwire");
+        let data = base.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // The last good fill, byte for byte — a halted pass
+        // must leave exactly this behind.
+        let sentinel = "{\"format\": 1, \"generated_at\": 7, \"rows\": []}";
+        std::fs::write(data.join(DB_FILE_NAME), sentinel).unwrap();
+
+        let mm = probe_manager(&base);
+        let mh = mod_hub::ModHubSource::with_base(&stub_http("403 Forbidden", ""));
+        let err = fill_at(&mm, &mh, Some(&data)).await.unwrap_err();
+        assert_eq!(
+            crate::sources::throttle::throttle_status(&err),
+            Some(403),
+            "the abort must carry the throttle signal: {}",
+            err
+        );
+        assert_eq!(
+            std::fs::read(data.join(DB_FILE_NAME)).unwrap(),
+            sentinel.as_bytes(),
+            "a halted pass never writes over the good database"
+        );
+        assert!(
+            !data.join(LEGACY_DB_FILE_NAME).exists(),
+            "no legacy file is conjured by a halted pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_writes_catalog_home_on_a_clean_pass() {
+        let base = scratch("clean-pass");
+        let data = base.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // Shaped like the real ModHub page (see mod_hub's
+        // parser tests): the probe mod, at version 2.0.0.0.
+        let page = r#"
+            <div class="table-cell"><b>Filename</b></div>
+            <div class="table-cell">FS25_Tripwire_Probe.zip</div>
+            <div class="table-cell"><b>Version</b></div>
+            <div class="table-cell">2.0.0.0</div>
+            <a href="https://cdn26.giants-software.com/modHub/storage/00424242/FS25_Tripwire_Probe.zip">DOWNLOAD</a>
+        "#;
+        let mm = probe_manager(&base);
+        let mh = mod_hub::ModHubSource::with_base(&stub_http("200 OK", page));
+        let summary = fill_at(&mm, &mh, Some(&data)).await.unwrap();
+        assert_eq!(summary.modhub_rows, 1);
+        assert_eq!(summary.updates_available, 1);
+        let db = UpdateDb::load(&data.join(DB_FILE_NAME)).unwrap();
+        assert_eq!(db.rows.len(), 1);
+        assert_eq!(db.rows[0].latest_version.as_deref(), Some("2.0.0.0"));
+        assert!(
+            !data.join(LEGACY_DB_FILE_NAME).exists(),
+            "fills land under the new name only"
+        );
+    }
 }
+

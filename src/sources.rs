@@ -1,7 +1,11 @@
 pub mod mod_hub;
+pub mod throttle;
 pub mod github;
 pub mod kingmods;
+pub mod itch;
 pub mod catalog;
+pub mod catalog_other;
+pub mod catalog_miss;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

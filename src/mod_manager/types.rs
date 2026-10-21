@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use super::moddesc;
@@ -47,6 +47,20 @@ pub struct Mod {
     pub categories: Vec<String>,
 }
 
+/// A mod's stable ID: a hash of its canonical path. The same
+/// mod at the same location gets the same ID on every scan —
+/// favorites and the CLI both depend on that (a fresh random
+/// ID per scan breaks both). Shared with the library
+/// database, which re-derives the id when a remembered mod
+/// is served at a path (a hardlink twin in the other folder,
+/// or a file moved between folders).
+pub fn id_for_path(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 impl Mod {
     pub fn new(path: PathBuf) -> Result<Self, std::io::Error> {
         let metadata = std::fs::metadata(&path)?;
@@ -83,13 +97,10 @@ impl Mod {
             ModType::Unknown
         };
 
-        // Stable ID: a hash of the canonical path. The same mod at the same
-        // location gets the same ID on every scan — favorites and the CLI
-        // both depend on that (a fresh random ID per scan breaks both).
-        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.to_string_lossy().as_bytes());
-        let id = hex::encode(hasher.finalize());
+        // Stable ID: a hash of the canonical path (see
+        // `id_for_path` — the library database recomputes the
+        // same id when it serves a remembered mod at a path).
+        let id = id_for_path(&path);
 
         let mut m = Self {
             id,

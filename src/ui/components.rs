@@ -1,8 +1,10 @@
 use crate::mod_manager::conflict::Conflict;
 use crate::mod_manager::icons::LoadedIcon;
 use crate::mod_manager::types::{Mod, ModState};
+use crate::update_db::{DbSummary, UpdateRow};
 use iced::widget::{button, column, container, row, text};
 use iced::{Color, Element, Length};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,64 @@ impl std::fmt::Display for BrowseView {
 pub struct ScanOutcome {
     pub mods: Vec<Mod>,
     pub conflicts: Vec<Conflict>,
+}
+
+/// One phase of the two-phase library load. Phase 1 loads the
+/// mods (the folder scan); phase 2 loads the updates (the
+/// update database read and judged against the library). The
+/// launch splash's bar spans both, so the handoff to the main
+/// window happens only when both are done — and the Updates
+/// tile count is already true at that moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPhase {
+    Mods,
+    Updates,
+}
+
+/// One mod's update-database judgement, computed in the load's
+/// second phase: the mod's id and the database row it was
+/// judged against. The app turns these into per-mod update
+/// states when the load lands.
+#[derive(Debug, Clone)]
+pub struct UpdateJudgement {
+    pub id: String,
+    pub row: UpdateRow,
+}
+
+/// The update database, read and judged in the load's second
+/// phase — the same presentation the app used to compute
+/// synchronously on the UI thread when a scan landed. When
+/// `present` is false there is no database file (yet), and the
+/// app simply has nothing to present.
+#[derive(Debug, Clone)]
+pub struct UpdateDbPresentation {
+    pub present: bool,
+    pub rows: HashMap<String, UpdateRow>,
+    pub generated_at: Option<u64>,
+    pub summary: DbSummary,
+    pub judged: Vec<UpdateJudgement>,
+}
+
+/// Everything one full load produces: the scan and, judged
+/// against it, the update database.
+#[derive(Debug, Clone)]
+pub struct LoadOutcome {
+    pub scan: ScanOutcome,
+    pub updates: UpdateDbPresentation,
+}
+
+/// Progress and completion events from the background load
+/// job, streamed to the app while the load runs. Progress
+/// counts are real work counts (files processed of files
+/// found, rows judged of rows total) — never estimates.
+#[derive(Debug, Clone)]
+pub enum LoadEvent {
+    Progress {
+        phase: LoadPhase,
+        done: usize,
+        total: usize,
+    },
+    Finished(Result<LoadOutcome, String>),
 }
 
 /// How a game-log line is classified for the Log Reader.
@@ -118,7 +178,9 @@ pub mod update_types {
 #[derive(Debug, Clone)]
 pub enum Message {
     Scan,
-    ScanLoaded(Result<ScanOutcome, String>),
+    /// One event from the background load job: a progress tick
+    /// for the splash bar, or the finished load.
+    LoadEvent(LoadEvent),
     IconsLoaded(Vec<(String, LoadedIcon)>),
     SearchChanged(String),
     TabSelected(Tab),
@@ -160,10 +222,22 @@ pub enum Message {
     },
     /// One batch of a chunked detection pass (the pass saves
     /// every batch, so closing the app mid-pass loses nothing).
+    /// `missed` counts everything the batch did not link
+    /// (not-found and failed searches alike, as the tally
+    /// always has); `missed_keys` carries only the true
+    /// not-founds — (stem, file name) — whose outcome is
+    /// written to the miss store so they are never
+    /// searched again.
     DetectBatchDone {
         found: Vec<(String, String)>,
         missed: usize,
+        missed_keys: Vec<(String, String)>,
         processed: usize,
+        /// GIANTS throttled this batch (HTTP 403/429): the
+        /// tripwire. The handler stops the pass here — the
+        /// remaining jobs are dropped unsearched; this
+        /// batch's links and misses were already saved.
+        throttled: bool,
     },
     CheckUpdate(String),
     UpdateChecked(String, Result<Option<update_types::UpdateInfo>, String>),
@@ -178,6 +252,7 @@ pub enum Message {
     SavesFilterChanged(String),
     WindowResized(iced::Size),
     GridScrolled(iced::widget::scrollable::Viewport),
+    ToggleShowMenu,
 }
 
 pub fn format_size(bytes: u64) -> String {

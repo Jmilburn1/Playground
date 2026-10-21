@@ -19,11 +19,37 @@ use std::path::{Path, PathBuf};
 /// validates and swaps it in, same as the GitHub flow. If the
 /// page layout ever changes, parsing fails loudly instead of
 /// guessing.
-pub struct ModHubSource;
+/// The production ModHub host. The page paths below are
+/// appended to it.
+pub const DEFAULT_BASE: &str = "https://www.farming-simulator.com";
+
+pub struct ModHubSource {
+    /// Scheme + host the pages are fetched from. Production
+    /// is always DEFAULT_BASE; the seam exists so tests can
+    /// point the source at a local stub (e.g. one that
+    /// answers 403, to prove the throttling tripwire without
+    /// ever provoking the real GIANTS).
+    base: String,
+}
 
 impl ModHubSource {
     pub fn new() -> Self {
-        Self
+        Self {
+            base: DEFAULT_BASE.to_string(),
+        }
+    }
+
+    /// A source speaking to a different host (tests only).
+    #[cfg(test)]
+    pub fn with_base(base: &str) -> Self {
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// This source's page URL for a mod.
+    fn page_url(&self, mod_id: &str) -> String {
+        format!("{}/mod.php?mod_id={}&title=fs2025", self.base, mod_id)
     }
 
     fn client(&self) -> Result<reqwest::Client> {
@@ -37,15 +63,18 @@ impl ModHubSource {
     /// (verified the hard way while building this).
     pub async fn search_candidates(&self, query: &str) -> Result<Vec<String>> {
         let url = format!(
-            "https://www.farming-simulator.com/mods.php?title=fs2025&searchMod={}",
+            "{}/mods.php?title=fs2025&searchMod={}",
+            self.base,
             encode_query(query)
         );
-        let html = self
+        let resp = self
             .client()?
             .get(&url)
             .send()
             .await
-            .context("ModHub search did not answer")?
+            .context("ModHub search did not answer")?;
+        super::throttle::check_status("GIANTS ModHub", resp.status())?;
+        let html = resp
             .error_for_status()
             .context("ModHub search failed")?
             .text()
@@ -58,16 +87,15 @@ impl ModHubSource {
     /// page is 0-based) — the catalog indexer's raw material.
     /// An empty vec means the walk has run past the end.
     pub async fn listing_ids(&self, page: u32) -> Result<Vec<String>> {
-        let url = format!(
-            "https://www.farming-simulator.com/mods.php?title=fs2025&page={}",
-            page
-        );
-        let html = self
+        let url = format!("{}/mods.php?title=fs2025&page={}", self.base, page);
+        let resp = self
             .client()?
             .get(&url)
             .send()
             .await
-            .context("ModHub listing did not answer")?
+            .context("ModHub listing did not answer")?;
+        super::throttle::check_status("GIANTS ModHub", resp.status())?;
+        let html = resp
             .error_for_status()
             .context("ModHub listing failed")?
             .text()
@@ -238,12 +266,10 @@ impl Catalog {
     }
 }
 
-/// The public page for a ModHub mod (FS25 section).
+/// The public page for a ModHub mod (FS25 section), on the
+/// production host.
 pub fn page_url(mod_id: &str) -> String {
-    format!(
-        "https://www.farming-simulator.com/mod.php?mod_id={}&title=fs2025",
-        mod_id
-    )
+    format!("{}/mod.php?mod_id={}&title=fs2025", DEFAULT_BASE, mod_id)
 }
 
 /// Normalize a user-typed ModHub reference to the numeric
@@ -336,7 +362,7 @@ impl ModHubSource {
     /// error — ModHub's layout changed, and the user should
     /// hear that instead of a wrong "up to date".
     pub async fn fetch_info(&self, mod_id: &str) -> Result<Option<ModHubInfo>> {
-        let url = page_url(mod_id);
+        let url = self.page_url(mod_id);
         let resp = reqwest::Client::builder()
             .user_agent(UA)
             .build()?
@@ -347,6 +373,7 @@ impl ModHubSource {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
+        super::throttle::check_status("GIANTS ModHub", resp.status())?;
         let html = resp
             .error_for_status()
             .with_context(|| format!("ModHub page failed for mod {}", mod_id))?
@@ -492,6 +519,43 @@ mod tests {
     #[test]
     fn page_without_fields_does_not_parse() {
         assert!(parse_page("<html><body>nothing here</body></html>").is_none());
+    }
+
+    /// A one-shot HTTP stub on a loopback port that answers
+    /// every request with the given status line — the
+    /// injection seam for the tripwire tests (a real 403
+    /// from GIANTS is never provoked).
+    fn stub_status(status_line: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let line = status_line.to_string();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    line
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn a_403_from_modhub_is_a_throttle_error() {
+        let src = ModHubSource::with_base(&stub_status("403 Forbidden"));
+        let err = src.fetch_info("123").await.unwrap_err();
+        assert_eq!(crate::sources::throttle::throttle_status(&err), Some(403));
+    }
+
+    #[tokio::test]
+    async fn a_429_from_modhub_search_is_a_throttle_error() {
+        let src = ModHubSource::with_base(&stub_status("429 Too Many Requests"));
+        let err = src.search_candidates("anything").await.unwrap_err();
+        assert_eq!(crate::sources::throttle::throttle_status(&err), Some(429));
     }
 
     #[test]

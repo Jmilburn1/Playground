@@ -1,0 +1,11 @@
+Playground complete-walk report (--full)
+Catalog file: C:/Playground/catalog.json
+Walk reached the end of the listings: yes
+Mods on ModHub (ids seen in the walk): 6872
+New to the catalog in this walk: 0
+Catalog records now carrying a Released date: 6872 of 6872
+Walked mods still missing a record/date after the fetch: 0
+Catalogued ids the walk did NOT see (delisted candidates — records kept, not deleted): 0
+New ids: 
+Still-missing ids: 
+Not-seen ids: 
