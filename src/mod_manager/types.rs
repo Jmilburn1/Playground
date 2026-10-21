@@ -149,6 +149,20 @@ impl Mod {
             m.categories = vec![super::categories::UNCATEGORIZED.to_string()];
         }
 
+        // A .dlc pack's category is assigned by file kind
+        // (owner ruling, 2026-10-21): GIANTS' DLC files are
+        // encrypted, so there is never a modDesc to detect
+        // from — the record carries the DLC's category
+        // instead of the no-category fallback. (This also
+        // overrides the modDesc branch defensively: a .dlc
+        // never yields one, but the kind rules regardless.)
+        if m.path
+            .extension()
+            .map_or(false, |e| e.eq_ignore_ascii_case("dlc"))
+        {
+            m.categories = vec![super::categories::DLC_CATEGORY.to_string()];
+        }
+
         Ok(m)
     }
 

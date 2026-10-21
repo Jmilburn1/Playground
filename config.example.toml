@@ -1,4 +1,4 @@
-# FS Mod Manager Configuration
+# Playground Configuration
 
 [game_directories]
 # Set paths to your Farming Simulator game directories
@@ -29,9 +29,9 @@ api_key = ""
 
 [settings]
 # Archive directory (inactive mods)
-archive_directory = "~/.config/fs-mod-manager/Archive"
+archive_directory = "~/.config/playground/Archive"
 # Active directory (active mods)
-active_directory = "~/.config/fs-mod-manager/Active"
+active_directory = "~/.config/playground/Active"
 # Auto-update mods when checking
 auto_update = true
 # Check for mod conflicts

@@ -12,6 +12,7 @@ pub enum Tab {
     Browse,
     Conflicts,
     Saves,
+    Layout,
     Log,
     Settings,
 }
@@ -119,6 +120,42 @@ pub enum LoadEvent {
         total: usize,
     },
     Finished(Result<LoadOutcome, String>),
+}
+
+/// How a Layout page migration run ended, as the page
+/// reports it: the executor's outcomes, with a failed
+/// run's reversal called out as its own case — it is
+/// NOT a success, and the page must never dress it as
+/// one (design: "a failed apply's auto-reversal is
+/// reported plainly").
+#[derive(Debug, Clone)]
+pub enum LayoutRunOutcome {
+    /// The plan held no work: already in layout form.
+    AlreadyLaidOut,
+    Migrated {
+        moves: usize,
+        links: usize,
+        /// The pre-layout game folder, kept whole.
+        backup: String,
+        /// The per-run log file.
+        log: String,
+    },
+    /// The migration failed partway and everything it
+    /// did was reversed from the operation log. The
+    /// string is the failure's own words.
+    FailedReversed(String),
+}
+
+/// Progress and completion events from the Layout
+/// page's background jobs, streamed over a channel like
+/// the load's (real op counts, ticking; the finish event
+/// is sent with a blocking send so it cannot be lost).
+#[derive(Debug, Clone)]
+pub enum LayoutEvent {
+    Progress { done: usize, total: usize },
+    ApplyFinished(Result<LayoutRunOutcome, String>),
+    /// Ok carries the page-ready summary line.
+    RollbackFinished(Result<String, String>),
 }
 
 /// How a game-log line is classified for the Log Reader.
@@ -250,6 +287,17 @@ pub enum Message {
     SaveLoadout,
     ApplyLoadout,
     SavesFilterChanged(String),
+    /// Layout page: build (or rebuild) the read-only
+    /// plan preview for the current folders.
+    LayoutBuildPlan,
+    /// Layout page: arm, then (second press) execute the
+    /// previewed plan in the background.
+    LayoutApply,
+    /// Layout page: arm, then (second press) roll the
+    /// recorded migration back in the background.
+    LayoutRollback,
+    /// One event from a Layout background job.
+    LayoutEvent(LayoutEvent),
     WindowResized(iced::Size),
     /// Boot handover (splash -> main window): the window
     /// id read answered. The handover collects this fact

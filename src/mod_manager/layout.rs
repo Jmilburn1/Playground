@@ -26,6 +26,16 @@
 //!   a real displayed bucket is a home; the absence marker
 //!   is not. Positive fallback buckets (Scripts, Maps) are
 //!   real categories and file under themselves.
+//! - **DLC rider (owner ruling, 2026-10-21).** A `.dlc`
+//!   pack is a movable FILE mod whose category is
+//!   `categories::DLC_CATEGORY` ("DLC's") — assigned by
+//!   file kind because the pack is encrypted and has no
+//!   modDesc to detect from. Its card shows the same
+//!   category (the scan assigns it too), so Ruling A
+//!   holds: the displayed category is the home. The
+//!   engine applies the override itself, so a pack whose
+//!   record predates the ruling — or has no record at
+//!   all — still homes under `DLC's`.
 //!
 //! READ-ONLY IS THE PHASE'S WHOLE POINT: planning reads
 //! directory listings, metadata, and link targets, and
@@ -58,10 +68,23 @@ use super::types::{Mod, ModType};
 /// (Ruling B — the owner's name for it).
 pub const OTHER_CATEGORY: &str = "Other";
 
+/// Is this path / file name a `.dlc` pack? The kind
+/// test for the DLC rider: the extension, case-folded,
+/// and nothing else about the file matters.
+pub fn is_dlc(path: &Path) -> bool {
+    path.extension()
+        .map_or(false, |e| e.eq_ignore_ascii_case("dlc"))
+}
+
 /// The layout category for a mod: the bucket its Browse
 /// card displays (see the module docs), with the
-/// no-category cases folded to [`OTHER_CATEGORY`].
+/// no-category cases folded to [`OTHER_CATEGORY`]. A
+/// `.dlc` pack's bucket is its kind-assigned category,
+/// whatever its record says.
 pub fn layout_category(m: &Mod) -> String {
+    if is_dlc(&m.path) {
+        return categories::DLC_CATEGORY.to_string();
+    }
     match m.categories.first() {
         Some(c) if c != categories::UNCATEGORIZED => c.clone(),
         _ => OTHER_CATEGORY.to_string(),
@@ -228,14 +251,19 @@ pub struct LayoutPlan {
     pub summary: PlanSummary,
 }
 
-/// Is `p` shaped like a mod candidate — a folder, or a
-/// .zip file? Mirrors the scanner's own candidate filter
-/// (`ModManager::enumerate_candidates`).
+/// Is `p` shaped like a mod candidate — a folder, a
+/// .zip file, or a `.dlc` pack (a movable file mod
+/// since the 2026-10-21 DLC rider)? Mirrors the
+/// scanner's own candidate filters
+/// (`ModManager::enumerate_candidates` for the game
+/// folder, `enumerate_library_candidates` for the
+/// library, which admits `.dlc` at both levels).
 fn is_candidate(p: &Path) -> bool {
     p.is_dir()
         || (p.is_file()
-            && p.extension()
-                .map_or(false, |e| e.eq_ignore_ascii_case("zip")))
+            && p.extension().map_or(false, |e| {
+                e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("dlc")
+            }))
 }
 
 /// The byte size of a copy on disk: the file's length,
@@ -439,17 +467,25 @@ pub fn build_plan(library_root: &Path, game_root: &Path, mods: &[Mod]) -> Layout
             .or_else(|| sorted_recs.iter().find(|r| Some(&r.path) == game_path.as_ref()))
             .or_else(|| sorted_recs.first())
             .copied();
-        let category = match chosen {
-            Some(r) => layout_category(r),
-            // No scanned record knows this copy (its
-            // parse failed — the recursive scan reaches
-            // every depth the layout uses): it files
-            // under Other wherever it sits. Phase 2's
-            // stopgap, which kept a record-less copy in
-            // its subfolder because the depth-1 scan
-            // could not see it, is retired — the records
-            // it substituted for now exist (Phase 3).
-            None => OTHER_CATEGORY.to_string(),
+        // The DLC rider overrides the record entirely:
+        // a .dlc pack homes under its kind-assigned
+        // category whether the chosen record predates
+        // the ruling or no record knows the copy at all.
+        let category = if is_dlc(Path::new(name)) {
+            categories::DLC_CATEGORY.to_string()
+        } else {
+            match chosen {
+                Some(r) => layout_category(r),
+                // No scanned record knows this copy (its
+                // parse failed — the recursive scan reaches
+                // every depth the layout uses): it files
+                // under Other wherever it sits. Phase 2's
+                // stopgap, which kept a record-less copy in
+                // its subfolder because the depth-1 scan
+                // could not see it, is retired — the records
+                // it substituted for now exist (Phase 3).
+                None => OTHER_CATEGORY.to_string(),
+            }
         };
         let folder = sanitize_category(&category);
         if folder != category {
@@ -611,14 +647,9 @@ pub fn build_plan(library_root: &Path, game_root: &Path, mods: &[Mod]) -> Layout
 
 /// Where the plan JSON lives: the app config dir, next
 /// to the library database and the other stores
-/// (`~/.config/fs-mod-manager/layout-plan.json`).
+/// (`~/.config/playground/layout-plan.json`).
 pub fn plan_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(
-        home.join(".config")
-            .join("fs-mod-manager")
-            .join("layout-plan.json"),
-    )
+    Some(crate::paths::data_dir()?.join("layout-plan.json"))
 }
 
 /// Serialize the plan to [`plan_path`]. The ONLY write
@@ -812,6 +843,154 @@ mod tests {
             m.file_name == "FS25_Root.zip"
                 && m.to == lib.join("Other").join("FS25_Root.zip")
         }));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -- The DLC rider (owner ruling, 2026-10-21) -------
+
+    #[test]
+    fn dlc_folder_name_is_verbatim() {
+        // The trap this pins: the category -> folder-name
+        // sanitizer must hand back the owner's exact
+        // spelling, apostrophe included — it is a legal
+        // folder name on NTFS and ext4, and anything else
+        // would file the pack somewhere its card does not
+        // point.
+        assert_eq!(sanitize_category(categories::DLC_CATEGORY), "DLC's");
+    }
+
+    #[test]
+    fn dlc_record_category_is_its_kind() {
+        // A record that still carries the pre-ruling
+        // fallback ("Uncategorized") resolves to the
+        // kind-assigned category by its path alone.
+        let m = test_mod("/lib/pack.dlc", &["Uncategorized"], 1, "1.0.0.0", false);
+        assert_eq!(layout_category(&m), categories::DLC_CATEGORY);
+    }
+
+    #[test]
+    fn dlc_pack_at_the_root_plans_a_move_to_dlcs() {
+        let base = temp_root("dlc-root");
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        write_file(&lib.join("strawHarvestPack.dlc"), 500);
+        // The record predates the ruling: it still says
+        // Uncategorized. The engine's override must win.
+        let mods = vec![test_mod(
+            lib.join("strawHarvestPack.dlc").to_str().unwrap(),
+            &["Uncategorized"],
+            500,
+            "1.0.0.0",
+            false,
+        )];
+        let plan = build_plan(&lib, &game, &mods);
+        assert_eq!(plan.summary.mods, 1);
+        let e = &plan.entries[0];
+        assert_eq!(e.kind, ModKind::File);
+        assert_eq!(e.category, categories::DLC_CATEGORY);
+        assert_eq!(
+            e.target_path,
+            lib.join("DLC's").join("strawHarvestPack.dlc")
+        );
+        assert_eq!(plan.summary.moves, 1);
+        assert_eq!(
+            plan.moves[0].to,
+            lib.join("DLC's").join("strawHarvestPack.dlc")
+        );
+        // The per-category census names the literal folder.
+        let per: HashMap<String, usize> = plan.summary.per_category.iter().cloned().collect();
+        assert_eq!(per.get("DLC's"), Some(&1));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dlc_pack_recordless_still_homes_under_dlcs() {
+        // No record at all: the listing alone censuses
+        // the pack now, and it still files by kind.
+        let base = temp_root("dlc-recordless");
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        write_file(&lib.join("strawHarvestPack.dlc"), 500);
+        let plan = build_plan(&lib, &game, &[]);
+        assert_eq!(plan.summary.mods, 1);
+        assert_eq!(plan.entries[0].category, categories::DLC_CATEGORY);
+        assert_eq!(
+            plan.moves[0].to,
+            lib.join("DLC's").join("strawHarvestPack.dlc")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dlc_pack_filed_under_dlcs_is_in_place() {
+        let base = temp_root("dlc-filed");
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        write_file(&lib.join("DLC's").join("strawHarvestPack.dlc"), 500);
+        let mods = vec![test_mod(
+            lib.join("DLC's").join("strawHarvestPack.dlc").to_str().unwrap(),
+            &["DLC's"],
+            500,
+            "1.0.0.0",
+            false,
+        )];
+        let plan = build_plan(&lib, &game, &mods);
+        assert_eq!(plan.summary.moves, 0);
+        assert_eq!(plan.summary.already_in_place, 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dlc_pack_in_a_wrong_folder_moves_to_dlcs() {
+        let base = temp_root("dlc-wrong");
+        let lib = base.join("lib");
+        let game = base.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        write_file(&lib.join("Other").join("strawHarvestPack.dlc"), 500);
+        let mods = vec![test_mod(
+            lib.join("Other").join("strawHarvestPack.dlc").to_str().unwrap(),
+            &["DLC's"],
+            500,
+            "1.0.0.0",
+            false,
+        )];
+        let plan = build_plan(&lib, &game, &mods);
+        assert_eq!(plan.summary.moves, 1);
+        assert_eq!(plan.moves[0].from, lib.join("Other").join("strawHarvestPack.dlc"));
+        assert_eq!(
+            plan.moves[0].to,
+            lib.join("DLC's").join("strawHarvestPack.dlc")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dlc_pack_active_plans_a_hardlink_like_any_file_mod() {
+        let base = temp_root("dlc-active");
+        let lib = base.join("lib");
+        let game = base.join("game");
+        write_file(&lib.join("strawHarvestPack.dlc"), 500);
+        write_file(&game.join("strawHarvestPack.dlc"), 500);
+        let mods = vec![test_mod(
+            lib.join("strawHarvestPack.dlc").to_str().unwrap(),
+            &["DLC's"],
+            500,
+            "1.0.0.0",
+            false,
+        )];
+        let plan = build_plan(&lib, &game, &mods);
+        assert_eq!(plan.summary.hardlinks, 1);
+        let link = &plan.links[0];
+        assert_eq!(link.kind, LinkKind::Hardlink);
+        // The link points at the post-move library home.
+        assert_eq!(
+            link.target,
+            lib.join("DLC's").join("strawHarvestPack.dlc")
+        );
+        assert_eq!(link.link_path, game.join("strawHarvestPack.dlc"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

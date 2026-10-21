@@ -54,12 +54,7 @@ pub struct CatalogOther {
 /// Where the store lives: beside config.toml, the update
 /// database and the library database.
 pub fn store_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(
-        home.join(".config")
-            .join("fs-mod-manager")
-            .join("catalog-other.json"),
-    )
+    Some(crate::paths::data_dir()?.join("catalog-other.json"))
 }
 
 fn now_secs() -> u64 {

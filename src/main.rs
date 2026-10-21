@@ -6,8 +6,8 @@
     windows_subsystem = "windows"
 )]
 
-use fs_mod_manager::config::Config;
-use fs_mod_manager::mod_manager::ModManager;
+use playground::config::Config;
+use playground::mod_manager::ModManager;
 
 fn main() -> anyhow::Result<()> {
     // Setup logging
@@ -20,11 +20,11 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "cli" {
         let mut mod_manager = ModManager::new(config)?;
-        return fs_mod_manager::cli::run_cli(&mut mod_manager, &args[2..]);
+        return playground::cli::run_cli(&mut mod_manager, &args[2..]);
     }
 
     // Start GUI — unscanned: the app loads the library in a background
     // task so the window opens immediately.
     let mod_manager = ModManager::new_unscanned(config)?;
-    fs_mod_manager::ui::run(mod_manager)
+    playground::ui::run(mod_manager)
 }

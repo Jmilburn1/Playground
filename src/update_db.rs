@@ -20,7 +20,7 @@
 //! The database is private: it records the user's own links,
 //! so unlike the published catalog it never leaves the
 //! machine. It lives beside the catalog cache:
-//! ~/.config/fs-mod-manager/catalog-home.json — the owner's
+//! ~/.config/playground/catalog-home.json — the owner's
 //! name for it ("your mods") since the 2026-10-19 naming.
 //! It was born as updates.json; the one-time migration in
 //! `resolve_db_path` renames it on first run (the old file
@@ -103,8 +103,7 @@ pub const LEGACY_DB_FILE_NAME: &str = "updates.json";
 /// The folder every store in this project shares: beside
 /// config.toml and the catalog cache.
 pub fn data_dir() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".config").join("fs-mod-manager"))
+    crate::paths::data_dir()
 }
 
 /// The one-time rename (owner, 2026-10-19): when

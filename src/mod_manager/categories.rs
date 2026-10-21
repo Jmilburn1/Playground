@@ -20,6 +20,13 @@ use std::path::Path;
 pub const MAPS: &str = "Maps";
 pub const SCRIPTS: &str = "Scripts";
 pub const UNCATEGORIZED: &str = "Uncategorized";
+/// The one category a `.dlc` pack carries (owner ruling,
+/// 2026-10-21): GIANTS' DLC files are encrypted — no
+/// modDesc to detect from — so the category is assigned
+/// by file kind, exactly with this spelling, and the
+/// layout homes the pack under it (Ruling A: the card's
+/// category is the home).
+pub const DLC_CATEGORY: &str = "DLC's";
 
 /// The categories for the mod at `path`, sorted and deduplicated.
 pub fn detect_categories(path: &Path, info: Option<&ModDescInfo>) -> Vec<String> {

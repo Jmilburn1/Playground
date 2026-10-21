@@ -4,11 +4,11 @@ Playground's update checks are split in two, on purpose:
 
 - **The app never crawls.** At launch it reads the personal
   update database (`catalog-home.json`, in
-  `C:\Users\<you>\.config\fs-mod-manager\`) and answers
+  `C:\Users\<you>\.config\playground\`) and answers
   "what's new for me" locally, in milliseconds.
 - **The update program does the asking.** `update.exe` —
   the standalone binary that ships beside
-  `fs-mod-manager.exe` — runs the fill: scan facts, the
+  `playground.exe` — runs the fill: scan facts, the
   ModHub catalog join, and one polite poll per linked
   source (GitHub, KingMods, itch.io). It's built to run
   unattended, about **three times a day**, so the database

@@ -64,12 +64,7 @@ pub struct CatalogMiss {
 /// Where the store lives: beside config.toml, the update
 /// database, the library database and catalog-other.
 pub fn store_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(
-        home.join(".config")
-            .join("fs-mod-manager")
-            .join("catalog-miss.json"),
-    )
+    Some(crate::paths::data_dir()?.join("catalog-miss.json"))
 }
 
 fn now_secs() -> u64 {

@@ -22,7 +22,7 @@
 //!
 //! The database is an accelerator only. It lives beside
 //! config.toml and the update database:
-//! ~/.config/fs-mod-manager/library-db.json. A missing file
+//! ~/.config/playground/library-db.json. A missing file
 //! is normal (first run); an unreadable or damaged one is
 //! quarantined (renamed to library-db.json.damaged-<unix>,
 //! never wiped) and the library simply loads from the
@@ -64,12 +64,7 @@ pub struct LibraryDb {
 /// Where the database lives: beside config.toml and the
 /// update database.
 pub fn db_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(
-        home.join(".config")
-            .join("fs-mod-manager")
-            .join("library-db.json"),
-    )
+    Some(crate::paths::data_dir()?.join("library-db.json"))
 }
 
 fn now_secs() -> u64 {
@@ -164,6 +159,23 @@ impl LibraryDb {
                         stored.path = path.to_path_buf();
                         stored.id = id_for_path(path);
                         stored.created_at = created_at_of(path, stored.created_at);
+                    }
+                    // A .dlc pack's category comes from its
+                    // file kind (owner ruling, 2026-10-21),
+                    // not from the parse: a row stored before
+                    // the ruling still says "Uncategorized",
+                    // so normalize it here — in the stored
+                    // row, so the correction persists on the
+                    // next save and the served record matches
+                    // a fresh parse.
+                    if path
+                        .extension()
+                        .map_or(false, |e| e.eq_ignore_ascii_case("dlc"))
+                        && stored.categories
+                            != vec![super::categories::DLC_CATEGORY.to_string()]
+                    {
+                        stored.categories =
+                            vec![super::categories::DLC_CATEGORY.to_string()];
                     }
                     return Some(stored.clone());
                 }

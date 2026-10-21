@@ -3,6 +3,10 @@ use crate::mod_manager::game_files;
 use crate::mod_manager::icons::{
     icon_cache_dir, icon_cache_key, load_icon_cached, sweep_icon_cache, LoadedIcon,
 };
+use crate::mod_manager::layout::{self, LayoutPlan};
+use crate::mod_manager::layout_exec::{
+    self, ApplyOutcome, LayoutState, MigrationStatus, RollbackOutcome,
+};
 use crate::mod_manager::saves::SaveSlot;
 use crate::mod_manager::types::{Mod, ModState};
 use crate::mod_manager::ModManager;
@@ -11,9 +15,10 @@ use crate::ui::components::update_types::{UpdateInfo, UpdateState};
 use crate::ui::theme;
 use crate::update_db::{self, UpdateRow};
 use crate::ui::components::{
-    format_size, mod_card, BrowseView, DropdownTick, FolderTarget, LoadEvent,
-    LoadOutcome, LoadPhase, LogKind, LogLine, LogOutcome, Message,
-    ScanOutcome, Tab, UpdateDbPresentation, UpdateJudgement,
+    format_size, mod_card, BrowseView, DropdownTick, FolderTarget, LayoutEvent,
+    LayoutRunOutcome, LoadEvent, LoadOutcome, LoadPhase, LogKind, LogLine,
+    LogOutcome, Message, ScanOutcome, Tab, UpdateDbPresentation,
+    UpdateJudgement,
 };
 use futures::SinkExt as _;
 use iced::widget::image::Handle as ImageHandle;
@@ -144,6 +149,15 @@ impl RestoreState {
     }
 }
 
+/// Which Layout background job is in flight, if any
+/// (Roadmap #2, Phase 4). The page disables its actions
+/// while one runs and shows the apply job's op counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutRun {
+    Apply,
+    Rollback,
+}
+
 pub struct App {
     mod_manager: ModManager,
     current_tab: Tab,
@@ -235,6 +249,32 @@ pub struct App {
     /// Boot handover (splash -> main window) state; see
     /// RestoreState. Stays Idle for every load after boot.
     window_restore: RestoreState,
+    /// Layout page (Roadmap #2, Phase 4): the recorded
+    /// migration state as last read from layout-state.json
+    /// — None until the page is first opened, Some(None)
+    /// when no migration is recorded, Some(Some) with the
+    /// record itself.
+    layout_standing: Option<Option<LayoutState>>,
+    /// The previewed plan (Build plan): the exact work an
+    /// Apply click approves. Replaced wholesale by a
+    /// rebuild; dropped after a run lands (the world it
+    /// described is gone).
+    layout_preview: Option<LayoutPlan>,
+    /// Arm-to-confirm flags, mirroring Remove's pattern:
+    /// the first press arms with the stakes in the label,
+    /// the second executes.
+    layout_arm_apply: bool,
+    layout_arm_rollback: bool,
+    /// The in-flight Layout job and its op counts
+    /// (apply only — rollback reports no counts).
+    layout_running: Option<LayoutRun>,
+    layout_done: usize,
+    layout_total: usize,
+    /// The last run's result, in the page's own words:
+    /// success lines and refusal/failure lines are kept
+    /// apart so a failure never reads as a success.
+    layout_outcome: Option<String>,
+    layout_error: Option<String>,
 }
 
 impl App {
@@ -300,6 +340,15 @@ impl App {
             grid_view_h: 0.0,
             show_menu_open: false,
             window_restore: RestoreState::Idle,
+            layout_standing: None,
+            layout_preview: None,
+            layout_arm_apply: false,
+            layout_arm_rollback: false,
+            layout_running: None,
+            layout_done: 0,
+            layout_total: 0,
+            layout_outcome: None,
+            layout_error: None,
         }
     }
 
@@ -461,6 +510,58 @@ impl App {
         }
     }
 
+    /// Re-read the recorded migration state for the
+    /// Layout page: the same layout-state.json the CLI
+    /// verbs write, so the page's standing picture can
+    /// never disagree with the executor's record.
+    fn refresh_layout_standing(&mut self) {
+        match layout_exec::standing_state() {
+            Ok(state) => self.layout_standing = Some(state),
+            Err(e) => {
+                self.layout_standing = Some(None);
+                self.layout_error = Some(format!(
+                    "The migration record (layout-state.json) could not be read: {:#}",
+                    e
+                ));
+            }
+        }
+    }
+
+    /// Start the migration in the background: the
+    /// previewed plan is executed exactly as approved
+    /// (the executor refuses if the tree drifted since
+    /// the preview), with op counts streaming back over
+    /// the channel — the load job's pattern, so the page
+    /// ticks on a ~2,900-mod migration instead of
+    /// freezing.
+    fn begin_layout_apply(&mut self, preview: LayoutPlan) -> Task<Message> {
+        self.layout_running = Some(LayoutRun::Apply);
+        self.layout_done = 0;
+        self.layout_total = 0;
+        self.layout_outcome = None;
+        self.layout_error = None;
+        self.status = "Applying the layout…".to_string();
+        let mods: Vec<Mod> = self.mod_manager.get_mods().into_iter().cloned().collect();
+        let lib = self.mod_manager.get_archive_dir().clone();
+        let game = self.mod_manager.get_active_dir().clone();
+        let (tx, rx) = futures::channel::mpsc::channel::<LayoutEvent>(128);
+        std::thread::spawn(move || layout_apply_job(preview, lib, game, mods, tx));
+        Task::run(rx, Message::LayoutEvent)
+    }
+
+    /// Start the rollback in the background: the same
+    /// executor entry the CLI verb runs, audit refusal
+    /// included.
+    fn begin_layout_rollback(&mut self) -> Task<Message> {
+        self.layout_running = Some(LayoutRun::Rollback);
+        self.layout_outcome = None;
+        self.layout_error = None;
+        self.status = "Rolling back the layout…".to_string();
+        let (tx, rx) = futures::channel::mpsc::channel::<LayoutEvent>(128);
+        std::thread::spawn(move || layout_rollback_job(tx));
+        Task::run(rx, Message::LayoutEvent)
+    }
+
     /// Read the game's log.txt in the background (Log Reader).
     fn begin_log_load(&mut self) -> Task<Message> {
         match self.mod_manager.profile_dir() {
@@ -487,7 +588,7 @@ impl App {
                 )
             }
             None => {
-                self.log_note = "No game profile folder — the active folder isn't a game's mods folder."
+                self.log_note = "No game profile folder — check that the game mods folder really is a game's mods folder."
                     .to_string();
                 Task::none()
             }
@@ -733,6 +834,143 @@ impl App {
                 }
             }
             Message::SavesFilterChanged(filter) => self.saves_filter = filter,
+            Message::LayoutBuildPlan => {
+                if self.layout_running.is_some() {
+                    self.status =
+                        "A layout job is running — let it finish before rebuilding the plan."
+                            .to_string();
+                } else if self.loading {
+                    self.status =
+                        "Still loading — the plan needs the finished scan.".to_string();
+                } else {
+                    // The same build_plan the CLI verb
+                    // runs, against the current folders and
+                    // records — read-only. The plan JSON is
+                    // written too, Phase 2's input contract,
+                    // exactly as `cli layout-plan` writes it.
+                    let plan = self.mod_manager.layout_plan();
+                    match layout::write_plan_json(&plan) {
+                        Ok(_) => {
+                            self.layout_outcome = Some(format!(
+                                "Plan built: {} mods, {} moves, {} links to create.",
+                                plan.summary.mods,
+                                plan.summary.moves,
+                                plan.summary.hardlinks + plan.summary.junctions
+                            ));
+                            self.layout_error = None;
+                        }
+                        Err(e) => {
+                            self.layout_error = Some(format!(
+                                "The plan was built but its JSON could not be saved: {}",
+                                e
+                            ));
+                        }
+                    }
+                    self.layout_preview = Some(plan);
+                    self.layout_arm_apply = false;
+                }
+            }
+            Message::LayoutApply => {
+                if self.layout_running.is_some() {
+                    return Task::none();
+                }
+                if !self.layout_arm_apply {
+                    // First press arms only — the button's
+                    // label restates the counts, so the
+                    // approval is for THIS plan's work.
+                    self.layout_arm_apply = true;
+                    return Task::none();
+                }
+                self.layout_arm_apply = false;
+                let Some(preview) = self.layout_preview.clone() else {
+                    self.layout_error =
+                        Some("Build a plan first — there is nothing approved to apply.".to_string());
+                    return Task::none();
+                };
+                return self.begin_layout_apply(preview);
+            }
+            Message::LayoutRollback => {
+                if self.layout_running.is_some() {
+                    return Task::none();
+                }
+                if !self.layout_arm_rollback {
+                    self.layout_arm_rollback = true;
+                    return Task::none();
+                }
+                self.layout_arm_rollback = false;
+                return self.begin_layout_rollback();
+            }
+            Message::LayoutEvent(event) => match event {
+                LayoutEvent::Progress { done, total } => {
+                    self.layout_done = done;
+                    self.layout_total = total;
+                }
+                LayoutEvent::ApplyFinished(result) => {
+                    self.layout_running = None;
+                    self.layout_preview = None;
+                    self.refresh_layout_standing();
+                    match result {
+                        Ok(LayoutRunOutcome::AlreadyLaidOut) => {
+                            self.layout_outcome = Some(
+                                "Already in layout form — the library is sorted and the game folder is projected. Nothing was done."
+                                    .to_string(),
+                            );
+                            self.layout_error = None;
+                            self.status = "Layout: already in layout form.".to_string();
+                        }
+                        Ok(LayoutRunOutcome::Migrated {
+                            moves,
+                            links,
+                            backup,
+                            log,
+                        }) => {
+                            self.layout_outcome = Some(format!(
+                                "Migration complete: {} library move(s), {} projection(s) created.\nThe pre-layout game folder is kept whole at {}\nRollback stays open until you delete that backup yourself.\nRun log: {}",
+                                moves, links, backup, log
+                            ));
+                            self.layout_error = None;
+                            self.status = "Layout applied — rescanning the library.".to_string();
+                            // The tree moved under the
+                            // records: rescan so Browse and
+                            // the tiles tell the new truth.
+                            return self.begin_load();
+                        }
+                        Ok(LayoutRunOutcome::FailedReversed(why)) => {
+                            self.layout_error = Some(format!(
+                                "The migration FAILED and was reversed — nothing was changed. {}\nSee the run log for the step-by-step record.",
+                                why
+                            ));
+                            self.layout_outcome = None;
+                            self.status =
+                                "Layout migration failed and was reversed.".to_string();
+                        }
+                        Err(e) => {
+                            self.layout_error = Some(e);
+                            self.layout_outcome = None;
+                            self.status = "Layout apply did not run.".to_string();
+                        }
+                    }
+                }
+                LayoutEvent::RollbackFinished(result) => {
+                    self.layout_running = None;
+                    self.layout_preview = None;
+                    self.refresh_layout_standing();
+                    match result {
+                        Ok(summary) => {
+                            self.layout_outcome = Some(summary);
+                            self.layout_error = None;
+                            self.status =
+                                "Layout rollback finished — rescanning the library.".to_string();
+                            return self.begin_load();
+                        }
+                        Err(e) => {
+                            self.layout_error = Some(e);
+                            self.layout_outcome = None;
+                            self.status = "Layout rollback did not complete.".to_string();
+                        }
+                    }
+                }
+            },
             Message::LinkInputChanged(value) => self.link_input = value,
             Message::SaveModLink(id) => {
                 if let Some(m) = self.mod_manager.get_mod(&id).cloned() {
@@ -1113,6 +1351,15 @@ impl App {
                 if tab == Tab::Saves {
                     self.refresh_save_slots();
                 }
+                if tab == Tab::Layout {
+                    // Read the migration record fresh on
+                    // every open, and start disarmed: an
+                    // arm left over from a previous visit
+                    // must never carry into this one.
+                    self.refresh_layout_standing();
+                    self.layout_arm_apply = false;
+                    self.layout_arm_rollback = false;
+                }
                 self.current_tab = tab;
                 if tab == Tab::Log {
                     return self.begin_log_load();
@@ -1219,7 +1466,7 @@ impl App {
             Message::BrowseFolder(target) => {
                 let title = match target {
                     FolderTarget::Active => "Choose the game's mods folder",
-                    FolderTarget::Archive => "Choose the archive folder",
+                    FolderTarget::Archive => "Choose the library folder",
                     FolderTarget::Game => {
                         "Choose the Farming Simulator install folder (holds game.xml)"
                     }
@@ -1642,7 +1889,7 @@ impl App {
                 text(if self.loading {
                     "Loading mods… big libraries take a while. The window stays usable — watch the status bar below."
                 } else if self.mod_manager.get_mods().is_empty() {
-                    "No mods found. Put mod zips or folders into your active or archive folder, then Rescan."
+                    "No mods found. Put mod zips or folders into your game mods folder or library folder, then Rescan."
                 } else {
                     "No mods match the current search/filter."
                 })
@@ -2716,16 +2963,16 @@ impl App {
             text("Settings").size(20),
             text("Game mods folder (Browse also points the game here via gameSettings.xml):"),
             row![
-                text_input("Active folder path", &self.active_dir_input)
+                text_input("Game mods folder path", &self.active_dir_input)
                     .on_input(Message::ActiveDirChanged)
                     .padding(8)
                     .width(Length::Fill),
                 button(text("Browse")).on_press(Message::BrowseFolder(FolderTarget::Active)),
             ]
             .spacing(8),
-            text("Archive folder (stored mods):"),
+            text("Library folder (stored mods):"),
             row![
-                text_input("Archive folder path", &self.archive_dir_input)
+                text_input("Library folder path", &self.archive_dir_input)
                     .on_input(Message::ArchiveDirChanged)
                     .padding(8)
                     .width(Length::Fill),
@@ -2752,6 +2999,267 @@ impl App {
         ]
         .spacing(10)
         .into()
+    }
+
+    /// The Library Layout page (Roadmap #2, Phase 4):
+    /// the standing state read from the executor's own
+    /// record, a read-only plan preview, the destructive
+    /// step stated in plain words over an arm-to-confirm
+    /// Apply, progress that ticks while a run lands, and
+    /// the rollback button while its window is open.
+    fn layout_view(&self) -> Element<'_, Message> {
+        let running = self.layout_running;
+        let busy = running.is_some();
+        let lib = self.mod_manager.get_archive_dir().clone();
+        let game = self.mod_manager.get_active_dir().clone();
+        let mut col = column![
+            text("Library Layout").size(20),
+            text("One copy of every mod lives in the library, sorted into category folders. The game mods folder holds links to the active mods — never second copies.")
+                .size(13)
+                .width(Length::Fill),
+        ]
+        .spacing(10);
+
+        // ---- Standing state, from the record ----------
+        let standing = self.layout_standing.clone();
+        match &standing {
+            None => {
+                col = col.push(text("Standing: the migration record has not been read yet.").size(13));
+            }
+            Some(None) => {
+                col = col.push(
+                    text("Standing: not migrated. No Playground layout migration is recorded — the library is in its everyday shape.")
+                        .size(13)
+                        .width(Length::Fill),
+                );
+            }
+            Some(Some(state)) => {
+                let line = match state.status {
+                    MigrationStatus::InProgress => format!(
+                        "Standing: a migration started {} is recorded as still in progress — it was interrupted mid-run. Roll it back below to restore the pre-migration world before applying again.",
+                        state.started_at
+                    ),
+                    MigrationStatus::FailedReversed => format!(
+                        "Standing: the migration started {} FAILED and was reversed — the library and the game folder are as they were. Run log: {}",
+                        state.started_at,
+                        state.log_file.display()
+                    ),
+                    MigrationStatus::Swapped => {
+                        if state.backup_root.exists() {
+                            format!(
+                                "Standing: migrated ({}). The rollback window is OPEN — the pre-layout game folder is kept whole at {}.",
+                                state.started_at,
+                                state.backup_root.display()
+                            )
+                        } else {
+                            format!(
+                                "Standing: migrated ({}). The backup {} is gone, so the rollback window is closed — the layout is final.",
+                                state.started_at,
+                                state.backup_root.display()
+                            )
+                        }
+                    }
+                };
+                col = col.push(text(line).size(13).width(Length::Fill));
+            }
+        }
+
+        // ---- Plan preview ------------------------------
+        match &self.layout_preview {
+            None => {
+                let mut b = button(text("Build plan")).padding(8);
+                if !busy && !self.loading {
+                    b = b.on_press(Message::LayoutBuildPlan);
+                }
+                col = col.push(b);
+                col = col.push(
+                    text("Building a plan is read-only: it censuses the library and the game mods folder and shows the moves and links a migration would make. Nothing is touched.")
+                        .size(12)
+                        .width(Length::Fill),
+                );
+            }
+            Some(plan) => {
+                let s = &plan.summary;
+                col = col.push(
+                    text(format!(
+                        "Plan — library: {} · game mods folder: {}",
+                        plan.library_root.display(),
+                        plan.game_root.display()
+                    ))
+                    .size(13)
+                    .width(Length::Fill),
+                );
+                col = col.push(
+                    text(format!(
+                        "{} mods · {} to move · {} hardlinks + {} junctions to create · {} already linked · {} already in place · {} total",
+                        s.mods,
+                        s.moves,
+                        s.hardlinks,
+                        s.junctions,
+                        s.links_satisfied,
+                        s.already_in_place,
+                        format_size(s.total_bytes)
+                    ))
+                    .size(13)
+                    .width(Length::Fill),
+                );
+                let mut cats = column![].spacing(1);
+                for (name, count) in &s.per_category {
+                    cats = cats.push(text(format!("  {}: {}", name, count)).size(12));
+                }
+                col = col.push(cats);
+                if !plan.warnings.is_empty() {
+                    let mut warns = column![text(format!("Warnings ({}):", plan.warnings.len())).size(13)].spacing(1);
+                    for w in &plan.warnings {
+                        let kind = match w.kind {
+                            layout::WarningKind::NoLibraryCopy => "no library copy",
+                            layout::WarningKind::TargetCollision => "target collision",
+                            layout::WarningKind::CategorySanitized => "category sanitized",
+                        };
+                        warns = warns.push(
+                            text(format!("  [{}] {}: {}", kind, w.file_name, w.detail))
+                                .size(12)
+                                .width(Length::Fill),
+                        );
+                    }
+                    col = col.push(warns);
+                }
+                let mut rebuild = button(text("Rebuild plan")).padding(8);
+                if !busy && !self.loading {
+                    rebuild = rebuild.on_press(Message::LayoutBuildPlan);
+                }
+                col = col.push(rebuild);
+
+                let stale = plan.library_root != lib || plan.game_root != game;
+                let plan_empty = s.moves == 0 && s.hardlinks == 0 && s.junctions == 0;
+                if stale {
+                    col = col.push(
+                        text("This plan was built for different folders than the ones now configured — it no longer applies. Build a fresh plan.")
+                            .size(13)
+                            .width(Length::Fill),
+                    );
+                } else if plan_empty {
+                    col = col.push(
+                        text("This plan is empty: the library is already in layout form and the game mods folder is fully projected. Nothing to apply.")
+                            .size(13)
+                            .width(Length::Fill),
+                    );
+                } else if running != Some(LayoutRun::Apply) {
+                    // ---- The destructive step, in plain
+                    // words, over the arm-to-confirm button.
+                    col = col.push(
+                        text(format!(
+                            "What Apply will do — read it before you approve: rename {} library mod(s) into their category subfolders; build a staging farm holding {} projection(s); verify that every projection reads through to its library copy; then rename the game mods folder to a timestamped backup and put the farm in its place. The game folder's real copies are NOT deleted — they stay whole in the backup, and the rollback window stays open until you delete the backup yourself. Anything else sitting in the game folder rides into the backup with them and will not be in the new game folder.",
+                            s.moves,
+                            plan.links.len()
+                        ))
+                        .size(13)
+                        .width(Length::Fill),
+                    );
+                    if let Some(Some(state)) = &standing {
+                        let blocked = state.status == MigrationStatus::InProgress
+                            || (state.status == MigrationStatus::Swapped
+                                && state.backup_root.exists());
+                        if blocked {
+                            col = col.push(
+                                text("Note: a previous migration's rollback window is still open (see Standing above). The executor will refuse a new apply until that migration is rolled back, or its backup is deleted by hand.")
+                                    .size(12)
+                                    .width(Length::Fill),
+                            );
+                        }
+                    }
+                    let apply_btn = if self.layout_arm_apply {
+                        button(centered_label(
+                            text(format!(
+                                "Click again to apply: {} moves, {} links",
+                                s.moves,
+                                s.hardlinks + s.junctions
+                            ))
+                            .size(14),
+                        ))
+                        .width(Length::Fill)
+                        .style(theme::danger_pill())
+                        .on_press(Message::LayoutApply)
+                    } else {
+                        button(centered_label(text("Apply this layout").size(14)))
+                            .width(Length::Fill)
+                            .style(theme::nav_pill(false))
+                            .on_press(Message::LayoutApply)
+                    };
+                    col = col.push(apply_btn);
+                }
+            }
+        }
+
+        // ---- Progress while a run lands -----------------
+        if running == Some(LayoutRun::Apply) {
+            let frac = if self.layout_total > 0 {
+                self.layout_done as f32 / self.layout_total as f32
+            } else {
+                0.0
+            };
+            col = col.push(progress_bar(0.0..=1.0, frac).width(Length::Fill));
+            col = col.push(
+                text(format!(
+                    "Applying: {} of {} operations landed…",
+                    self.layout_done, self.layout_total
+                ))
+                .size(13),
+            );
+        }
+        if running == Some(LayoutRun::Rollback) {
+            col = col.push(text("Rolling back…").size(13));
+        }
+
+        // ---- Rollback, while its window is open ---------
+        if let Some(Some(state)) = &standing {
+            let window_open = match state.status {
+                MigrationStatus::InProgress | MigrationStatus::FailedReversed => true,
+                MigrationStatus::Swapped => state.backup_root.exists(),
+            };
+            if window_open && running != Some(LayoutRun::Rollback) {
+                col = col.push(
+                    text("Rollback removes the projection farm, puts the backed-up game folder back in place, and renames the sorted library copies back where they were. If the game folder holds anything that is not a projection of the library, rollback refuses and removes nothing.")
+                        .size(13)
+                        .width(Length::Fill),
+                );
+                let (label, armed_label) = if state.status == MigrationStatus::FailedReversed {
+                    ("Clear the failed migration's record", "Click again to clear the record")
+                } else {
+                    ("Roll back the migration", "Click again to roll back")
+                };
+                let rb_btn = if self.layout_arm_rollback {
+                    button(centered_label(text(armed_label).size(14)))
+                        .width(Length::Fill)
+                        .style(theme::danger_pill())
+                        .on_press(Message::LayoutRollback)
+                } else {
+                    button(centered_label(text(label).size(14)))
+                        .width(Length::Fill)
+                        .style(theme::nav_pill(false))
+                        .on_press(Message::LayoutRollback)
+                };
+                col = col.push(rb_btn);
+            }
+        }
+
+        // ---- The last run's result -----------------------
+        if let Some(outcome) = &self.layout_outcome {
+            col = col.push(text(outcome.clone()).size(13).width(Length::Fill));
+        }
+        if let Some(error) = &self.layout_error {
+            col = col.push(
+                text(error.clone())
+                    .size(13)
+                    .width(Length::Fill)
+                    .color(iced::Color::from_rgb(0.96, 0.46, 0.40)),
+            );
+        }
+
+        scrollable(col)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// Left sidebar (John, round 4 — the Hub layout piece): logo and
@@ -2833,6 +3341,7 @@ impl App {
                 .on_press(Message::Scan),
             nav(format!("Conflicts ({})", self.conflicts.len()), Tab::Conflicts),
             nav("Configure Save (wip)".to_string(), Tab::Saves),
+            nav("Layout".to_string(), Tab::Layout),
             nav("Log Reader".to_string(), Tab::Log),
             nav("Settings".to_string(), Tab::Settings),
             text("LIBRARY").size(11),
@@ -2857,7 +3366,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.3.4  © 2026 Farmer Jay.")
+            text("V1.4.0  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -3248,6 +3757,12 @@ impl App {
                 self.saves_view(),
                 50.0,
             ),
+            Tab::Layout => (
+                Space::with_height(0).into(),
+                None,
+                self.layout_view(),
+                50.0,
+            ),
             Tab::Log => (Space::with_height(0).into(), None, self.log_view(), 50.0),
             Tab::Settings => (
                 Space::with_height(0).into(),
@@ -3458,6 +3973,97 @@ fn to_handle(icon: LoadedIcon) -> ImageHandle {
         } => ImageHandle::from_rgba(width, height, pixels),
         LoadedIcon::Encoded(bytes) => ImageHandle::from_bytes(bytes),
     }
+}
+
+/// Background job for a Layout page apply, run on a worker
+/// thread: executes EXACTLY the plan the owner previewed
+/// and approved — `layout_exec::apply_previewed` refuses
+/// if the folders or the library drifted since the
+/// preview, so unapproved work can never run. Op counts
+/// stream back over the channel as operations land (try_send:
+/// a dropped tick is replaced by the next one); the finish
+/// event uses a blocking send so the outcome cannot be
+/// lost. A run that failed partway and reversed itself is
+/// reported as its own outcome, never as success.
+fn layout_apply_job(
+    preview: LayoutPlan,
+    lib: PathBuf,
+    game: PathBuf,
+    mods: Vec<Mod>,
+    mut tx: futures::channel::mpsc::Sender<LayoutEvent>,
+) {
+    let progress_tx = std::sync::Arc::new(std::sync::Mutex::new(tx.clone()));
+    let progress = move |done: usize, total: usize| {
+        if let Ok(mut sender) = progress_tx.lock() {
+            let _ = sender.try_send(LayoutEvent::Progress { done, total });
+        }
+    };
+    let result = match layout_exec::apply_previewed(&lib, &game, &preview, &mods, &progress) {
+        Ok(ApplyOutcome::AlreadyLaidOut) => Ok(LayoutRunOutcome::AlreadyLaidOut),
+        Ok(ApplyOutcome::Migrated {
+            moves,
+            links,
+            backup,
+        }) => {
+            // The run's log path rides the state record
+            // the executor just wrote (status Swapped).
+            let log = layout_exec::standing_state()
+                .ok()
+                .flatten()
+                .map(|s| s.log_file.display().to_string())
+                .unwrap_or_else(|| "(run log path unavailable)".to_string());
+            Ok(LayoutRunOutcome::Migrated {
+                moves,
+                links,
+                backup: backup.display().to_string(),
+                log,
+            })
+        }
+        Err(e) => {
+            // A failure the executor already reversed
+            // leaves a FailedReversed record behind; that
+            // is a plain failure report, not an error of
+            // the job itself. Anything else (a refusal
+            // before any work, a reversal that itself met
+            // problems) is an error in the failure's own
+            // words.
+            let reversed = layout_exec::standing_state()
+                .ok()
+                .flatten()
+                .map(|s| s.status == MigrationStatus::FailedReversed)
+                .unwrap_or(false);
+            if reversed {
+                Ok(LayoutRunOutcome::FailedReversed(format!("{:#}", e)))
+            } else {
+                Err(format!("{:#}", e))
+            }
+        }
+    };
+    let _ = futures::executor::block_on(tx.send(LayoutEvent::ApplyFinished(result)));
+}
+
+/// Background job for a Layout page rollback, run on a
+/// worker thread: the same executor entry the CLI verb
+/// runs (`layout_exec::rollback_recorded`), audit refusal
+/// included. The outcome is translated into the page's
+/// own summary lines; a refusal stays an error in the
+/// executor's words.
+fn layout_rollback_job(mut tx: futures::channel::mpsc::Sender<LayoutEvent>) {
+    let result = match layout_exec::rollback_recorded() {
+        Ok(RollbackOutcome::NothingRecorded) => {
+            Ok("No layout migration is recorded — nothing to roll back.".to_string())
+        }
+        Ok(RollbackOutcome::AlreadyReversed) => Ok(
+            "That migration already failed and reversed itself — nothing to restore. The record was cleared."
+                .to_string(),
+        ),
+        Ok(RollbackOutcome::Restored) => Ok(
+            "Rollback complete: the pre-layout game folder is back in place and the library sort is undone."
+                .to_string(),
+        ),
+        Err(e) => Err(format!("{:#}", e)),
+    };
+    let _ = futures::executor::block_on(tx.send(LayoutEvent::RollbackFinished(result)));
 }
 
 /// Background job for one full library load, run on a worker

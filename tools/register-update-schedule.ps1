@@ -69,7 +69,7 @@ if ($Remove) {
 }
 
 if (-not (Test-Path $UpdateExe)) {
-    throw "update.exe not found at '$UpdateExe'. Pass -UpdateExe with the real path (the binary the release ships, beside fs-mod-manager.exe)."
+    throw "update.exe not found at '$UpdateExe'. Pass -UpdateExe with the real path (the binary the release ships, beside playground.exe)."
 }
 $ExePath = (Resolve-Path $UpdateExe).Path
 $ExeDir = Split-Path $ExePath

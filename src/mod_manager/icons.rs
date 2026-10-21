@@ -286,12 +286,7 @@ fn read_wild_candidates(mod_path: &Path) -> Vec<(String, Vec<u8>)> {
 // caller after each icon job.
 
 pub fn icon_cache_dir() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(
-        home.join(".config")
-            .join("fs-mod-manager")
-            .join("icon-cache"),
-    )
+    Some(crate::paths::data_dir()?.join("icon-cache"))
 }
 
 /// The cache key for a mod file, or None if it can't be

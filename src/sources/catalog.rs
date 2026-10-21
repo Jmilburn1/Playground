@@ -31,14 +31,9 @@ pub const DEFAULT_CATALOG_URL: &str =
 pub const CACHE_TTL_HOURS: u64 = 24;
 
 /// The cache lives beside config.toml:
-/// ~/.config/fs-mod-manager/catalog-cache.json
+/// ~/.config/playground/catalog-cache.json
 pub fn cache_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(
-        home.join(".config")
-            .join("fs-mod-manager")
-            .join("catalog-cache.json"),
-    )
+    Some(crate::paths::data_dir()?.join("catalog-cache.json"))
 }
 
 /// The cached catalog, if one has ever been downloaded.
@@ -94,7 +89,7 @@ pub fn fetch_urls(url: &str) -> Vec<String> {
 /// catalog.
 pub async fn fetch(url: &str) -> Result<Catalog> {
     let client = reqwest::Client::builder()
-        .user_agent("Playground-FS-Mod-Manager/1.0 (catalog reader)")
+        .user_agent("Playground/1.0 (catalog reader)")
         .build()
         .context("Could not build the catalog HTTP client")?;
     let mut last_err: Option<anyhow::Error> = None;

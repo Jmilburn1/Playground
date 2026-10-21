@@ -326,7 +326,10 @@ impl ModManager {
     ///   no readable modDesc) is a file-mod candidate at
     ///   both levels too — `Mod::new` gives it the same
     ///   filename-based fallback record an unparseable
-    ///   zip gets, and a library holding one must not
+    ///   zip gets, with the one exception that its
+    ///   category is the kind-assigned "DLC's" (owner
+    ///   ruling, 2026-10-21: the layout homes it under
+    ///   that folder), and a library holding one must not
     ///   lose it from the list when it is laid out
     ///   (owner's strawHarvestPack.dlc, 2026-10-21);
     /// - a root folder holding a `modDesc.xml` at its top
@@ -1970,14 +1973,15 @@ mod tests {
             );
             // DLC packs (owner's strawHarvestPack.dlc,
             // 2026-10-21): one at the root in BOTH worlds
-            // — the layout engine plans no move for a
-            // .dlc, so the root is where it stays — and
-            // one filed under Other when migrated, at
+            // — a root pack must list identically before
+            // and after a migration pass homes it — and
+            // one filed under DLC's when migrated (its
+            // kind-assigned home since the DLC rider), at
             // the root when flat. Both must list in both
             // worlds, or the migrated list loses records
             // the flat list has.
             write_dlc_file(&lib.join("EqDlcPack.dlc"));
-            write_dlc_file(&at(&lib, "Other", "EqFiledDlc.dlc"));
+            write_dlc_file(&at(&lib, "DLC's", "EqFiledDlc.dlc"));
             // Active set: the tractor and the folder mod,
             // plus a game-only mod — the same in both
             // worlds (links after migration, copies
@@ -2038,8 +2042,10 @@ mod tests {
         );
         // And the trees really do differ underneath: the
         // migrated records point into category folders —
-        // all but the root DLC pack, which the layout
-        // files nowhere and which therefore stays home.
+        // all but the root DLC pack, which the fixture
+        // plants at the root in both worlds (a migration
+        // pass would home it under DLC's; the scan must
+        // not care where it sits).
         assert!(mig_mods
             .iter()
             .filter(|m| m.path.starts_with(&mig_lib))
@@ -2047,9 +2053,11 @@ mod tests {
             .all(|m| m.path.parent() != Some(mig_lib.as_path())));
 
         // The DLC packs list in both worlds with the
-        // fallback record shape: the file name for a
-        // name, the default version, Uncategorized,
-        // Archived, type Unknown.
+        // fallback record shape — the file name for a
+        // name, the default version, Archived, type
+        // Unknown — except the category, which is the
+        // kind-assigned DLC's (owner ruling, 2026-10-21),
+        // never the Uncategorized fallback.
         for mods in [&flat_mods, &mig_mods] {
             for name in ["EqDlcPack.dlc", "EqFiledDlc.dlc"] {
                 let rec = mods
@@ -2058,7 +2066,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("{} missing from the scan", name));
                 assert_eq!(rec.name, name);
                 assert_eq!(rec.version, "1.0.0");
-                assert_eq!(rec.categories, vec!["Uncategorized".to_string()]);
+                assert_eq!(rec.categories, vec!["DLC's".to_string()]);
                 assert_eq!(rec.state, ModState::Archived);
                 assert_eq!(rec.mod_type, ModType::Unknown);
             }

@@ -3,7 +3,7 @@
 //! database, the CLI verbs, the GUI); the binaries are
 //! thin entry points over it:
 //!
-//! - `fs-mod-manager` (src/main.rs) — the app: GUI, or the
+//! - `playground` (src/main.rs) — the app: GUI, or the
 //!   full CLI behind `cli`.
 //! - `update` (src/bin/update.rs) — the isolated update
 //!   program (owner, 2026-10-19): the fill and detect
@@ -16,6 +16,7 @@
 pub mod cli;
 pub mod config;
 pub mod mod_manager;
+pub mod paths;
 pub mod scanner;
 pub mod sources;
 pub mod ui;

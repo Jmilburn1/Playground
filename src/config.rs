@@ -130,9 +130,8 @@ impl Config {
     }
 
     fn config_path() -> anyhow::Result<PathBuf> {
-        let home = dirs::home_dir()
+        let config_dir = crate::paths::data_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-        let config_dir = home.join(".config").join("fs-mod-manager");
         std::fs::create_dir_all(&config_dir)?;
         Ok(config_dir.join("config.toml"))
     }

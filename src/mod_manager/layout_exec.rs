@@ -45,8 +45,7 @@ use super::layout::{self, LayoutPlan, LinkKind};
 /// Where this module's records live: the app config
 /// dir, beside the layout plan and the library database.
 fn store_dir() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".config").join("fs-mod-manager"))
+    crate::paths::data_dir()
 }
 
 /// The migration state file: present while a migration
@@ -947,12 +946,17 @@ fn verify_migration(
 /// Execute the plan's operations in order: category
 /// folders, archive renames, the staging farm, the
 /// verification, the swap. Every landed op is recorded
-/// before the next begins.
+/// before the next begins. `progress`, when given, is
+/// called after every landed op with (done, total) —
+/// the total counts every op this run will record:
+/// category folders to create, moves, staged links, and
+/// the two swap renames.
 fn execute(
     store: &StorePaths,
     state: &mut LayoutState,
     log: &mut RunLog,
     plan: &LayoutPlan,
+    progress: Option<&(dyn Fn(usize, usize) + Sync)>,
 ) -> Result<()> {
     // Pre-move sizes, measured off the copies about to
     // move (records can be stale; the files cannot).
@@ -970,6 +974,20 @@ fn execute(
         .collect();
     dirs.sort();
     dirs.dedup();
+    // The progress total: every op this run will record
+    // (see the fn docs). Counted before the first op
+    // lands, from the same facts execute acts on.
+    let total_ops = dirs.iter().filter(|d| !d.exists()).count()
+        + plan.moves.len()
+        + plan.links.len()
+        + 2;
+    let mut done_ops = 0usize;
+    let tick = |done_ops: &mut usize| {
+        *done_ops += 1;
+        if let Some(p) = progress {
+            p(*done_ops, total_ops);
+        }
+    };
     for d in dirs {
         if !d.exists() {
             std::fs::create_dir_all(&d)
@@ -981,6 +999,7 @@ fn execute(
                 CompletedOp::CreateDir { path: d.clone() },
                 &format!("[apply] created category folder {}", d.display()),
             )?;
+            tick(&mut done_ops);
         }
     }
 
@@ -1009,6 +1028,7 @@ fn execute(
                 mv.to.display()
             ),
         )?;
+        tick(&mut done_ops);
     }
 
     std::fs::create_dir(&state.staging_root).with_context(|| {
@@ -1038,6 +1058,7 @@ fn execute(
                 link.target.display()
             ),
         )?;
+        tick(&mut done_ops);
     }
 
     verify_migration(state, plan, &pre_sizes, log)?;
@@ -1059,6 +1080,7 @@ fn execute(
             state.backup_root.display()
         ),
     )?;
+    tick(&mut done_ops);
     if let Err(e) = std::fs::rename(&state.staging_root, &state.game_root) {
         // Put the original straight back before reporting.
         return match std::fs::rename(&state.backup_root, &state.game_root) {
@@ -1083,6 +1105,7 @@ fn execute(
         CompletedOp::SwapIn,
         "[apply] staging folder is now the game folder",
     )?;
+    tick(&mut done_ops);
     Ok(())
 }
 
@@ -1096,6 +1119,28 @@ pub fn apply(
     game_root: &Path,
     fresh_plan: &LayoutPlan,
     saved_plan: Option<LayoutPlan>,
+) -> Result<ApplyOutcome> {
+    apply_with_progress(
+        store,
+        library_root,
+        game_root,
+        fresh_plan,
+        saved_plan,
+        None,
+    )
+}
+
+/// [`apply`], with an optional progress sink: called
+/// after every landed operation with (done, total) op
+/// counts. The CLI passes None; the GUI Layout page
+/// passes its channel sender so the page can tick.
+pub fn apply_with_progress(
+    store: &StorePaths,
+    library_root: &Path,
+    game_root: &Path,
+    fresh_plan: &LayoutPlan,
+    saved_plan: Option<LayoutPlan>,
+    progress: Option<&(dyn Fn(usize, usize) + Sync)>,
 ) -> Result<ApplyOutcome> {
     if !library_root.is_dir() {
         anyhow::bail!("library folder {} does not exist", library_root.display());
@@ -1298,7 +1343,7 @@ pub fn apply(
         ),
     );
 
-    match execute(store, &mut state, &mut log, &work) {
+    match execute(store, &mut state, &mut log, &work, progress) {
         Ok(()) => {
             state.status = MigrationStatus::Swapped;
             save_state(&store.state, &state)?;
@@ -1483,6 +1528,76 @@ pub fn run_rollback() -> Result<()> {
     let store = prod_store_paths()?;
     rollback(&store)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// The GUI Layout page's glue (Roadmap #2, Phase 4) — the
+// same cores through the production store paths, with
+// the page's stricter contracts on top.
+// ---------------------------------------------------------------------
+
+/// The recorded migration state, if any: the Layout
+/// page's standing picture (not migrated / window open
+/// / failed-and-reversed), read from the same state
+/// file the CLI verbs write.
+pub fn standing_state() -> Result<Option<LayoutState>> {
+    let Some(path) = state_path() else {
+        return Ok(None);
+    };
+    load_state(&path)
+}
+
+/// Apply EXACTLY the plan the owner previewed and
+/// approved on the Layout page. Stricter than the CLI
+/// contract on purpose: the CLI executes the saved plan
+/// with a drift warning, but a GUI approval was given
+/// for specific counts — so a fresh census is built
+/// from the current records, and ANY difference from
+/// the previewed plan (or changed roots) refuses with
+/// "build a fresh plan" instead of running unapproved
+/// work. When the two plans agree, the previewed plan
+/// is the work list, and progress ticks through the
+/// sink as operations land.
+pub fn apply_previewed(
+    library_root: &Path,
+    game_root: &Path,
+    preview: &LayoutPlan,
+    mods: &[super::types::Mod],
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<ApplyOutcome> {
+    if preview.library_root != library_root || preview.game_root != game_root {
+        anyhow::bail!(
+            "the folders changed since this plan was built (it was made for library {}, \
+             game {}). Build a fresh plan for the current folders.",
+            preview.library_root.display(),
+            preview.game_root.display()
+        );
+    }
+    let fresh = layout::build_plan(library_root, game_root, mods);
+    if !plans_equivalent(preview, &fresh) {
+        anyhow::bail!(
+            "the library changed since this plan was built (mods added, removed, or \
+             changed). Build a fresh plan so the counts you approve are the work \
+             that runs."
+        );
+    }
+    let store = prod_store_paths()?;
+    apply_with_progress(
+        &store,
+        library_root,
+        game_root,
+        &fresh,
+        Some(preview.clone()),
+        Some(progress),
+    )
+}
+
+/// Roll back the recorded migration through the
+/// production store paths — the same semantics (and
+/// the same audit refusal) as `cli layout-rollback`.
+pub fn rollback_recorded() -> Result<RollbackOutcome> {
+    let store = prod_store_paths()?;
+    rollback(&store)
 }
 
 // ---------------------------------------------------------------------

@@ -1,5 +1,5 @@
 //! The command-line surface: every `cli` verb, shared by
-//! the app binary (`fs-mod-manager cli ...`) and the
+//! the app binary (`playground cli ...`) and the
 //! standalone update program (`update.exe`, src/bin/update.rs),
 //! which exposes the network-talking verbs — the fill
 //! (`update`) and ModHub detection (`detect-modhub`) —
@@ -113,7 +113,7 @@ pub fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<
         Some("saves") => {
             let slots = mod_manager.save_slots();
             if slots.is_empty() {
-                println!("No save slots found (is the active folder a game's mods folder?).");
+                println!("No save slots found (is the game mods folder a game's mods folder?).");
             }
             for s in &slots {
                 let loadout = mod_manager.save_loadout(&s.dir_name);
@@ -1256,8 +1256,8 @@ async fn catalog_updates_pass(mod_manager: &ModManager, standalone: bool) -> boo
 }
 
 fn print_help() {
-    println!("FS Mod Manager - Farming Simulator Mod Manager");
-    println!("Usage: fs-mod-manager [command] [args]");
+    println!("Playground - Farming Simulator Mod Manager");
+    println!("Usage: playground [command] [args]");
     println!("Commands:");
     println!("  cli scan - Scan all directories for mods");
     println!("  cli list - List all mods");

@@ -16,9 +16,9 @@ set for each savegame.
 Grab the pre-compiled Windows build from the
 [Releases](https://github.com/Jmilburn1/Playground/releases) page:
 
-1. Download `FS-Mod-Manager-Windows.zip` from the latest release.
+1. Download `Playground-Windows.zip` from the latest release.
 2. Unzip it anywhere.
-3. Double-click `fs-mod-manager.exe`.
+3. Double-click `playground.exe`.
 
 No Rust, no compiler, no terminal — and nothing to install. The exe is
 portable: run it from the unzipped folder, a USB stick, wherever.
@@ -27,9 +27,9 @@ portable: run it from the unzipped folder, a USB stick, wherever.
 
 Open the **Settings** tab and point Playground at your folders:
 
-- **Active** — your game's mods folder, e.g.
+- **Game mods folder** — your game's mods folder, e.g.
   `Documents\My Games\FarmingSimulator2025\mods`
-- **Archive** — wherever you keep the rest of your library, on any drive
+- **Library folder** — wherever you keep the rest of your library, on any drive
 
 Save, and Playground scans both folders.
 
@@ -60,7 +60,7 @@ yourself you need Rust (stable, MSVC) on Windows:
 
 ```bat
 cargo build --release
-target\release\fs-mod-manager.exe
+target\release\playground.exe
 ```
 
 ## Project structure

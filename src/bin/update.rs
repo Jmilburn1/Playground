@@ -22,8 +22,8 @@
 //! throttling tripwire halt — so schedulers and scripts
 //! can tell a halted pass from a clean one.
 
-use fs_mod_manager::config::Config;
-use fs_mod_manager::mod_manager::ModManager;
+use playground::config::Config;
+use playground::mod_manager::ModManager;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
 fn run(cli_args: &[String]) -> anyhow::Result<()> {
     let config = Config::load()?;
     let mut mod_manager = ModManager::new(config)?;
-    fs_mod_manager::cli::run_cli(&mut mod_manager, cli_args)
+    playground::cli::run_cli(&mut mod_manager, cli_args)
 }
 
 fn print_usage() {
