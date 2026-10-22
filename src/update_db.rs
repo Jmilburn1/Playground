@@ -265,6 +265,83 @@ impl FillSummary {
     }
 }
 
+/// The folder the scheduled fill's log files live in:
+/// `logs` inside the data folder.
+pub fn logs_dir() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("logs"))
+}
+
+/// The body of one fill's log file: when it started, the
+/// per-source results and the updates count on success,
+/// or the error on failure — a GIANTS tripwire halt names
+/// itself in its error chain, which is the line a reader
+/// of the log is looking for.
+pub fn fill_log_body(
+    started: chrono::DateTime<chrono::Local>,
+    result: &Result<FillSummary>,
+) -> String {
+    let mut out = format!(
+        "Playground update fill\nstarted: {} (unix {})\n",
+        started.format("%Y-%m-%d %H:%M:%S %Z"),
+        started.timestamp()
+    );
+    match result {
+        Ok(s) => {
+            out.push_str("result: completed\n");
+            out.push_str(&format!(
+                "rows: {} (ModHub {}, GitHub {}, other sites {}, no source {})\n",
+                s.total, s.modhub_rows, s.github_rows, s.other_rows, s.residue
+            ));
+            out.push_str(&format!("updates available: {}\n", s.updates_available));
+            out.push_str(&format!(
+                "ahead of source (downgrade-blocked): {}\n",
+                s.ahead_blocked
+            ));
+            out.push_str(&format!(
+                "rows whose latest version changed since the last fill: {}\n",
+                s.changed_since_last_fill
+            ));
+        }
+        Err(e) => {
+            out.push_str("result: FAILED\n");
+            out.push_str(&format!("error: {:#}\n", e));
+        }
+    }
+    out
+}
+
+/// Which fill-log file names a keep count prunes. Fill
+/// logs sort by name — the name carries the timestamp,
+/// so name order is time order; all but the newest
+/// `keep` go. Pure, for testing.
+pub fn fill_logs_to_prune(names: &[String], keep: usize) -> Vec<String> {
+    let mut logs: Vec<&String> = names
+        .iter()
+        .filter(|n| n.starts_with("fill-") && n.ends_with(".log"))
+        .collect();
+    logs.sort();
+    let excess = logs.len().saturating_sub(keep.max(1));
+    logs.iter().take(excess).map(|n| n.to_string()).collect()
+}
+
+/// Write one fill's log (`fill-<YYYYMMDD-HHMMSS>.log`)
+/// and prune the folder to the keep count. Best effort
+/// by design: a fill must never fail because its log
+/// could not be written, so every error here is swallowed.
+pub fn write_fill_log(dir: &std::path::Path, keep: usize, stamp: &str, body: &str) {
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(format!("fill-{}.log", stamp)), body);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        for name in fill_logs_to_prune(&names, keep) {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+    }
+}
+
 /// Copy a previous fill's facts into a row whose source
 /// section has halted (throttled) — the row keeps its
 /// previous state rather than being blanked.
@@ -714,6 +791,54 @@ mod tests {
     }
 
     #[test]
+    fn fill_log_pruning_keeps_the_newest() {
+        let names: Vec<String> = (1..=12)
+            .map(|i| format!("fill-202610{:02}-060000.log", i))
+            .collect();
+        let prune = fill_logs_to_prune(&names, 10);
+        assert_eq!(
+            prune,
+            vec![
+                "fill-20261001-060000.log".to_string(),
+                "fill-20261002-060000.log".to_string(),
+            ]
+        );
+        // At or under the keep count, nothing goes.
+        assert!(fill_logs_to_prune(&names[..10], 10).is_empty());
+        // Foreign files in the folder are never pruned.
+        let mut mixed = names.clone();
+        mixed.push("updates-summary.txt".to_string());
+        mixed.push("fill-notes.txt".to_string());
+        assert_eq!(fill_logs_to_prune(&mixed, 10), prune);
+        // A zero keep still keeps the newest one.
+        assert_eq!(fill_logs_to_prune(&names, 0).len(), 11);
+    }
+
+    #[test]
+    fn fill_log_body_reports_success_and_failure() {
+        let started = chrono::DateTime::from_timestamp(1_761_158_400, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let mut summary = FillSummary::default();
+        summary.total = 5;
+        summary.modhub_rows = 3;
+        summary.github_rows = 1;
+        summary.other_rows = 1;
+        summary.updates_available = 2;
+        let ok = fill_log_body(started, &Ok(summary));
+        assert!(ok.contains("result: completed"));
+        assert!(ok.contains("rows: 5 (ModHub 3, GitHub 1, other sites 1, no source 0)"));
+        assert!(ok.contains("updates available: 2"));
+
+        let err = fill_log_body(
+            started,
+            &Err(anyhow::anyhow!("TRIPWIRE: GIANTS ModHub throttled this fill (HTTP 403)")),
+        );
+        assert!(err.contains("result: FAILED"));
+        assert!(err.contains("TRIPWIRE"));
+    }
+
+    #[test]
     fn status_derivation_blocks_downgrades() {
         assert_eq!(status_of("1.2.0", Some("1.3.0")), "update_available");
         assert_eq!(status_of("1.3.0", Some("1.2.0")), "ahead_blocked");
@@ -929,6 +1054,16 @@ mod tests {
                 .into_iter()
                 .collect(),
                 catalog_url: String::new(),
+                startup_update_check: true,
+                self_update_enabled: true,
+                browse_default_view: "all".to_string(),
+                start_maximized: false,
+                auto_file_new_mods: false,
+                keep_download_history: true,
+                fill_log_keep: 10,
+                log_errors_only_default: false,
+                log_lines_cap: 3000,
+                launch: crate::config::LaunchConfig::default(),
             },
         };
         ModManager::new(config).unwrap()

@@ -800,10 +800,27 @@ pub fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<
 /// program. A tripwire abort inside the fill surfaces here
 /// as an error — the caller returns it from main, which is
 /// what makes the halt a nonzero exit.
+///
+/// Every fill also writes its log (owner, 2026-10-22:
+/// until now a scheduled fill left no written record, so
+/// a failed 2 AM fill was invisible): one file per fill
+/// in the data folder's logs/, pruned to the configured
+/// keep count. The write is best-effort and never changes
+/// the fill's own outcome.
 fn run_fill(mod_manager: &mut ModManager) -> anyhow::Result<()> {
+    let started = chrono::Local::now();
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async { crate::update_db::fill(mod_manager).await })?;
-    Ok(())
+    let result = runtime.block_on(async { crate::update_db::fill(mod_manager).await });
+    if let Some(dir) = crate::update_db::logs_dir() {
+        let body = crate::update_db::fill_log_body(started, &result);
+        crate::update_db::write_fill_log(
+            &dir,
+            mod_manager.fill_log_keep(),
+            &started.format("%Y%m%d-%H%M%S").to_string(),
+            &body,
+        );
+    }
+    result.map(|_| ())
 }
 
 /// What a ModHub detection pass did — returned so callers
@@ -1401,6 +1418,16 @@ mod tests {
                 mod_links: std::collections::HashMap::new(),
                 modhub_links: std::collections::HashMap::new(),
                 catalog_url: String::new(),
+                startup_update_check: true,
+                self_update_enabled: true,
+                browse_default_view: "all".to_string(),
+                start_maximized: false,
+                auto_file_new_mods: false,
+                keep_download_history: true,
+                fill_log_keep: 10,
+                log_errors_only_default: false,
+                log_lines_cap: 3000,
+                launch: crate::config::LaunchConfig::default(),
             },
         };
         let mut mm = ModManager::new(config).unwrap();

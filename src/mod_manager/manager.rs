@@ -80,6 +80,30 @@ fn copy_dir_all(source: &std::path::Path, dest: &std::path::Path) -> Result<()> 
     Ok(())
 }
 
+/// Everything the Settings page stages, committed in one
+/// config write by `ModManager::save_settings_page`
+/// (Round 2: the page is tabbed; the save model is still
+/// Round 1's — one explicit save for the whole page).
+pub struct PageSettings {
+    pub active_dir: PathBuf,
+    pub archive_dir: PathBuf,
+    pub check_conflicts: bool,
+    pub parallel_scans: usize,
+    pub cache_ttl_hours: u64,
+    pub catalog_url: String,
+    pub mod_sources: ModSources,
+    pub startup_update_check: bool,
+    pub self_update_enabled: bool,
+    pub browse_default_view: String,
+    pub start_maximized: bool,
+    pub auto_file_new_mods: bool,
+    pub keep_download_history: bool,
+    pub fill_log_keep: usize,
+    pub log_errors_only_default: bool,
+    pub log_lines_cap: usize,
+    pub launch: crate::config::LaunchConfig,
+}
+
 pub struct ModManager {
     config: Config,
     mods: HashMap<String, Mod>,
@@ -211,25 +235,14 @@ impl ModManager {
 
     /// Save the whole Settings page in one write: the two
     /// folders (created if needed, a leading `~` expanded)
-    /// plus every Library and Catalog & Sources value the
-    /// page stages. This is the page's one save model —
-    /// its Save folders button commits all of it through
-    /// the ordinary config save, and the caller starts the
-    /// rescan that applies the folders and the conflict
-    /// switch to the library.
-    #[allow(clippy::too_many_arguments)]
-    pub fn save_settings_page(
-        &mut self,
-        active_dir: PathBuf,
-        archive_dir: PathBuf,
-        check_conflicts: bool,
-        parallel_scans: usize,
-        cache_ttl_hours: u64,
-        catalog_url: String,
-        mod_sources: ModSources,
-    ) -> Result<()> {
-        let active_dir = crate::config::expand_tilde(&active_dir);
-        let archive_dir = crate::config::expand_tilde(&archive_dir);
+    /// plus every value the page stages, across all its
+    /// tabs. This is the page's one save model — its Save
+    /// button commits all of it through the ordinary config
+    /// save, and the caller starts the rescan that applies
+    /// the folders and the conflict switch to the library.
+    pub fn save_settings_page(&mut self, page: PageSettings) -> Result<()> {
+        let active_dir = crate::config::expand_tilde(&page.active_dir);
+        let archive_dir = crate::config::expand_tilde(&page.archive_dir);
         std::fs::create_dir_all(&active_dir)
             .with_context(|| format!("Failed to create active directory: {:?}", active_dir))?;
         std::fs::create_dir_all(&archive_dir)
@@ -238,14 +251,158 @@ impl ModManager {
         self.archive_dir = archive_dir.clone();
         self.config.settings.active_directory = active_dir;
         self.config.settings.archive_directory = archive_dir;
-        self.config.settings.check_conflicts = check_conflicts;
+        self.config.settings.check_conflicts = page.check_conflicts;
         self.config.settings.parallel_scans =
-            crate::config::clamp_parallel_scans(parallel_scans);
+            crate::config::clamp_parallel_scans(page.parallel_scans);
         self.config.settings.cache_ttl_hours =
-            crate::config::clamp_cache_ttl_hours(cache_ttl_hours);
-        self.config.settings.catalog_url = catalog_url.trim().to_string();
-        self.config.mod_sources = mod_sources;
+            crate::config::clamp_cache_ttl_hours(page.cache_ttl_hours);
+        self.config.settings.catalog_url = page.catalog_url.trim().to_string();
+        self.config.settings.startup_update_check = page.startup_update_check;
+        self.config.settings.self_update_enabled = page.self_update_enabled;
+        self.config.settings.browse_default_view = page.browse_default_view;
+        self.config.settings.start_maximized = page.start_maximized;
+        self.config.settings.auto_file_new_mods = page.auto_file_new_mods;
+        self.config.settings.keep_download_history = page.keep_download_history;
+        self.config.settings.fill_log_keep = page.fill_log_keep.max(1);
+        self.config.settings.log_errors_only_default = page.log_errors_only_default;
+        self.config.settings.log_lines_cap = page.log_lines_cap.max(1);
+        self.config.settings.launch = page.launch;
+        self.config.mod_sources = page.mod_sources;
         self.config.save()
+    }
+
+    /// Settings Round 2 accessors: the values the tabbed
+    /// page stages from, and the features the switches
+    /// govern read back.
+
+    /// General > Updates: check for mod updates at start-up.
+    pub fn startup_update_check(&self) -> bool {
+        self.config.settings.startup_update_check
+    }
+
+    /// General > Updates: the app self-update's launch
+    /// check is allowed to run.
+    pub fn self_update_enabled(&self) -> bool {
+        self.config.settings.self_update_enabled
+    }
+
+    /// General > Behavior: the stored Browse default-view
+    /// key ("all", "active", ..., "category:<name>").
+    pub fn browse_default_view(&self) -> String {
+        self.config.settings.browse_default_view.clone()
+    }
+
+    /// General > Behavior: start the main window maximized.
+    pub fn start_maximized(&self) -> bool {
+        self.config.settings.start_maximized
+    }
+
+    /// Library > Auto-Fill: file completed downloads into
+    /// the layout automatically.
+    pub fn auto_file_new_mods(&self) -> bool {
+        self.config.settings.auto_file_new_mods
+    }
+
+    /// Maintenance > Downloads: keep finished download
+    /// history across restarts.
+    pub fn keep_download_history(&self) -> bool {
+        self.config.settings.keep_download_history
+    }
+
+    /// Maintenance > Fill log: how many fill logs to keep.
+    pub fn fill_log_keep(&self) -> usize {
+        self.config.settings.fill_log_keep.max(1)
+    }
+
+    /// Diagnostics > Log Reader: open with the
+    /// errors/warnings-only filter on.
+    pub fn log_errors_only_default(&self) -> bool {
+        self.config.settings.log_errors_only_default
+    }
+
+    /// Diagnostics > Log Reader: trailing lines kept.
+    pub fn log_lines_cap(&self) -> usize {
+        self.config.settings.log_lines_cap.max(1)
+    }
+
+    /// General > Launch Configuration (the flags half; the
+    /// Developer Console half lives in game.xml).
+    pub fn launch_config(&self) -> crate::config::LaunchConfig {
+        self.config.settings.launch.clone()
+    }
+
+    /// Accounts > GitHub: a token resolves from the config's
+    /// GitHub source entry.
+    pub fn github_connected(&self) -> bool {
+        self.github_endpoint().1.is_some()
+    }
+
+    /// How many library copies already sit at their layout
+    /// target — the organized count the Settings Library
+    /// tab's Layout summary shows. Computed the census way
+    /// (see layout::build_plan's already_in_place), from
+    /// the scanned records alone: a record whose library
+    /// path IS its category home counts.
+    pub fn organized_count(&self) -> usize {
+        self.mods
+            .values()
+            .filter(|m| {
+                self.is_library_path(&m.path)
+                    && m.path == self.library_home_for(m)
+            })
+            .count()
+    }
+
+    /// Auto-Fill (Settings > Library): file one completed
+    /// mod into its layout home. Narrow and guarded, per
+    /// the ruling: the switch must be on, the library must
+    /// be in layout form, the mod's record must be its
+    /// library copy, and its home must be free — anything
+    /// else is a silent no-op (Ok(None)). On success the
+    /// copy moves (same library tree; copy-then-delete
+    /// across volumes) and a proven game-folder projection
+    /// is re-pointed at the new home; the record follows.
+    /// Returns a short note for the status line.
+    pub fn auto_file_mod(&mut self, mod_id: &str) -> Result<Option<String>> {
+        if !self.config.settings.auto_file_new_mods {
+            return Ok(None);
+        }
+        let Some(m) = self.mods.get(mod_id).cloned() else {
+            return Ok(None);
+        };
+        if !self.is_library_path(&m.path) || !self.library_in_layout_form() {
+            return Ok(None);
+        }
+        let home = self.library_home_for(&m);
+        if m.path == home || home.exists() {
+            return Ok(None);
+        }
+        let was_projection = self.game_entry_is_projection(&m);
+        if let Some(parent) = home.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create category folder: {:?}", parent)
+            })?;
+        }
+        move_path(&m.path, &home)
+            .with_context(|| format!("Failed to file {:?} into {:?}", m.path, home))?;
+        let mut fresh = m.clone();
+        fresh.path = home.clone();
+        // A proven projection must not be left reading the
+        // old home (for a hardlink the move kept the file,
+        // so it may already prove; for a junction it cannot).
+        if was_projection {
+            self.refresh_projection(&fresh);
+        }
+        let note = format!(
+            "Auto-Fill: {} filed under {}.",
+            fresh.file_name(),
+            home.parent()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        );
+        self.mods.insert(fresh.id.clone(), fresh);
+        Ok(Some(note))
     }
 
     /// Scan both folders into a fresh mod map without touching any
@@ -1597,6 +1754,16 @@ mod tests {
                 mod_links: std::collections::HashMap::new(),
                 modhub_links: std::collections::HashMap::new(),
                 catalog_url: String::new(),
+                startup_update_check: true,
+                self_update_enabled: true,
+                browse_default_view: "all".to_string(),
+                start_maximized: false,
+                auto_file_new_mods: false,
+                keep_download_history: true,
+                fill_log_keep: 10,
+                log_errors_only_default: false,
+                log_lines_cap: 3000,
+                launch: crate::config::LaunchConfig::default(),
             },
         };
         let mut manager = ModManager::new(config).unwrap();
@@ -1652,6 +1819,16 @@ mod tests {
                 mod_links: std::collections::HashMap::new(),
                 modhub_links: std::collections::HashMap::new(),
                 catalog_url: String::new(),
+                startup_update_check: true,
+                self_update_enabled: true,
+                browse_default_view: "all".to_string(),
+                start_maximized: false,
+                auto_file_new_mods: false,
+                keep_download_history: true,
+                fill_log_keep: 10,
+                log_errors_only_default: false,
+                log_lines_cap: 3000,
+                launch: crate::config::LaunchConfig::default(),
             },
         }
     }

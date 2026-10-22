@@ -13,7 +13,7 @@ pub mod game_files;
 
 use crate::config::Config;
 
-pub use manager::ModManager;
+pub use manager::{ModManager, PageSettings};
 pub use types::{Mod, ModState};
 pub use conflict::{Conflict, ConflictType};
 

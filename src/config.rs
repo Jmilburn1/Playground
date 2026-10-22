@@ -65,12 +65,140 @@ pub struct Settings {
     /// previously downloaded cache is still used).
     #[serde(default = "default_catalog_url")]
     pub catalog_url: String,
+    /// Settings Round 2 (owner, 2026-10-22): run the app's
+    /// update check (the ModHub detection pass) as part of
+    /// starting up. A user-pressed Rescan checks either way.
+    #[serde(default = "default_true")]
+    pub startup_update_check: bool,
+    /// Settings Round 2: the app self-update's launch check
+    /// (v1.5.0) may be switched off here. A manual "Check
+    /// now" on the Settings page works either way.
+    #[serde(default = "default_true")]
+    pub self_update_enabled: bool,
+    /// Settings Round 2: the Browse view a fresh launch
+    /// opens with, stored as a key (see
+    /// `browse_view_key` / the App's parsing): "all",
+    /// "active", "archived", "favorites", "updates", or
+    /// "category:<name>".
+    #[serde(default = "default_browse_default_view")]
+    pub browse_default_view: String,
+    /// Settings Round 2: start the main window maximized
+    /// (applied at the boot handover, once the ordinary
+    /// window shape has landed).
+    #[serde(default)]
+    pub start_maximized: bool,
+    /// Settings Round 2 (Library): when a download or
+    /// install completes into a laid-out library, file the
+    /// mod into its category home (and fix its projection)
+    /// automatically.
+    #[serde(default)]
+    pub auto_file_new_mods: bool,
+    /// Settings Round 2 (Maintenance): keep the Downloads
+    /// page's finished history across restarts (stored as
+    /// downloads-history.json in the data folder).
+    #[serde(default = "default_true")]
+    pub keep_download_history: bool,
+    /// Settings Round 2 (Maintenance): how many scheduled-
+    /// fill log files to keep in the data folder's logs/
+    /// directory; older fills' logs are pruned after a fill.
+    #[serde(default = "default_fill_log_keep")]
+    pub fill_log_keep: usize,
+    /// Settings Round 2 (Diagnostics): the Log Reader opens
+    /// with its errors/warnings-only filter already on.
+    #[serde(default)]
+    pub log_errors_only_default: bool,
+    /// Settings Round 2 (Diagnostics): how many trailing
+    /// log.txt lines the Log Reader keeps for display.
+    #[serde(default = "default_log_lines_cap")]
+    pub log_lines_cap: usize,
+    /// Settings Round 2 (General): the Launch Configuration
+    /// — the game-start settings Playground keeps and the
+    /// command they compose. Playground never runs the
+    /// command (owner ruling, 2026-10-22: no launch button).
+    #[serde(default)]
+    pub launch: LaunchConfig,
 }
 
 /// Serde default for Settings::catalog_url.
 fn default_catalog_url() -> String {
     crate::sources::catalog::DEFAULT_CATALOG_URL.to_string()
 }
+
+/// Serde default for the Round 2 switches that ship on.
+fn default_true() -> bool {
+    true
+}
+
+/// Serde default for Settings::browse_default_view.
+fn default_browse_default_view() -> String {
+    "all".to_string()
+}
+
+/// Serde default for Settings::fill_log_keep.
+fn default_fill_log_keep() -> usize {
+    10
+}
+
+/// Serde default for Settings::log_lines_cap.
+fn default_log_lines_cap() -> usize {
+    3000
+}
+
+/// The Launch Configuration (Settings, General — owner,
+/// 2026-10-22): the game-start options Playground keeps,
+/// in MT's shape but Playground's alone. The flags compose
+/// the Launch Command Preview (see `launch_command_preview`);
+/// nothing anywhere executes that command — there is no
+/// launch button. The Developer Console is NOT here: it
+/// acts through game.xml, and the page stages it beside
+/// these (see ModManager's settings-page save).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LaunchConfig {
+    /// Savegame slot to auto-start (1–20); None = unset.
+    #[serde(default)]
+    pub slot: Option<u8>,
+    /// -skipModUpdateDialog
+    #[serde(default)]
+    pub skip_mod_update_dialog: bool,
+    /// -cheats
+    #[serde(default)]
+    pub cheats: bool,
+    /// -autostart
+    #[serde(default)]
+    pub autostart: bool,
+    /// -skipStartVideos
+    #[serde(default)]
+    pub skip_start_videos: bool,
+}
+
+/// The Launch Command Preview: the game exe name plus the
+/// flags for the options that are set, in the owner's
+/// reference order — cheats, skip dialog, skip videos,
+/// autostart, savegame slot. A slot outside 1–20 composes
+/// nothing (the page refuses to save one; this keeps a
+/// hand-edited config honest too).
+pub fn launch_command_preview(launch: &LaunchConfig) -> String {
+    let mut cmd = String::from("FarmingSimulator2025.exe");
+    if launch.cheats {
+        cmd.push_str(" -cheats");
+    }
+    if launch.skip_mod_update_dialog {
+        cmd.push_str(" -skipModUpdateDialog");
+    }
+    if launch.skip_start_videos {
+        cmd.push_str(" -skipStartVideos");
+    }
+    if launch.autostart {
+        cmd.push_str(" -autostart");
+    }
+    if let Some(slot) = launch.slot {
+        if (1..=20).contains(&slot) {
+            cmd.push_str(&format!(" -autoStartSavegameId {}", slot));
+        }
+    }
+    cmd
+}
+
 
 /// Clamp the scan-parallelism setting to the range the
 /// Settings page offers: at least one scan worker, and no
@@ -200,6 +328,16 @@ impl Config {
                 mod_links: std::collections::HashMap::new(),
                 modhub_links: std::collections::HashMap::new(),
                 catalog_url: crate::sources::catalog::DEFAULT_CATALOG_URL.to_string(),
+                startup_update_check: true,
+                self_update_enabled: true,
+                browse_default_view: "all".to_string(),
+                start_maximized: false,
+                auto_file_new_mods: false,
+                keep_download_history: true,
+                fill_log_keep: 10,
+                log_errors_only_default: false,
+                log_lines_cap: 3000,
+                launch: LaunchConfig::default(),
             },
         }
     }
@@ -228,6 +366,74 @@ cache_ttl_hours = 24
         assert!(settings.check_conflicts);
         assert_eq!(settings.parallel_scans, 2);
         assert_eq!(settings.cache_ttl_hours, 24);
+    }
+
+    #[test]
+    fn round2_keys_default_when_absent() {
+        // A config.toml written before Round 2 carries none
+        // of the new keys; every one must land on its ruled
+        // default so the old file loads untouched.
+        let settings: Settings = toml::from_str(
+            r#"
+archive_directory = "/tmp/archive"
+active_directory = "/tmp/active"
+check_conflicts = true
+parallel_scans = 2
+cache_ttl_hours = 24
+"#,
+        )
+        .unwrap();
+        assert!(settings.startup_update_check);
+        assert!(settings.self_update_enabled);
+        assert_eq!(settings.browse_default_view, "all");
+        assert!(!settings.start_maximized);
+        assert!(!settings.auto_file_new_mods);
+        assert!(settings.keep_download_history);
+        assert_eq!(settings.fill_log_keep, 10);
+        assert!(!settings.log_errors_only_default);
+        assert_eq!(settings.log_lines_cap, 3000);
+        assert_eq!(settings.launch.slot, None);
+        assert!(!settings.launch.cheats);
+        assert!(!settings.launch.skip_mod_update_dialog);
+        assert!(!settings.launch.autostart);
+        assert!(!settings.launch.skip_start_videos);
+    }
+
+    #[test]
+    fn launch_preview_composes_only_what_is_set() {
+        let bare = LaunchConfig::default();
+        assert_eq!(launch_command_preview(&bare), "FarmingSimulator2025.exe");
+
+        let mut some = LaunchConfig::default();
+        some.cheats = true;
+        some.skip_start_videos = true;
+        assert_eq!(
+            launch_command_preview(&some),
+            "FarmingSimulator2025.exe -cheats -skipStartVideos"
+        );
+
+        // The owner's reference readout, fully loaded:
+        // flags in the ruled order, slot last.
+        let full = LaunchConfig {
+            slot: Some(3),
+            skip_mod_update_dialog: true,
+            cheats: true,
+            autostart: true,
+            skip_start_videos: true,
+        };
+        assert_eq!(
+            launch_command_preview(&full),
+            "FarmingSimulator2025.exe -cheats -skipModUpdateDialog \
+             -skipStartVideos -autostart -autoStartSavegameId 3"
+        );
+
+        // An out-of-range slot (hand-edited config) composes
+        // no flag at all.
+        let mut bad = LaunchConfig::default();
+        bad.slot = Some(0);
+        assert_eq!(launch_command_preview(&bad), "FarmingSimulator2025.exe");
+        bad.slot = Some(21);
+        assert_eq!(launch_command_preview(&bad), "FarmingSimulator2025.exe");
     }
 
     #[test]

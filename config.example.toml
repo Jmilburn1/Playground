@@ -39,3 +39,22 @@ check_conflicts = true
 parallel_scans = 4
 # Cache time-to-live in hours
 cache_ttl_hours = 24
+# Check for mod updates once at startup
+startup_update_check = true
+# Let Playground update itself when a new release is published
+self_update_enabled = true
+# Browse view shown at startup: all, active, archived, favorites,
+# updates, or category:<name>
+browse_default_view = "all"
+# Start with the window maximized
+start_maximized = false
+# File completed downloads/imports into the library layout automatically
+auto_file_new_mods = false
+# Keep download history between sessions
+keep_download_history = true
+# Number of scheduled-fill logs to keep
+fill_log_keep = 10
+# Log Reader: show errors only by default
+log_errors_only_default = false
+# Log Reader: maximum number of log lines loaded
+log_lines_cap = 3000

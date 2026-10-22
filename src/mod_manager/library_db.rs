@@ -67,6 +67,24 @@ pub fn db_path() -> Option<PathBuf> {
     Some(crate::paths::data_dir()?.join("library-db.json"))
 }
 
+/// Forget every stored fingerprint (Settings >
+/// Maintenance, "Re-read every mod"): the database file
+/// is removed, so the next scan finds no record to serve
+/// and parses every mod from its folder — the boot path's
+/// ordinary full-parse case, reached by emptying the
+/// cache rather than by a second scanner. The database
+/// is an accelerator only; removing it loses nothing but
+/// the memory. Returns true when a file was removed.
+pub fn clear_default() -> std::io::Result<bool> {
+    match db_path() {
+        Some(path) if path.exists() => {
+            std::fs::remove_file(path)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

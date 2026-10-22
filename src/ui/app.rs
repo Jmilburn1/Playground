@@ -12,23 +12,23 @@ use crate::mod_manager::layout_exec::{
 use crate::mod_manager::savegame::{self, CareerSettings, FarmFinances, RecordedMod};
 use crate::mod_manager::saves::SaveSlot;
 use crate::mod_manager::types::{Mod, ModState};
-use crate::mod_manager::ModManager;
+use crate::mod_manager::{ModManager, PageSettings};
 use crate::sources::github::GithubSource;
 use crate::ui::components::update_types::{UpdateInfo, UpdateState};
 use crate::ui::theme;
 use crate::update_db::{self, UpdateRow};
 use crate::ui::components::{
-    format_size, mod_card, BrowseView, DownloadEvent, DownloadJob,
-    DownloadJobState, DownloadRegistry, DropdownTick, FolderTarget,
-    LayoutEvent, LayoutRunOutcome, LoadEvent, LoadOutcome, LoadPhase,
-    LogKind, LogLine, LogOutcome, Message, ScanOutcome, SourceList, Tab,
-    UpdateDbPresentation, UpdateJudgement,
+    format_size, mod_card, BrowseView, DownloadEvent, DownloadHistoryEntry,
+    DownloadJob, DownloadJobState, DownloadRegistry, DropdownTick, FolderTarget,
+    LaunchSetting, LayoutEvent, LayoutRunOutcome, LoadEvent, LoadOutcome,
+    LoadPhase, LogKind, LogLine, LogOutcome, Message, ScanOutcome,
+    SettingsTab, SourceList, Tab, UpdateDbPresentation, UpdateJudgement,
 };
 use futures::SinkExt as _;
 use iced::widget::image::Handle as ImageHandle;
 use iced::widget::{
-    button, checkbox, column, container, progress_bar, row, scrollable, stack,
-    text, text_input, Scrollable, Space,
+    button, checkbox, column, container, pick_list, progress_bar, row,
+    scrollable, stack, text, text_input, Scrollable, Space,
 };
 use iced::{Element, Length, Size, Subscription, Task, Theme};
 use rayon::prelude::*;
@@ -438,6 +438,137 @@ struct PendingDownload {
     token: Option<String>,
 }
 
+/// The stored key for a Browse default view (Settings,
+/// General > Behavior) and back. Unknown keys — and a
+/// category key with no name — fall back to All: a
+/// hand-edited config can never strand a launch on a
+/// view that doesn't exist.
+fn browse_view_from_key(key: &str) -> BrowseView {
+    match key {
+        "active" => BrowseView::Active,
+        "archived" => BrowseView::Archived,
+        "favorites" => BrowseView::Favorites,
+        "updates" => BrowseView::Updates,
+        _ => match key.strip_prefix("category:") {
+            Some(name) if !name.is_empty() => {
+                BrowseView::Category(name.to_string())
+            }
+            _ => BrowseView::All,
+        },
+    }
+}
+
+/// `browse_view_from_key`'s other direction.
+fn browse_view_key(view: &BrowseView) -> String {
+    match view {
+        BrowseView::All => "all".to_string(),
+        BrowseView::Active => "active".to_string(),
+        BrowseView::Archived => "archived".to_string(),
+        BrowseView::Favorites => "favorites".to_string(),
+        BrowseView::Updates => "updates".to_string(),
+        BrowseView::Category(name) => format!("category:{}", name),
+    }
+}
+
+/// Where the Downloads history file lives: beside the
+/// other stores in the data folder.
+fn download_history_path() -> Option<PathBuf> {
+    crate::paths::data_dir().map(|d| d.join("downloads-history.json"))
+}
+
+/// Read the stored Downloads history, when the file
+/// exists and parses. A missing or unreadable file is
+/// simply no history — never an error worth a launch.
+fn load_download_history() -> Option<Vec<DownloadHistoryEntry>> {
+    let path = download_history_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Replace the user's home path with its masked form
+/// ("C:\Users\<user>\...", "/home/<user>/...") everywhere
+/// it appears — the Diagnostics summary is text a user
+/// may paste somewhere public, and it prints real paths
+/// (data folder, catalog cache). Pure, for testing.
+fn scrub_home_prefix(text: &str, home: &std::path::Path) -> String {
+    let home = home.to_string_lossy();
+    if home.is_empty() {
+        return text.to_string();
+    }
+    let masked = match std::path::Path::new(home.as_ref()).parent() {
+        Some(parent) => format!(
+            "{}{}{}",
+            parent.to_string_lossy(),
+            std::path::MAIN_SEPARATOR,
+            "<user>"
+        ),
+        None => "<user>".to_string(),
+    };
+    text.replace(home.as_ref(), &masked)
+}
+
+/// Ask Windows whether the scheduled fill's task is
+/// registered. None when the query cannot run at all
+/// (not Windows, or schtasks missing); Some(false) when
+/// it ran and the task is not there.
+#[cfg(windows)]
+fn query_fill_task_registered() -> Option<bool> {
+    std::process::Command::new("schtasks")
+        .args(["/query", "/tn", "Playground Update Fill"])
+        .output()
+        .ok()
+        .map(|out| out.status.success())
+}
+
+/// Non-Windows: there is no Task Scheduler to ask.
+#[cfg(not(windows))]
+fn query_fill_task_registered() -> Option<bool> {
+    None
+}
+
+/// Open a folder in the OS file explorer (creating it
+/// first — the fill-log folder may not exist yet).
+fn open_folder(path: &std::path::Path) -> std::io::Result<()> {
+    let _ = std::fs::create_dir_all(path);
+    spawn_opener(&path.to_string_lossy(), false)
+}
+
+/// Open a URL in the default browser.
+fn open_url(url: &str) -> std::io::Result<()> {
+    spawn_opener(url, true)
+}
+
+/// The platform opener: explorer / open / xdg-open.
+/// Spawning is fire-and-forget; only a spawn failure is
+/// an error worth reporting.
+#[cfg(windows)]
+fn spawn_opener(target: &str, is_url: bool) -> std::io::Result<()> {
+    if is_url {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", target])
+            .spawn()?;
+    } else {
+        // explorer returns 1 even on success; the spawn
+        // landing is all that can be known here.
+        std::process::Command::new("explorer").arg(target).spawn()?;
+    }
+    Ok(())
+}
+
+/// The platform opener (macOS).
+#[cfg(target_os = "macos")]
+fn spawn_opener(target: &str, _is_url: bool) -> std::io::Result<()> {
+    std::process::Command::new("open").arg(target).spawn()?;
+    Ok(())
+}
+
+/// The platform opener (other Unix).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_opener(target: &str, _is_url: bool) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open").arg(target).spawn()?;
+    Ok(())
+}
+
 pub struct App {
     mod_manager: ModManager,
     current_tab: Tab,
@@ -451,7 +582,10 @@ pub struct App {
     active_dir_input: String,
     archive_dir_input: String,
     /// Settings: the game install folder display + the console
-    /// switch state read from its game.xml (None = unknown).
+    /// switch state. Read from game.xml when the folder is
+    /// picked; since Round 2 the switch is a staged Settings
+    /// value (Launch Configuration) that writes game.xml when
+    /// the page saves. None = no switch state known.
     game_dir_input: String,
     console_on: Option<bool>,
     /// Settings page staging (Round 1): the Library and
@@ -464,6 +598,37 @@ pub struct App {
     settings_cache_ttl_input: String,
     settings_catalog_url_input: String,
     settings_sources: ModSources,
+    /// Settings page staging (Round 2): the tabbed page's
+    /// state. The open tab and the boxes' collapse state
+    /// are view state; every value below stages exactly
+    /// like Round 1's — nothing touches the config until
+    /// the page's one explicit save commits all of it at
+    /// once (see apply_directories / save_settings_page).
+    /// The Developer Console stages in `console_on` above:
+    /// since Round 2 it is a staged value too, written to
+    /// game.xml at save time.
+    settings_tab: SettingsTab,
+    settings_collapsed: HashSet<String>,
+    settings_startup_check: bool,
+    settings_self_update: bool,
+    settings_browse_default: BrowseView,
+    settings_start_maximized: bool,
+    settings_launch: crate::config::LaunchConfig,
+    settings_launch_slot_input: String,
+    settings_auto_file: bool,
+    settings_keep_history: bool,
+    settings_fill_log_keep_input: String,
+    settings_log_errors_only_default: bool,
+    settings_log_lines_cap_input: String,
+    /// The scheduled-fill task query's answer, once it has
+    /// run (Settings, General > Updates / Diagnostics):
+    /// None = not asked yet or the query cannot run here.
+    fill_task_registered: Option<bool>,
+    /// A "Check now" press is outstanding: when its check
+    /// answers with nothing, the status line says so (the
+    /// launch check stays silent by design; a manual one
+    /// was asked out loud).
+    app_update_check_manual: bool,
     /// A status note to show once the current load finishes
     /// (e.g. the folder switcher's gameSettings.xml result,
     /// which a rescan would otherwise overwrite).
@@ -626,10 +791,41 @@ impl App {
         let settings_cache_ttl_input = mod_manager.cache_ttl_hours().to_string();
         let settings_catalog_url_input = mod_manager.catalog_url();
         let settings_sources = mod_manager.mod_sources();
+        // Round 2 staging, read from the same config the
+        // page will write back on save.
+        let settings_startup_check = mod_manager.startup_update_check();
+        let settings_self_update = mod_manager.self_update_enabled();
+        let settings_browse_default =
+            browse_view_from_key(&mod_manager.browse_default_view());
+        let settings_start_maximized = mod_manager.start_maximized();
+        let settings_launch = mod_manager.launch_config();
+        let settings_launch_slot_input = settings_launch
+            .slot
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let settings_auto_file = mod_manager.auto_file_new_mods();
+        let settings_keep_history = mod_manager.keep_download_history();
+        let settings_fill_log_keep_input = mod_manager.fill_log_keep().to_string();
+        let settings_log_errors_only_default = mod_manager.log_errors_only_default();
+        let settings_log_lines_cap_input = mod_manager.log_lines_cap().to_string();
+        // The boot Browse view is the configured default —
+        // this constructor is the one place a launch reads
+        // it (a save mid-session never moves the view).
+        let boot_view = settings_browse_default.clone();
+        // Downloads history (Round 2): last session's
+        // finished rows come back when the setting keeps
+        // them; the stored file is read-only here — turning
+        // the setting off later leaves it untouched.
+        let mut downloads = DownloadRegistry::new();
+        if settings_keep_history {
+            if let Some(entries) = load_download_history() {
+                downloads.restore_history(entries);
+            }
+        }
         Self {
             mod_manager,
             current_tab: Tab::Browse,
-            view_filter: BrowseView::All,
+            view_filter: boot_view,
             search_query: String::new(),
             favorites_only: false,
             selected_mod: None,
@@ -645,6 +841,21 @@ impl App {
             settings_cache_ttl_input,
             settings_catalog_url_input,
             settings_sources,
+            settings_tab: SettingsTab::General,
+            settings_collapsed: HashSet::new(),
+            settings_startup_check,
+            settings_self_update,
+            settings_browse_default,
+            settings_start_maximized,
+            settings_launch,
+            settings_launch_slot_input,
+            settings_auto_file,
+            settings_keep_history,
+            settings_fill_log_keep_input,
+            settings_log_errors_only_default,
+            settings_log_lines_cap_input,
+            fill_task_registered: None,
+            app_update_check_manual: false,
             pending_status: None,
             status: "Loading mods…".to_string(),
             loading: true,
@@ -708,7 +919,7 @@ impl App {
             layout_total: 0,
             layout_outcome: None,
             layout_error: None,
-            downloads: DownloadRegistry::new(),
+            downloads,
             pending_downloads: HashMap::new(),
             app_update: None,
             app_update_installing: false,
@@ -1008,16 +1219,16 @@ impl App {
         }
     }
 
-    /// Save the folder inputs and rescan — the Settings tab's
-    /// Save button and the Browse pickers share this path.
-    /// The Settings page's one explicit save (its Save
-    /// folders button, and the folder pickers that have
-    /// always saved on pick): the folders AND every staged
-    /// Library / Catalog & Sources value commit together
-    /// through the config save, then the rescan the folder
-    /// save has always started applies them. A numeric
-    /// field that doesn't parse refuses the whole save —
-    /// nothing is written half-way.
+    /// Save the folder inputs and rescan — the Settings
+    /// page's Save button and the folder pickers share this
+    /// path. The page's one explicit save: the folders AND
+    /// every staged value across all its tabs commit
+    /// together through the one config write, then the
+    /// rescan the folder save has always started applies
+    /// them. A numeric field that doesn't parse refuses
+    /// the whole save — nothing is written half-way. The
+    /// Developer Console is a staged value like the rest:
+    /// its game.xml write happens here, at save time.
     fn apply_directories(&mut self) -> Task<Message> {
         if self.loading {
             self.status =
@@ -1039,15 +1250,61 @@ impl App {
                     .to_string();
             return Task::none();
         };
-        match self.mod_manager.save_settings_page(
-            active,
-            archive,
-            self.settings_check_conflicts,
-            parallel,
-            cache_ttl,
-            self.settings_catalog_url_input.clone(),
-            self.settings_sources.clone(),
-        ) {
+        // The Launch Configuration's slot: empty is unset;
+        // anything present must be a whole slot number in
+        // range, or the save refuses like any bad number.
+        let slot_text = self.settings_launch_slot_input.trim();
+        let slot = if slot_text.is_empty() {
+            None
+        } else {
+            match slot_text.parse::<u8>() {
+                Ok(n) if (1..=20).contains(&n) => Some(n),
+                _ => {
+                    self.status =
+                        "Savegame slot must be a whole number from 1 to 20 (or empty) — nothing was saved."
+                            .to_string();
+                    return Task::none();
+                }
+            }
+        };
+        let Ok(fill_log_keep) =
+            self.settings_fill_log_keep_input.trim().parse::<usize>()
+        else {
+            self.status =
+                "Fill logs to keep must be a whole number (minimum 1) — nothing was saved."
+                    .to_string();
+            return Task::none();
+        };
+        let Ok(log_lines_cap) =
+            self.settings_log_lines_cap_input.trim().parse::<usize>()
+        else {
+            self.status =
+                "Log lines to keep must be a whole number (minimum 1) — nothing was saved."
+                    .to_string();
+            return Task::none();
+        };
+        let mut launch = self.settings_launch.clone();
+        launch.slot = slot;
+        let page = PageSettings {
+            active_dir: active,
+            archive_dir: archive,
+            check_conflicts: self.settings_check_conflicts,
+            parallel_scans: parallel,
+            cache_ttl_hours: cache_ttl,
+            catalog_url: self.settings_catalog_url_input.clone(),
+            mod_sources: self.settings_sources.clone(),
+            startup_update_check: self.settings_startup_check,
+            self_update_enabled: self.settings_self_update,
+            browse_default_view: browse_view_key(&self.settings_browse_default),
+            start_maximized: self.settings_start_maximized,
+            auto_file_new_mods: self.settings_auto_file,
+            keep_download_history: self.settings_keep_history,
+            fill_log_keep,
+            log_errors_only_default: self.settings_log_errors_only_default,
+            log_lines_cap,
+            launch,
+        };
+        match self.mod_manager.save_settings_page(page) {
             Ok(()) => {
                 // Show the values as saved (folders tilde-
                 // expanded, numbers clamped to their ranges).
@@ -1060,12 +1317,116 @@ impl App {
                 self.settings_cache_ttl_input =
                     self.mod_manager.cache_ttl_hours().to_string();
                 self.settings_catalog_url_input = self.mod_manager.catalog_url();
+                self.settings_launch = self.mod_manager.launch_config();
+                self.settings_launch_slot_input = self
+                    .settings_launch
+                    .slot
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                self.settings_fill_log_keep_input =
+                    self.mod_manager.fill_log_keep().to_string();
+                self.settings_log_lines_cap_input =
+                    self.mod_manager.log_lines_cap().to_string();
+                // The staged console switch writes game.xml
+                // now, with the save. A failure rides the
+                // pending status (the rescan about to start
+                // would otherwise overwrite the note).
+                if let (Some(dir), Some(on)) =
+                    (self.mod_manager.game_directory(), self.console_on)
+                {
+                    if let Err(e) = game_files::set_console(&dir, on) {
+                        self.pending_status = Some(format!(
+                            "Settings saved, but the developer console switch in game.xml was not changed: {}",
+                            e
+                        ));
+                    }
+                }
                 self.begin_load()
             }
             Err(e) => {
                 self.status = format!("Could not save settings: {}", e);
                 Task::none()
             }
+        }
+    }
+
+    /// Persist the Downloads page's finished history when
+    /// the setting keeps it (Round 2). When the setting is
+    /// off this writes nothing — and deletes nothing: the
+    /// stored file is left exactly as it was.
+    fn save_download_history(&self) {
+        if !self.mod_manager.keep_download_history() {
+            return;
+        }
+        let Some(path) = download_history_path() else {
+            return;
+        };
+        let entries = self.downloads.history_entries();
+        if let Ok(text) = serde_json::to_string_pretty(&entries) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    /// The scheduled-fill task query, as a task: it spawns
+    /// schtasks, which has no place on the UI thread.
+    fn query_fill_task(&self) -> Task<Message> {
+        Task::perform(
+            async move { query_fill_task_registered() },
+            Message::FillTaskStatus,
+        )
+    }
+
+    /// The Diagnostics summary (Settings, Diagnostics):
+    /// the app's vital signs in plain text — and already
+    /// scrubbed of the user's home path, because this is
+    /// the text Copy / Export hand to the world.
+    fn diagnostics_summary(&self) -> String {
+        let total = self.mod_manager.get_mods().len();
+        let active = self.mod_manager.get_mods_by_state(ModState::Active).len();
+        let archived = self
+            .mod_manager
+            .get_mods_by_state(ModState::Archived)
+            .len();
+        let data_dir = crate::paths::data_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let catalog = match crate::sources::catalog::cache_path() {
+            Some(path) => match std::fs::metadata(&path) {
+                Ok(meta) => format!(
+                    "{} ({})",
+                    format_size(meta.len()),
+                    path.display()
+                ),
+                Err(_) => "not downloaded yet".to_string(),
+            },
+            None => "unknown".to_string(),
+        };
+        let fill = match self.fill_task_registered {
+            Some(true) => "registered (daily 06:00, 14:00, 22:00)",
+            Some(false) => "not registered",
+            None => "unknown",
+        };
+        let text = format!(
+            "Playground diagnostics\n\
+             Version: {}\n\
+             OS: {} ({})\n\
+             Data folder: {}\n\
+             Library: {} mods — {} active, {} archived\n\
+             ModHub catalog cache: {}\n\
+             Scheduled fill: {}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            data_dir,
+            total,
+            active,
+            archived,
+            catalog,
+            fill,
+        );
+        match dirs::home_dir() {
+            Some(home) => scrub_home_prefix(&text, &home),
+            None => text,
         }
     }
 
@@ -1126,6 +1487,7 @@ impl App {
         match self.mod_manager.profile_dir() {
             Some(profile) => {
                 self.log_note = "Reading log.txt…".to_string();
+                let cap = self.mod_manager.log_lines_cap();
                 let stems: Vec<(String, String)> = self
                     .mod_manager
                     .get_mods()
@@ -1142,7 +1504,7 @@ impl App {
                     })
                     .collect();
                 Task::perform(
-                    async move { log_job(profile, stems) },
+                    async move { log_job(profile, stems, cap) },
                     Message::LogLoaded,
                 )
             }
@@ -1821,8 +2183,18 @@ impl App {
                     // still fires exactly once per launch.
                     self.booting = false;
                     let restore = Self::restore_window();
-                    if self.detect_after_scan {
-                        self.detect_after_scan = false;
+                    // The start-up update check (Settings >
+                    // General > Updates, Round 2), gated by
+                    // its switch: the detection pass runs
+                    // once the app is up, exactly as it does
+                    // behind a rescan. A rescan asks for the
+                    // pass itself (detect_after_scan) and gets
+                    // it in either switch state — the switch
+                    // gates the launch-time check only.
+                    let detect = self.detect_after_scan
+                        || self.mod_manager.startup_update_check();
+                    self.detect_after_scan = false;
+                    if detect {
                         return Task::batch(vec![self.start_detect(), restore]);
                     }
                     return restore;
@@ -2301,10 +2673,32 @@ impl App {
                             Ok(change) => {
                                 self.update_status.insert(id.clone(), UpdateState::UpToDate);
                                 self.recompute_conflicts();
-                                self.status = format!(
+                                let mut status = format!(
                                     "Updated {} ({}).",
                                     name, change
                                 );
+                                // Auto-Fill (Settings >
+                                // Library): the completed mod
+                                // is filed into its layout
+                                // home when the switch and the
+                                // layout allow. Its outcome
+                                // rides the status — it can
+                                // never fail the install that
+                                // already succeeded.
+                                match self.mod_manager.auto_file_mod(&id) {
+                                    Ok(Some(note)) => {
+                                        status.push(' ');
+                                        status.push_str(&note);
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        status.push_str(&format!(
+                                            " Auto-Fill could not file it: {}",
+                                            e
+                                        ));
+                                    }
+                                }
+                                self.status = status;
                                 if let Some(job) = job {
                                     self.downloads.finish(job, Ok(()));
                                 }
@@ -2328,6 +2722,10 @@ impl App {
                         self.update_status.insert(id, UpdateState::Failed(e));
                     }
                 }
+                // A job may have finished above: the
+                // Downloads history file follows the
+                // registry (a no-op when the setting is off).
+                self.save_download_history();
                 // The wire is free: a queued download starts
                 // now, alongside the icon refresh as before.
                 return Task::batch([
@@ -2346,6 +2744,7 @@ impl App {
             },
             Message::ClearFinishedDownloads => {
                 self.downloads.clear_finished();
+                self.save_download_history();
             }
             Message::AppUpdateCheckDone(found) => {
                 // The launch check's only voice: a newer
@@ -2353,7 +2752,16 @@ impl App {
                 // (None) leaves the app exactly as it was.
                 if let Some(release) = found {
                     self.app_update = Some(release);
+                } else if self.app_update_check_manual {
+                    // A "Check now" was asked out loud, so
+                    // silence would read as broken: confirm
+                    // the up-to-date answer in the status.
+                    self.status = format!(
+                        "Playground is up to date (v{}).",
+                        env!("CARGO_PKG_VERSION")
+                    );
                 }
+                self.app_update_check_manual = false;
             }
             Message::DismissAppUpdate => {
                 self.app_update = None;
@@ -2614,6 +3022,14 @@ impl App {
                 if tab == Tab::Log {
                     return self.begin_log_load();
                 }
+                if tab == Tab::Settings {
+                    // The Updates box and the Diagnostics
+                    // summary both report the scheduled
+                    // fill's registration; ask Windows once
+                    // per opening of the page.
+                    self.fill_task_registered = None;
+                    return self.query_fill_task();
+                }
             }
             Message::BrowseViewChanged(view) => {
                 self.show_menu_open = false;
@@ -2743,8 +3159,6 @@ impl App {
                     );
                 }
             }
-            Message::ActiveDirChanged(value) => self.active_dir_input = value,
-            Message::ArchiveDirChanged(value) => self.archive_dir_input = value,
             Message::SaveDirectories => return self.apply_directories(),
             Message::SettingsCheckConflictsToggled(on) => {
                 self.settings_check_conflicts = on
@@ -2766,6 +3180,140 @@ impl App {
                 };
                 if let Some(source) = entries.get_mut(index) {
                     source.enabled = enabled;
+                }
+            }
+            Message::SettingsTabSelected(tab) => {
+                self.settings_tab = tab;
+                if tab == SettingsTab::Diagnostics
+                    && self.fill_task_registered.is_none()
+                {
+                    return self.query_fill_task();
+                }
+            }
+            Message::SettingsToggleSection(id) => {
+                if !self.settings_collapsed.remove(&id) {
+                    self.settings_collapsed.insert(id);
+                }
+            }
+            Message::SettingsStartupCheckToggled(on) => {
+                self.settings_startup_check = on
+            }
+            Message::SettingsSelfUpdateToggled(on) => {
+                self.settings_self_update = on
+            }
+            Message::CheckAppUpdateNow => {
+                self.app_update_check_manual = true;
+                self.status = "Checking for a newer Playground…".to_string();
+                return Task::perform(
+                    app_update::check_at_launch(),
+                    Message::AppUpdateCheckDone,
+                );
+            }
+            Message::SettingsBrowseDefaultChanged(view) => {
+                self.settings_browse_default = view
+            }
+            Message::SettingsStartMaximizedToggled(on) => {
+                self.settings_start_maximized = on
+            }
+            Message::SettingsLaunchToggled(setting, on) => match setting {
+                // The console stages like every other value
+                // on the page now; game.xml is written when
+                // the page saves (see apply_directories).
+                LaunchSetting::Console => self.console_on = Some(on),
+                LaunchSetting::SkipModUpdateDialog => {
+                    self.settings_launch.skip_mod_update_dialog = on
+                }
+                LaunchSetting::Cheats => self.settings_launch.cheats = on,
+                LaunchSetting::AutoStart => self.settings_launch.autostart = on,
+                LaunchSetting::SkipStartVideos => {
+                    self.settings_launch.skip_start_videos = on
+                }
+            },
+            Message::SettingsLaunchSlotChanged(value) => {
+                self.settings_launch_slot_input = value
+            }
+            Message::SettingsAutoFileToggled(on) => {
+                self.settings_auto_file = on
+            }
+            Message::SettingsKeepHistoryToggled(on) => {
+                self.settings_keep_history = on
+            }
+            Message::SettingsFillLogKeepChanged(value) => {
+                self.settings_fill_log_keep_input = value
+            }
+            Message::SettingsLogErrorsOnlyDefaultToggled(on) => {
+                self.settings_log_errors_only_default = on
+            }
+            Message::SettingsLogLinesCapChanged(value) => {
+                self.settings_log_lines_cap_input = value
+            }
+            Message::FillTaskStatus(known) => {
+                self.fill_task_registered = known;
+            }
+            Message::OpenFolder(path) => {
+                if let Err(e) = open_folder(&path) {
+                    self.status =
+                        format!("Could not open {}: {}", path.display(), e);
+                }
+            }
+            Message::OpenUrl(url) => {
+                if let Err(e) = open_url(&url) {
+                    self.status = format!("Could not open {}: {}", url, e);
+                }
+            }
+            Message::CopyDiagnostics => {
+                self.status = "Diagnostics copied to the clipboard.".to_string();
+                return iced::clipboard::write(self.diagnostics_summary());
+            }
+            Message::ExportDiagnostics => {
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Export diagnostics")
+                            .set_file_name("playground-diagnostics.txt")
+                            .add_filter("Text", &["txt"])
+                            .save_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::DiagnosticsExported,
+                );
+            }
+            Message::DiagnosticsExported(picked) => {
+                if let Some(path) = picked {
+                    match std::fs::write(&path, self.diagnostics_summary()) {
+                        Ok(()) => {
+                            self.status = format!(
+                                "Diagnostics exported to {}.",
+                                path.display()
+                            )
+                        }
+                        Err(e) => {
+                            self.status =
+                                format!("Could not export diagnostics: {}", e)
+                        }
+                    }
+                }
+            }
+            Message::RereadEveryMod => {
+                if self.loading {
+                    self.status =
+                        "Still loading — wait for it to finish before re-reading."
+                            .to_string();
+                } else {
+                    match crate::mod_manager::library_db::clear_default() {
+                        Ok(_) => {
+                            self.status =
+                                "Re-reading every mod from its folder…".to_string();
+                            return self.begin_load();
+                        }
+                        Err(e) => {
+                            self.status = format!(
+                                "Could not clear the library database: {}",
+                                e
+                            );
+                        }
+                    }
                 }
             }
             Message::BrowseFolder(target) => {
@@ -2861,25 +3409,6 @@ impl App {
                     }
                 }
             }
-            Message::ToggleConsole(on) => match self.mod_manager.game_directory() {
-                Some(dir) => match game_files::set_console(&dir, on) {
-                    Ok(()) => {
-                        self.console_on = Some(on);
-                        self.status = format!(
-                            "Developer console {} (game.xml).",
-                            if on { "on" } else { "off" }
-                        );
-                    }
-                    Err(e) => {
-                        self.status =
-                            format!("Could not change the console setting: {}", e)
-                    }
-                },
-                None => {
-                    self.status = "Set the game install folder first — the console switch lives in its game.xml."
-                        .to_string()
-                }
-            },
             Message::RefreshLog => return self.begin_log_load(),
             Message::LogLoaded(outcome) => match outcome {
                 Ok(o) => {
@@ -2889,6 +3418,12 @@ impl App {
                     self.log_warning_count = o.warning_count;
                     self.log_total_lines = o.total_lines;
                     self.log_note = String::new();
+                    // The reader opens as the Diagnostics
+                    // default says (Round 2): with the
+                    // errors/warnings-only filter already
+                    // applied when the setting has it on.
+                    self.log_errors_only =
+                        self.mod_manager.log_errors_only_default();
                 }
                 Err(e) => {
                     self.log_lines = Vec::new();
@@ -2993,6 +3528,12 @@ impl App {
                     return Task::none();
                 };
                 self.window_restore = RestoreState::Settled;
+                // "Start maximized" (Settings > General >
+                // Behavior, Round 2): the restore has settled
+                // either way at this point in the handover —
+                // the one place a launch may grow the window
+                // past its restored size.
+                let maximize = self.mod_manager.start_maximized();
                 if Self::still_splash_sized(size) {
                     // The batched restore demonstrably
                     // never landed, so issue it once more.
@@ -3007,11 +3548,18 @@ impl App {
                     // choreography. One check, at most
                     // one re-issue, per boot: no retry
                     // loop.
-                    return Task::batch(vec![
+                    let mut tasks = vec![
                         iced::window::toggle_decorations(id),
                         iced::window::resize(id, Size::new(1280.0, 800.0)),
                         Self::center_main_window(id),
-                    ]);
+                    ];
+                    if maximize {
+                        tasks.push(iced::window::maximize(id, true));
+                    }
+                    return Task::batch(tasks);
+                }
+                if maximize {
+                    return iced::window::maximize(id, true);
                 }
             }
             Message::ToggleShowMenu => {
@@ -5400,6 +5948,16 @@ impl App {
         col.into()
     }
 
+    /// Settings (Round 2, owner 2026-10-22): the tabbed
+    /// page modeled on Silo's tabs — General / Mods folder
+    /// / Library / Accounts / Diagnostics / Maintenance /
+    /// About — with collapsible menu-black boxes under the
+    /// strip. Everything editable on every tab stages in
+    /// the App and commits through the page's one explicit
+    /// save (the footer row, visible on every tab); boxes a
+    /// later build will fill carry the owner's placeholder
+    /// text and no dead controls. The scroll keeps the
+    /// Settings standard (page_scroll_pad 20).
     fn settings_view(&self) -> Element<'_, Message> {
         let total = self.mod_manager.get_mods().len();
         let active = self
@@ -5410,18 +5968,254 @@ impl App {
             .mod_manager
             .get_mods_by_state(ModState::Archived)
             .len();
-        let console_row: Element<'_, Message> =
-            match (self.mod_manager.game_directory(), self.console_on) {
-                (Some(_), Some(on)) => row![
-                    text(format!(
-                        "Developer console (game.xml): {}",
-                        if on { "On" } else { "Off" }
-                    )),
-                    button(text(if on { "Turn off" } else { "Turn on" }))
+
+        let tab_button = |tab: SettingsTab, label: &str| {
+            button(text(label.to_string()))
+                .style(theme::nav_pill(self.settings_tab == tab))
+                .on_press(Message::SettingsTabSelected(tab))
+        };
+        let tabs = row![
+            tab_button(SettingsTab::General, "General"),
+            tab_button(SettingsTab::ModsFolder, "Mods folder"),
+            tab_button(SettingsTab::Library, "Library"),
+            tab_button(SettingsTab::Accounts, "Accounts"),
+            tab_button(SettingsTab::Diagnostics, "Diagnostics"),
+            tab_button(SettingsTab::Maintenance, "Maintenance"),
+            tab_button(SettingsTab::About, "About"),
+        ]
+        .spacing(6);
+
+        let content: Element<'_, Message> = match self.settings_tab {
+            SettingsTab::General => self.settings_general_tab(),
+            SettingsTab::ModsFolder => self.settings_mods_folder_tab(),
+            SettingsTab::Library => self.settings_library_tab(),
+            SettingsTab::Accounts => self.settings_accounts_tab(),
+            SettingsTab::Diagnostics => self.settings_diagnostics_tab(),
+            SettingsTab::Maintenance => self.settings_maintenance_tab(),
+            SettingsTab::About => self.settings_about_tab(),
+        };
+
+        column![
+            text("Settings").size(20),
+            tabs,
+            page_scroll_pad(content, PAGE_MARGIN + SCROLLBAR_W)
+                .height(Length::Fill)
+                .width(Length::Fill),
+            // The footer row lives outside the scrollable
+            // and shows on every tab: the one save for the
+            // whole page, the library counts, and the
+            // standing Rescan. The same right pad aligns
+            // its edge with the boxes'.
+            row![
+                button(text("Save settings"))
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::SaveDirectories),
+                text(format!(
+                    "Mods: {} total — {} active, {} archived · Favorites: {}",
+                    total,
+                    active,
+                    archived,
+                    self.mod_manager.favorites_count()
+                )),
+                Space::with_width(Length::Fill),
+                button(text("Rescan folders"))
+                    .style(theme::danger_pill())
+                    .on_press(Message::Scan),
+            ]
+            .spacing(8)
+            .padding(iced::Padding {
+                right: PAGE_MARGIN + SCROLLBAR_W,
+                ..Default::default()
+            }),
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    /// One collapsible box on the Settings page: a header
+    /// row (a +/– affordance and the title) over the body,
+    /// in the menu-black section style. The collapse state
+    /// lives in the App, keyed by `id`.
+    fn settings_box<'a>(
+        &'a self,
+        id: &'static str,
+        title: &str,
+        body: Vec<Element<'a, Message>>,
+    ) -> Element<'a, Message> {
+        let collapsed = self.settings_collapsed.contains(id);
+        let header = row![
+            button(text(if collapsed { "+" } else { "–" }).size(14))
+                .style(theme::nav_pill(false))
+                .on_press(Message::SettingsToggleSection(id.to_string())),
+            text(title.to_string()).size(15),
+        ]
+        .spacing(8);
+        let mut col = column![header].spacing(7);
+        if !collapsed {
+            for el in body {
+                col = col.push(el);
+            }
+        }
+        container(col)
+            .width(Length::Fill)
+            .padding(11)
+            .style(wizard_section_box)
+            .into()
+    }
+
+    /// A folder row in the display-field pattern: the path
+    /// as read-only text, an Open folder button (greyed
+    /// when unset), and Change… through the folder picker.
+    /// The staged input behind it commits with the page
+    /// save, exactly as Round 1's fields did.
+    fn settings_path_row<'a>(
+        &'a self,
+        label: &'a str,
+        value: &'a str,
+        target: FolderTarget,
+    ) -> Element<'a, Message> {
+        let shown = if value.is_empty() { "Not set" } else { value };
+        let path = if value.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        };
+        column![
+            text(label).size(13),
+            row![
+                text(shown.to_string()).width(Length::Fill),
+                button(text("Open folder"))
+                    .style(theme::nav_pill(true))
+                    .on_press_maybe(path.map(Message::OpenFolder)),
+                button(text("Change…"))
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::BrowseFolder(target)),
+            ]
+            .spacing(8),
+        ]
+        .spacing(4)
+        .into()
+    }
+
+    /// A box the page is not ready to fill yet: the
+    /// owner's placeholder rule — the box exists under its
+    /// real title with the placeholder text and no controls
+    /// that pretend to work.
+    fn settings_placeholder<'a>(
+        &'a self,
+        id: &'static str,
+        title: &str,
+    ) -> Element<'a, Message> {
+        self.settings_box(
+            id,
+            title,
+            vec![text("under construction").size(13).into()],
+        )
+    }
+
+    /// General: start-up behaviour, the Launch
+    /// Configuration, and the placeholder boxes.
+    fn settings_general_tab(&self) -> Element<'_, Message> {
+        let fill_line = match self.fill_task_registered {
+            Some(true) => "Scheduled fill: the Windows task \"Playground Update Fill\" is registered.",
+            Some(false) => {
+                "Scheduled fill: the Windows task \"Playground Update Fill\" is not registered."
+            }
+            None => {
+                "Scheduled fill: registration could not be checked here."
+            }
+        };
+        let updates = self.settings_box(
+            "general-updates",
+            "Updates",
+            vec![
+                checkbox(
+                    "Check for updates at start-up",
+                    self.settings_startup_check,
+                )
+                .on_toggle(Message::SettingsStartupCheckToggled)
+                .into(),
+                text("Runs the update check once when Playground starts. The Rescan button always runs it too.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+                row![
+                    checkbox(
+                        "Playground self-update",
+                        self.settings_self_update,
+                    )
+                    .on_toggle(Message::SettingsSelfUpdateToggled),
+                    button(text("Check now"))
                         .style(theme::nav_pill(true))
-                        .on_press(Message::ToggleConsole(!on)),
+                        .on_press(Message::CheckAppUpdateNow),
                 ]
                 .spacing(8)
+                .into(),
+                text("When on, a newer published Playground is offered at start-up. Check now runs the same check right away.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+                text(fill_line).size(13).into(),
+                text("The scheduled catalog fill (update.exe) runs daily at 06:00, 14:00 and 22:00.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
+
+        let mut view_options = vec![
+            BrowseView::All,
+            BrowseView::Active,
+            BrowseView::Archived,
+            BrowseView::Favorites,
+            BrowseView::Updates,
+        ];
+        let mut cats: Vec<String> = self
+            .mod_manager
+            .get_mods()
+            .into_iter()
+            .flat_map(|m| m.categories.iter().cloned())
+            .collect();
+        cats.sort();
+        cats.dedup();
+        view_options.extend(cats.into_iter().map(BrowseView::Category));
+        let behavior = self.settings_box(
+            "general-behavior",
+            "Behavior",
+            vec![
+                row![
+                    text("Browse opens showing:").size(13).width(220),
+                    pick_list(
+                        view_options,
+                        Some(self.settings_browse_default.clone()),
+                        Message::SettingsBrowseDefaultChanged,
+                    ),
+                ]
+                .spacing(8)
+                .into(),
+                checkbox("Start maximized", self.settings_start_maximized)
+                    .on_toggle(Message::SettingsStartMaximizedToggled)
+                    .into(),
+                text("Both apply from the next launch; saving never moves the window or the view in this one.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
+
+        // The Developer Console stages like every other
+        // value on the page now; its three states mirror
+        // Round 1's row (switch / no switch in game.xml /
+        // no game folder yet).
+        let console_row: Element<'_, Message> =
+            match (self.mod_manager.game_directory(), self.console_on) {
+                (Some(_), Some(on)) => checkbox(
+                    "Developer console (written to game.xml when the page saves)",
+                    on,
+                )
+                .on_toggle(|on| {
+                    Message::SettingsLaunchToggled(LaunchSetting::Console, on)
+                })
                 .into(),
                 (Some(_), None) => {
                     text("Developer console: no game.xml console switch found in the game folder.")
@@ -5429,115 +6223,190 @@ impl App {
                         .into()
                 }
                 (None, _) => {
-                    text("Developer console: set the game install folder to manage the console switch in game.xml.")
+                    text("Developer console: set the game install folder (Mods folder tab) to manage the console switch in game.xml.")
                         .size(13)
                         .into()
                 }
             };
-        let game_folder_label = if self.game_dir_input.is_empty() {
-            "Not set".to_string()
-        } else {
-            self.game_dir_input.clone()
-        };
-
-        // ---- Folders -----------------------------------
-        let folders = wizard_section(
-            "Folders",
+        // The preview reads the staged values, the slot
+        // from its field (an unparseable slot previews as
+        // unset; the save itself refuses it).
+        let slot = self
+            .settings_launch_slot_input
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|n| (1..=20).contains(n));
+        let preview = crate::config::launch_command_preview(
+            &crate::config::LaunchConfig {
+                slot,
+                ..self.settings_launch.clone()
+            },
+        );
+        let launch = self.settings_box(
+            "general-launch",
+            "Launch Configuration",
             vec![
-                text("Game mods folder (Browse also points the game here via gameSettings.xml):")
-                    .size(13)
-                    .into(),
-                row![
-                    text_input("Game mods folder path", &self.active_dir_input)
-                        .on_input(Message::ActiveDirChanged)
-                        .padding(8)
-                        .width(Length::Fill),
-                    button(text("Browse"))
-                        .style(theme::nav_pill(true))
-                        .on_press(Message::BrowseFolder(FolderTarget::Active)),
-                ]
-                .spacing(8)
-                .into(),
-                text("Library folder (stored mods):").size(13).into(),
-                row![
-                    text_input("Library folder path", &self.archive_dir_input)
-                        .on_input(Message::ArchiveDirChanged)
-                        .padding(8)
-                        .width(Length::Fill),
-                    button(text("Browse"))
-                        .style(theme::nav_pill(true))
-                        .on_press(Message::BrowseFolder(FolderTarget::Archive)),
-                ]
-                .spacing(8)
-                .into(),
-                text("Game install folder (holds game.xml):")
-                    .size(13)
-                    .into(),
-                row![
-                    text(game_folder_label),
-                    button(text("Browse"))
-                        .style(theme::nav_pill(true))
-                        .on_press(Message::BrowseFolder(FolderTarget::Game)),
-                ]
-                .spacing(8)
-                .into(),
                 console_row,
                 row![
-                    button(text("Save folders"))
-                        .style(theme::nav_pill(true))
-                        .on_press(Message::SaveDirectories),
-                    text("Save folders saves every setting on this page to config.toml.")
-                        .size(12)
-                        .color(theme::TEXT_DIM),
-                ]
-                .spacing(8)
-                .into(),
-            ],
-        );
-
-        // ---- Library -----------------------------------
-        let library = wizard_section(
-            "Library",
-            vec![
-                checkbox(
-                    "Check for conflicts",
-                    self.settings_check_conflicts,
-                )
-                .on_toggle(Message::SettingsCheckConflictsToggled)
-                .into(),
-                text("When off, conflicts are not computed and the Conflicts page shows none.")
-                    .size(12)
-                    .color(theme::TEXT_DIM)
-                    .into(),
-                row![
-                    text("Parallel scans (1–16):").size(13).width(220),
-                    text_input("4", &self.settings_parallel_input)
-                        .on_input(Message::SettingsParallelScansChanged)
-                        .padding(8)
-                        .width(90),
-                ]
-                .spacing(8)
-                .into(),
-                row![
-                    text("Cache lifetime (hours, minimum 1):")
+                    text("Savegame slot (1–20, empty = unset):")
                         .size(13)
-                        .width(220),
-                    text_input("24", &self.settings_cache_ttl_input)
-                        .on_input(Message::SettingsCacheTtlChanged)
+                        .width(300),
+                    text_input("", &self.settings_launch_slot_input)
+                        .on_input(Message::SettingsLaunchSlotChanged)
                         .padding(8)
                         .width(90),
                 ]
                 .spacing(8)
                 .into(),
-                text("The cache lifetime covers the downloaded ModHub catalog and the decoded icon cache.")
+                checkbox(
+                    "Skip mod update dialog",
+                    self.settings_launch.skip_mod_update_dialog,
+                )
+                .on_toggle(|on| Message::SettingsLaunchToggled(
+                    LaunchSetting::SkipModUpdateDialog,
+                    on,
+                ))
+                .into(),
+                checkbox("Enable cheats", self.settings_launch.cheats)
+                    .on_toggle(|on| Message::SettingsLaunchToggled(
+                        LaunchSetting::Cheats,
+                        on,
+                    ))
+                    .into(),
+                checkbox("Auto-start the savegame", self.settings_launch.autostart)
+                    .on_toggle(|on| Message::SettingsLaunchToggled(
+                        LaunchSetting::AutoStart,
+                        on,
+                    ))
+                    .into(),
+                checkbox(
+                    "Skip start videos",
+                    self.settings_launch.skip_start_videos,
+                )
+                .on_toggle(|on| Message::SettingsLaunchToggled(
+                    LaunchSetting::SkipStartVideos,
+                    on,
+                ))
+                .into(),
+                text("Launch command preview:").size(13).into(),
+                text(preview).size(13).color(theme::TEXT_DIM).into(),
+                text("A readout only — Playground never runs this command. The Developer Console acts through game.xml when the page saves.")
                     .size(12)
                     .color(theme::TEXT_DIM)
                     .into(),
             ],
         );
 
-        // ---- Catalog & Sources -------------------------
+        column![
+            updates,
+            behavior,
+            launch,
+            self.settings_placeholder("general-appearance", "General"),
+            self.settings_placeholder("general-graphics", "Graphics"),
+            self.settings_placeholder("general-game-screens", "Game Screens"),
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    /// Mods folder: the game's two folders as display
+    /// rows. The Developer Console no longer lives here —
+    /// it is staged under General > Launch Configuration.
+    fn settings_mods_folder_tab(&self) -> Element<'_, Message> {
+        let folders = self.settings_box(
+            "folders-paths",
+            "Folders",
+            vec![
+                self.settings_path_row(
+                    "Game mods folder (Browse also points the game here via gameSettings.xml):",
+                    &self.active_dir_input,
+                    FolderTarget::Active,
+                ),
+                self.settings_path_row(
+                    "Game install folder (holds game.xml):",
+                    &self.game_dir_input,
+                    FolderTarget::Game,
+                ),
+            ],
+        );
+        column![folders].spacing(10).into()
+    }
+
+    /// Library: the library folder row, the Layout
+    /// summary, Round 1's catalog & sources surfaces
+    /// re-homed unchanged, and Auto-Fill.
+    fn settings_library_tab(&self) -> Element<'_, Message> {
+        let library_folder = self.settings_box(
+            "library-folder",
+            "Library folder",
+            vec![self.settings_path_row(
+                "Library folder (stored mods):",
+                &self.archive_dir_input,
+                FolderTarget::Archive,
+            )],
+        );
+
+        let layout = self.settings_box(
+            "library-layout",
+            "Layout",
+            vec![
+                text(format!(
+                    "{} mods are filed under the library layout.",
+                    self.mod_manager.organized_count()
+                ))
+                .size(13)
+                .into(),
+                row![button(text("Open Layout page"))
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::TabSelected(Tab::Layout))]
+                .into(),
+                text("Organizing and rollback live on the Layout page; this is its standing count.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
+
+        // Round 1's Library box values ride along inside
+        // Catalog & Sources (the owner's re-homing): the
+        // conflict switch, the scan parallelism, and the
+        // cache lifetime sit above the catalog fields.
         let mut source_rows: Vec<Element<'_, Message>> = vec![
+            checkbox(
+                "Check for conflicts",
+                self.settings_check_conflicts,
+            )
+            .on_toggle(Message::SettingsCheckConflictsToggled)
+            .into(),
+            text("When off, conflicts are not computed and the Conflicts page shows none.")
+                .size(12)
+                .color(theme::TEXT_DIM)
+                .into(),
+            row![
+                text("Parallel scans (1–16):").size(13).width(220),
+                text_input("4", &self.settings_parallel_input)
+                    .on_input(Message::SettingsParallelScansChanged)
+                    .padding(8)
+                    .width(90),
+            ]
+            .spacing(8)
+            .into(),
+            row![
+                text("Cache lifetime (hours, minimum 1):")
+                    .size(13)
+                    .width(220),
+                text_input("24", &self.settings_cache_ttl_input)
+                    .on_input(Message::SettingsCacheTtlChanged)
+                    .padding(8)
+                    .width(90),
+            ]
+            .spacing(8)
+            .into(),
+            text("The cache lifetime covers the downloaded ModHub catalog and the decoded icon cache.")
+                .size(12)
+                .color(theme::TEXT_DIM)
+                .into(),
             text("Catalog URL (the published ModHub catalog):")
                 .size(13)
                 .into(),
@@ -5593,49 +6462,220 @@ impl App {
             }
         }
         source_rows.push(
-            text("Source names and URLs are shown as configured; this round only their on/off switches are editable here.")
+            text("Source names and URLs are shown as configured; only their on/off switches are editable here.")
                 .size(12)
                 .color(theme::TEXT_DIM)
                 .into(),
         );
-        let catalog = wizard_section("Catalog & Sources", source_rows);
+        let catalog = self.settings_box(
+            "library-catalog",
+            "Catalog & Sources",
+            source_rows,
+        );
 
-        let sections = column![folders, library, catalog].spacing(10);
+        let auto_fill = self.settings_box(
+            "library-autofill",
+            "Auto-Fill",
+            vec![
+                checkbox(
+                    "Auto-Fill: file new mods into the library layout automatically",
+                    self.settings_auto_file,
+                )
+                .on_toggle(Message::SettingsAutoFileToggled)
+                .into(),
+                text("When a download or import finishes and the library layout is active, the mod is filed into its category folder and linked into the game folder. With no layout in place, finished mods simply stay where they landed.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
+
+        column![library_folder, layout, catalog, auto_fill]
+            .spacing(10)
+            .into()
+    }
+
+    /// Accounts: the GitHub connection state, read-only
+    /// this round, and the Sharing placeholder.
+    fn settings_accounts_tab(&self) -> Element<'_, Message> {
+        let github = self.settings_box(
+            "accounts-github",
+            "GitHub",
+            vec![
+                text(if self.mod_manager.github_connected() {
+                    "Connected — GitHub updates use the token Playground already holds (the ModHub source's API key, or the GITHUB_TOKEN / GH_TOKEN environment variable)."
+                } else {
+                    "Not connected — no GitHub token is available to Playground."
+                })
+                .size(13)
+                .into(),
+                text("Read-only this round: there are no connect or disconnect controls yet.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
         column![
-            text("Settings").size(20),
-            // A deeper pad than the other pages (John,
-            // 2026-10-22: at PAGE_MARGIN the panels "blew
-            // out" the right side — flush against the bar
-            // along their full height): PAGE_MARGIN +
-            // SCROLLBAR_W puts the boxes a true PAGE_MARGIN
-            // clear of the scrollbar.
-            page_scroll_pad(sections, PAGE_MARGIN + SCROLLBAR_W)
-                .height(Length::Fill)
-                .width(Length::Fill),
-            // The footer row lives outside the scrollable;
-            // the same right pad aligns the Rescan pill's
-            // edge with the boxes' instead of at margin 0.
-            row![
-                text(format!(
-                    "Mods: {} total — {} active, {} archived · Favorites: {}",
-                    total,
-                    active,
-                    archived,
-                    self.mod_manager.favorites_count()
-                )),
-                Space::with_width(Length::Fill),
-                button(text("Rescan folders"))
-                    .style(theme::danger_pill())
-                    .on_press(Message::Scan),
-            ]
-            .spacing(8)
-            .padding(iced::Padding {
-                right: PAGE_MARGIN + SCROLLBAR_W,
-                ..Default::default()
-            }),
+            github,
+            self.settings_placeholder("accounts-sharing", "Sharing"),
         ]
         .spacing(10)
         .into()
+    }
+
+    /// Diagnostics: the scrubbed summary with its three
+    /// actions, and the Log Reader's opening defaults.
+    fn settings_diagnostics_tab(&self) -> Element<'_, Message> {
+        let summary = self.settings_box(
+            "diagnostics-summary",
+            "Summary",
+            vec![
+                text(self.diagnostics_summary()).size(13).into(),
+                row![
+                    button(text("Copy diagnostics"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::CopyDiagnostics),
+                    button(text("Export report"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::ExportDiagnostics),
+                    button(text("Open log folder"))
+                        .style(theme::nav_pill(true))
+                        .on_press_maybe(
+                            crate::update_db::logs_dir()
+                                .map(Message::OpenFolder),
+                        ),
+                ]
+                .spacing(8)
+                .into(),
+                text("Paths in this summary have your user folder name masked — it is text you may paste somewhere public.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
+        let log_reader = self.settings_box(
+            "diagnostics-log-reader",
+            "Log Reader",
+            vec![
+                checkbox(
+                    "Open with errors and warnings only",
+                    self.settings_log_errors_only_default,
+                )
+                .on_toggle(Message::SettingsLogErrorsOnlyDefaultToggled)
+                .into(),
+                row![
+                    text("Log lines kept (the last N):").size(13).width(220),
+                    text_input("3000", &self.settings_log_lines_cap_input)
+                        .on_input(Message::SettingsLogLinesCapChanged)
+                        .padding(8)
+                        .width(90),
+                ]
+                .spacing(8)
+                .into(),
+                text("Applied when the Log Reader next reads the log.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
+        column![summary, log_reader].spacing(10).into()
+    }
+
+    /// Maintenance: the from-scratch re-read, the
+    /// Downloads history switch, and the fill log.
+    fn settings_maintenance_tab(&self) -> Element<'_, Message> {
+        let reread = self.settings_box(
+            "maintenance-reread",
+            "Library database",
+            vec![
+                text("Re-reading clears the library database's stored fingerprints, so the next scan parses every mod from its file again — the slow, certain way to settle a record that looks wrong.")
+                    .size(13)
+                    .into(),
+                row![button(text("Re-read every mod"))
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::RereadEveryMod)]
+                .into(),
+            ],
+        );
+        let downloads = self.settings_box(
+            "maintenance-downloads",
+            "Downloads",
+            vec![
+                checkbox(
+                    "Keep download history between sessions",
+                    self.settings_keep_history,
+                )
+                .on_toggle(Message::SettingsKeepHistoryToggled)
+                .into(),
+                text("When on, the Downloads page's finished and failed rows are stored in the data folder and come back at the next launch. When off, history lasts for the session only; a stored history is left untouched, just not loaded.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
+        let fill_log = self.settings_box(
+            "maintenance-fill-log",
+            "Fill log",
+            vec![
+                text(format!(
+                    "Fill logs folder: {}",
+                    crate::update_db::logs_dir()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ))
+                .size(13)
+                .into(),
+                row![
+                    text("Fill logs to keep:").size(13).width(220),
+                    text_input("10", &self.settings_fill_log_keep_input)
+                        .on_input(Message::SettingsFillLogKeepChanged)
+                        .padding(8)
+                        .width(90),
+                ]
+                .spacing(8)
+                .into(),
+                text("Each scheduled fill writes fill-<date>-<time>.log there: its start time, the per-source results, the updates found, and any error. Older logs are pruned to the keep count.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
+        column![reread, downloads, fill_log].spacing(10).into()
+    }
+
+    /// About: the version, the two links, and the credit.
+    fn settings_about_tab(&self) -> Element<'_, Message> {
+        let about = self.settings_box(
+            "about-main",
+            "About",
+            vec![
+                text(format!(
+                    "Playground v{}",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .size(14)
+                .into(),
+                row![
+                    button(text("GitHub — Jmilburn1/Playground"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::OpenUrl(
+                            "https://github.com/Jmilburn1/Playground"
+                                .to_string(),
+                        )),
+                    button(text("farmerjay.dev"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::OpenUrl(
+                            "https://farmerjay.dev".to_string(),
+                        )),
+                ]
+                .spacing(8)
+                .into(),
+                text("By Farmer Jay / Albert Einstein")
+                    .size(13)
+                    .into(),
+            ],
+        );
+        column![about].spacing(10).into()
     }
 
     /// The Library Layout page (Roadmap #2, Phase 4):
@@ -6015,11 +7055,11 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.5.7  © 2026 Farmer Jay.")
+            text("V1.5.8  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
-            text("Created with the Assistance of Albert")
+            text("By Farmer Jay / Albert Einstein")
                 .size(12)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -6994,12 +8034,15 @@ fn classify_log_line(line: &str) -> LogKind {
 
 /// Background job for the Log Reader: read log.txt from the
 /// profile folder, classify every line, count errors/warnings
-/// over the whole file, keep the last 3000 lines for display,
-/// and collect the library mods that error/warning lines name
-/// (file-name stems matched against a lowercase line).
+/// over the whole file, keep the last `cap` lines for display
+/// (the cap is a Settings value since Round 2, default
+/// 3000), and collect the library mods that error/warning
+/// lines name (file-name stems matched against a lowercase
+/// line).
 fn log_job(
     profile: PathBuf,
     stems: Vec<(String, String)>,
+    cap: usize,
 ) -> Result<LogOutcome, String> {
     let path = profile.join("log.txt");
     let bytes = std::fs::read(&path)
@@ -7024,7 +8067,7 @@ fn log_job(
         }
     }
     suspects.sort();
-    let start = total_lines.saturating_sub(3000);
+    let start = total_lines.saturating_sub(cap.max(1));
     let lines = all[start..]
         .iter()
         .map(|l| LogLine {
@@ -7126,11 +8169,18 @@ pub fn run(mod_manager: ModManager) -> anyhow::Result<()> {
             // background from the first frame; it never
             // delays the load, and its only message is
             // Some when a newer Playground exists (see
-            // app_update::check_at_launch).
-            let check = Task::perform(
-                app_update::check_at_launch(),
-                Message::AppUpdateCheckDone,
-            );
+            // app_update::check_at_launch). Settings can
+            // switch the launch check off (Round 2,
+            // self_update_enabled); the page's "Check now"
+            // runs the same check on demand either way.
+            let check = if app.mod_manager.self_update_enabled() {
+                Task::perform(
+                    app_update::check_at_launch(),
+                    Message::AppUpdateCheckDone,
+                )
+            } else {
+                Task::none()
+            };
             (app, Task::batch([task, check]))
         });
     match result {
@@ -7193,6 +8243,44 @@ mod tests {
     /// (702, 344) and the main window must land at
     /// (320, 140); on the sandbox rig's 2560x1600 screen
     /// it is (1022, 604) -> (640, 400).
+    /// The Browse default view's stored key round-trips
+    /// every choice, and a damaged or foreign key falls
+    /// back to All instead of stranding a launch.
+    #[test]
+    fn browse_default_key_round_trips() {
+        for view in [
+            BrowseView::All,
+            BrowseView::Active,
+            BrowseView::Archived,
+            BrowseView::Favorites,
+            BrowseView::Updates,
+            BrowseView::Category("Tractors".to_string()),
+        ] {
+            assert_eq!(browse_view_from_key(&browse_view_key(&view)), view);
+        }
+        assert_eq!(browse_view_from_key("nonsense"), BrowseView::All);
+        assert_eq!(browse_view_from_key("category:"), BrowseView::All);
+        assert_eq!(browse_view_from_key(""), BrowseView::All);
+    }
+
+    /// The Diagnostics scrub masks the home path wherever
+    /// it appears in the summary and leaves other text —
+    /// and a summary without the home path — untouched.
+    /// (Unix paths stand in for the Windows original; the
+    /// replacement is a prefix substitution either way.)
+    #[test]
+    fn diagnostics_scrub_masks_the_home_path() {
+        let home = std::path::Path::new("/home/jdoe");
+        let text = "Data folder: /home/jdoe/.config/playground\n\
+                    Catalog: /home/jdoe/.cache/x (1 KB)\n\
+                    Other: /srv/shared";
+        let scrubbed = scrub_home_prefix(text, home);
+        assert!(scrubbed.contains("/home/<user>/.config/playground"));
+        assert!(scrubbed.contains("/home/<user>/.cache/x"));
+        assert!(scrubbed.contains("/srv/shared"));
+        assert!(!scrubbed.contains("jdoe"));
+    }
+
     #[test]
     fn main_top_left_centers_on_the_splash_center() {
         assert_eq!(

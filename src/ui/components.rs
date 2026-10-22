@@ -19,6 +19,22 @@ pub enum Tab {
     Settings,
 }
 
+/// The Settings page's own tabs (Round 2, owner
+/// 2026-10-22 — Silo's tab shape in Playground's
+/// vocabulary). Distinct from the app's page `Tab`: these
+/// switch inside the one Settings page, and every tab's
+/// values commit through the page's one explicit save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    General,
+    ModsFolder,
+    Library,
+    Accounts,
+    Diagnostics,
+    Maintenance,
+    About,
+}
+
 /// Where one tracked mod download stands (owner, 2026-10-22:
 /// the Downloads section — "shows which mods are being
 /// downloaded"). The registry walks each job Queued ->
@@ -253,8 +269,81 @@ impl DownloadRegistry {
         self.jobs.retain(|j| !j.is_finished());
     }
 
+    /// The finished jobs as history entries, for the
+    /// Downloads history file (Settings > Maintenance,
+    /// "keep download history"): only Done / Failed rows
+    /// persist — a queued or running job belongs to its
+    /// session alone.
+    pub fn history_entries(&self) -> Vec<DownloadHistoryEntry> {
+        self.jobs
+            .iter()
+            .filter(|j| j.is_finished())
+            .map(DownloadHistoryEntry::from_job)
+            .collect()
+    }
+
+    /// Bring a previous session's history back as finished
+    /// rows. Ids are re-assigned from the registry's own
+    /// counter, and no instants are restored — a restored
+    /// row keeps its outcome, not its timing.
+    pub fn restore_history(&mut self, entries: Vec<DownloadHistoryEntry>) {
+        for entry in entries {
+            self.next_id += 1;
+            self.jobs.push(DownloadJob {
+                id: self.next_id,
+                mod_id: entry.mod_id,
+                mod_name: entry.mod_name,
+                file_name: entry.file_name,
+                source: entry.source,
+                version: entry.version,
+                state: if entry.failed {
+                    DownloadJobState::Failed
+                } else {
+                    DownloadJobState::Done
+                },
+                downloaded: entry.downloaded,
+                total: entry.total,
+                fail_reason: entry.fail_reason,
+                started_at: None,
+                finished_at: None,
+            });
+        }
+    }
+
     fn job_mut(&mut self, id: u64) -> Option<&mut DownloadJob> {
         self.jobs.iter_mut().find(|j| j.id == id)
+    }
+}
+
+/// One finished download, as stored in the Downloads
+/// history file (downloads-history.json in the data
+/// folder): the row's facts without its session timing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DownloadHistoryEntry {
+    pub mod_id: String,
+    pub mod_name: String,
+    pub file_name: String,
+    pub source: String,
+    pub version: String,
+    pub failed: bool,
+    pub fail_reason: Option<String>,
+    pub downloaded: u64,
+    pub total: Option<u64>,
+}
+
+impl DownloadHistoryEntry {
+    fn from_job(job: &DownloadJob) -> Self {
+        Self {
+            mod_id: job.mod_id.clone(),
+            mod_name: job.mod_name.clone(),
+            file_name: job.file_name.clone(),
+            source: job.source.clone(),
+            version: job.version.clone(),
+            failed: job.state == DownloadJobState::Failed,
+            fail_reason: job.fail_reason.clone(),
+            downloaded: job.downloaded,
+            total: job.total,
+        }
     }
 }
 
@@ -500,8 +589,6 @@ pub enum Message {
     MoveToArchive(String),
     MoveToActive(String),
     RemoveMod(String),
-    ActiveDirChanged(String),
-    ArchiveDirChanged(String),
     SaveDirectories,
     /// Settings page, Library section: the conflict-
     /// checking switch and the two numeric fields, staged
@@ -517,7 +604,6 @@ pub enum Message {
     SettingsSourceToggled(SourceList, usize, bool),
     BrowseFolder(FolderTarget),
     FolderPicked(FolderTarget, Option<PathBuf>),
-    ToggleConsole(bool),
     RefreshLog,
     LogLoaded(Result<LogOutcome, String>),
     LogErrorsOnlyToggled(bool),
@@ -650,6 +736,85 @@ pub enum Message {
     /// Downloads section: sweep the finished rows (Done /
     /// Failed) off the page; live jobs stay.
     ClearFinishedDownloads,
+    /// Settings page (Round 2): switch the page's tab.
+    /// Every tab stages into the same save.
+    SettingsTabSelected(SettingsTab),
+    /// Settings page (Round 2): collapse or expand one of
+    /// the page's boxes, by its stable id.
+    SettingsToggleSection(String),
+    /// Settings, General > Updates: the start-up update
+    /// check switch, staged for the page save.
+    SettingsStartupCheckToggled(bool),
+    /// Settings, General > Updates: the self-update switch,
+    /// staged for the page save.
+    SettingsSelfUpdateToggled(bool),
+    /// Settings, General > Updates: run the self-update
+    /// check on demand (works whichever way the switch
+    /// sits — it is an explicit ask).
+    CheckAppUpdateNow,
+    /// Settings, General > Behavior: the Browse view a
+    /// fresh launch opens with, staged for the page save.
+    SettingsBrowseDefaultChanged(BrowseView),
+    /// Settings, General > Behavior: start maximized,
+    /// staged for the page save.
+    SettingsStartMaximizedToggled(bool),
+    /// Settings, General > Launch Configuration: one of
+    /// the launch settings flipped, staged for the page
+    /// save (the Developer Console stages too — it writes
+    /// game.xml when the page saves, like everything else
+    /// on the page).
+    SettingsLaunchToggled(LaunchSetting, bool),
+    /// Settings, General > Launch Configuration: the
+    /// savegame slot field (text; empty = unset), staged
+    /// for the page save.
+    SettingsLaunchSlotChanged(String),
+    /// Settings, Library > Auto-Fill, staged for the save.
+    SettingsAutoFileToggled(bool),
+    /// Settings, Maintenance > Downloads history switch,
+    /// staged for the page save.
+    SettingsKeepHistoryToggled(bool),
+    /// Settings, Maintenance > Fill log keep-count field,
+    /// staged for the page save.
+    SettingsFillLogKeepChanged(String),
+    /// Settings, Diagnostics > Log Reader: the
+    /// errors-only-on-open default, staged for the save.
+    SettingsLogErrorsOnlyDefaultToggled(bool),
+    /// Settings, Diagnostics > Log Reader: the lines-cap
+    /// field, staged for the page save.
+    SettingsLogLinesCapChanged(String),
+    /// Settings: the scheduled-fill task query answered
+    /// (None = the query could not run on this platform).
+    FillTaskStatus(Option<bool>),
+    /// Open a folder in the OS file explorer (Settings path
+    /// rows' Open folder; Diagnostics' Open log folder).
+    OpenFolder(PathBuf),
+    /// Open a URL in the browser (About links).
+    OpenUrl(String),
+    /// Settings, Diagnostics: copy the diagnostics summary
+    /// to the clipboard.
+    CopyDiagnostics,
+    /// Settings, Diagnostics: save the diagnostics summary
+    /// to a text file the user picks.
+    ExportDiagnostics,
+    /// Settings, Diagnostics: the export dialog answered.
+    DiagnosticsExported(Option<PathBuf>),
+    /// Settings, Maintenance: forget the library database's
+    /// fingerprints and rescan, re-reading every mod.
+    RereadEveryMod,
+}
+
+/// One of the Launch Configuration's switches (Settings,
+/// General). The Developer Console rides along: it is a
+/// game-start setting in the same box, staged and saved
+/// with the rest even though it acts through game.xml
+/// rather than the composed command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchSetting {
+    Console,
+    SkipModUpdateDialog,
+    Cheats,
+    AutoStart,
+    SkipStartVideos,
 }
 
 pub fn format_size(bytes: u64) -> String {
