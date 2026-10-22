@@ -758,8 +758,9 @@ impl App {
 
     /// Begin one registered download job: flip it to
     /// Downloading and run the SAME download the panel has
-    /// always run (GitHub asset, or ModHub with the mod page
-    /// as referer) — now the reporting variant, so progress
+    /// always run (GitHub asset, ModHub with the mod page
+    /// as referer, or a KingMods offer through its own
+    /// lane) — now the reporting variant, so progress
     /// streams into the job registry over a channel while
     /// completion still arrives as UpdateInstalled. Progress
     /// sends may drop when the channel is full: a dropped
@@ -795,6 +796,49 @@ impl App {
                         });
                     };
                     crate::sources::mod_hub::ModHubSource::new()
+                        .download_to_reporting(&url, &page, &dest2, &mut report)
+                        .await
+                        .map(|_| dest2)
+                        .map_err(|e| e.to_string())
+                },
+                move |result| Message::UpdateInstalled(id.clone(), result),
+            );
+            return Task::batch([download, progress_task]);
+        }
+        // KingMods offers carry no repo marker — the
+        // database row that offered the update names the
+        // source (the same lookup the Downloads label
+        // uses), and the offer's repo IS the mod's KingMods
+        // page, which the lane sends as the referer the
+        // file-host chain starts from. Its download URL is
+        // the file host's page, resolved by the KingMods
+        // lane itself; falling through to the GitHub lane
+        // was v1.5.1's refusal bug.
+        let kingmods = self
+            .mod_manager
+            .get_mod(&id)
+            .map(|m| {
+                let stem = ModManager::mod_stem(&m.path);
+                self.db_rows
+                    .get(&stem)
+                    .map(|row| row.source_kind == "kingmods")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if kingmods {
+            let page = info.repo.clone();
+            let dest2 = dest.clone();
+            let mut tx2 = tx;
+            let download = Task::perform(
+                async move {
+                    let mut report = move |downloaded: u64, total: Option<u64>| {
+                        let _ = tx2.try_send(DownloadEvent::Progress {
+                            job,
+                            downloaded,
+                            total,
+                        });
+                    };
+                    crate::sources::kingmods::KingModsSource::new()
                         .download_to_reporting(&url, &page, &dest2, &mut report)
                         .await
                         .map(|_| dest2)
@@ -5573,7 +5617,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.5.1  © 2026 Farmer Jay.")
+            text("V1.5.2  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
