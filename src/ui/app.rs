@@ -75,6 +75,18 @@ const DETAILS_W: f32 = 344.0;
 /// the banners keep it too.
 const PAGE_MARGIN: f32 = 10.0;
 
+/// Iced's default scrollbar band: 10px wide, painted
+/// INSIDE the scrollable's right edge with no layout
+/// space reserved for it. A bare PAGE_MARGIN of pad is
+/// therefore the bar's own band, not clearance beside
+/// it — surfaces that must sit clear of the bar allow
+/// PAGE_MARGIN + SCROLLBAR_W on the right, so the
+/// visible gap between content and bar is a true
+/// PAGE_MARGIN. (Field diagnosis, 2026-10-22: at
+/// PAGE_MARGIN alone the Settings panels and the card
+/// grids sat flush against the bar.)
+const SCROLLBAR_W: f32 = 10.0;
+
 /// A page's scrollable with PAGE_MARGIN of room on the
 /// content's right (John's app-wide margin rule). The
 /// shell's row spacing already gives every page the same
@@ -84,12 +96,22 @@ const PAGE_MARGIN: f32 = 10.0;
 /// the header and status slabs and still leave the
 /// computed-width grids wrong). With the pad inside, the
 /// scrollbar sits at the padded edge, clear of the
-/// content it used to paint over.
+/// content it used to paint over. Surfaces that must
+/// clear the bar itself use page_scroll_pad with a
+/// deeper pad (see SCROLLBAR_W).
 fn page_scroll<'a>(content: impl Into<Element<'a, Message>>) -> Scrollable<'a, Message> {
+    page_scroll_pad(content, PAGE_MARGIN)
+}
+
+/// page_scroll with a caller-chosen right pad.
+fn page_scroll_pad<'a>(
+    content: impl Into<Element<'a, Message>>,
+    right_pad: f32,
+) -> Scrollable<'a, Message> {
     scrollable(
         container(content)
             .padding(iced::Padding {
-                right: PAGE_MARGIN,
+                right: right_pad,
                 ..Default::default()
             })
             .width(Length::Fill),
@@ -175,6 +197,25 @@ fn wizard_inset(_theme: &Theme) -> container::Style {
     }
 }
 
+/// The section box's own style: wizard_panel's shape
+/// (soft corners, no border) on the near-black base —
+/// the left menu's background (John, 2026-10-22: the
+/// boxes match the menu). wizard_panel itself keeps
+/// the petrol fill: it also dresses non-section boxes
+/// (the wizard's missing-mods and results blocks),
+/// which this ruling does not reach.
+fn wizard_section_box(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(theme::BASE)),
+        border: iced::Border {
+            color: iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: 8.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// One titled section of the Settings step.
 fn wizard_section<'a>(
     title: &'a str,
@@ -187,7 +228,7 @@ fn wizard_section<'a>(
     container(col)
         .width(Length::Fill)
         .padding(11)
-        .style(wizard_panel)
+        .style(wizard_section_box)
         .into()
 }
 
@@ -3173,15 +3214,32 @@ impl App {
             // Width math from the real shell geometry
             // (John's margin rule): window padding 24 +
             // sidebar + the shell's 10 spacing +
-            // PAGE_MARGIN on the right, so the last card
-            // ends PAGE_MARGIN from the edge. (Deducting
+            // PAGE_MARGIN + SCROLLBAR_W on the right, so
+            // the last card ends PAGE_MARGIN + SCROLLBAR_W
+            // from the edge — a true PAGE_MARGIN clear of
+            // the scrollbar, which paints inside the
+            // edge's own SCROLLBAR_W band. (Deducting
             // GRID_SPACING instead left the cards ~2px
-            // from it.)
-            let content_w =
-                (self.window_size.width - 24.0 - SIDEBAR_W - 10.0 - PAGE_MARGIN)
-                    .max(150.0);
+            // from the edge; PAGE_MARGIN alone left them
+            // flush against the bar.)
+            let content_w = (self.window_size.width
+                - 24.0
+                - SIDEBAR_W
+                - 10.0
+                - PAGE_MARGIN
+                - SCROLLBAR_W)
+                .max(150.0);
             let grid_w = if pane_open {
-                (content_w - DETAILS_W - GRID_SPACING).max(150.0)
+                // The pane-open grid scrollable is narrower
+                // than the page (pane + spacing + the body
+                // row's own PAGE_MARGIN pad), so its bar
+                // band eats a SCROLLBAR_W the closed grid
+                // never sees — deduct it once more, or the
+                // bar paints over the last card's right
+                // edge. Net either way: cards end
+                // PAGE_MARGIN + SCROLLBAR_W from their
+                // scrollable's edge.
+                (content_w - DETAILS_W - GRID_SPACING - SCROLLBAR_W).max(150.0)
             } else {
                 content_w
             };
@@ -3762,9 +3820,7 @@ impl App {
         // conflicts afterwards. Other conflict types get a simple
         // card each.
         let card_style = |_: &Theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb(
-                0.13, 0.14, 0.16,
-            ))),
+            background: Some(iced::Background::Color(theme::BASE)),
             border: iced::Border {
                 color: iced::Color::from_rgb(0.30, 0.31, 0.34),
                 width: 1.0,
@@ -3794,10 +3850,22 @@ impl App {
         // ~440px cards, column count follows the window width.
         // Same shell geometry as the Browse grid (John's
         // margin rule): window padding 24 + sidebar + the
-        // shell's 10 spacing + PAGE_MARGIN on the right.
-        let content_w =
-            (self.window_size.width - 24.0 - SIDEBAR_W - 10.0 - PAGE_MARGIN)
-                .max(200.0);
+        // shell's 10 spacing + PAGE_MARGIN + SCROLLBAR_W on
+        // the right. The bar here belongs to the outer
+        // page_scroll below; its pad does not stack with
+        // this formula — card positions are computed from
+        // the left, and the pad only caps the page box —
+        // so the net is cards ending PAGE_MARGIN +
+        // SCROLLBAR_W from the page's edge, a true
+        // PAGE_MARGIN clear of the bar (at PAGE_MARGIN
+        // alone they sat flush against it).
+        let content_w = (self.window_size.width
+            - 24.0
+            - SIDEBAR_W
+            - 10.0
+            - PAGE_MARGIN
+            - SCROLLBAR_W)
+            .max(200.0);
         let cols = (((content_w + GRID_SPACING) / (440.0 + GRID_SPACING)).floor()
             as usize)
             .clamp(1, 4);
@@ -4678,7 +4746,7 @@ impl App {
             .width(252)
             .padding(8)
             .style(move |_| container::Style {
-                background: Some(iced::Background::Color(theme::PANEL)),
+                background: Some(iced::Background::Color(theme::BASE)),
                 border: iced::Border {
                     color: if selected {
                         theme::ACCENT
@@ -5147,6 +5215,7 @@ impl App {
                     .spacing(2),
                 )
                 .padding(8)
+                .width(Length::Fill)
                 .style(|_| container::Style {
                     background: Some(iced::Background::Color(iced::Color::from_rgb(
                         0.13, 0.14, 0.16,
@@ -5160,7 +5229,7 @@ impl App {
                 }),
             );
         }
-        let mut lines_col = column![].spacing(1);
+        let mut lines_col = column![].spacing(1).width(Length::Fill);
         for line in self
             .log_lines
             .iter()
@@ -5181,8 +5250,14 @@ impl App {
         if self.log_lines.is_empty() && self.log_note.is_empty() {
             lines_col = lines_col.push(text("No lines to show.").size(12));
         }
+        // No page_scroll here (John, 2026-10-22: the pad
+        // read as "way too big" on this page): log lines
+        // have no hard right edge, so the pad only pushed
+        // wrapped text further in. The lines ride in a
+        // plain scrollable, as they did before the margin
+        // pass — the deliberate exception to the rule.
         col = col.push(
-            page_scroll(lines_col)
+            scrollable(lines_col)
                 .width(Length::Fill)
                 .height(Length::Fill),
         );
@@ -5528,7 +5603,18 @@ impl App {
         let sections = column![folders, library, catalog].spacing(10);
         column![
             text("Settings").size(20),
-            page_scroll(sections).height(Length::Fill).width(Length::Fill),
+            // A deeper pad than the other pages (John,
+            // 2026-10-22: at PAGE_MARGIN the panels "blew
+            // out" the right side — flush against the bar
+            // along their full height): PAGE_MARGIN +
+            // SCROLLBAR_W puts the boxes a true PAGE_MARGIN
+            // clear of the scrollbar.
+            page_scroll_pad(sections, PAGE_MARGIN + SCROLLBAR_W)
+                .height(Length::Fill)
+                .width(Length::Fill),
+            // The footer row lives outside the scrollable;
+            // the same right pad aligns the Rescan pill's
+            // edge with the boxes' instead of at margin 0.
             row![
                 text(format!(
                     "Mods: {} total — {} active, {} archived · Favorites: {}",
@@ -5542,7 +5628,11 @@ impl App {
                     .style(theme::danger_pill())
                     .on_press(Message::Scan),
             ]
-            .spacing(8),
+            .spacing(8)
+            .padding(iced::Padding {
+                right: PAGE_MARGIN + SCROLLBAR_W,
+                ..Default::default()
+            }),
         ]
         .spacing(10)
         .into()
@@ -5925,7 +6015,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.5.5  © 2026 Farmer Jay.")
+            text("V1.5.7  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -5940,12 +6030,26 @@ impl App {
         ]
         .spacing(8);
 
-        container(content)
-            .width(SIDEBAR_W)
-            .height(Length::Fill)
-            .padding(12)
-            .style(theme::sidebar_container)
-            .into()
+        // The shell row no longer pads the window's bottom
+        // (the main stack's status slab covers that band
+        // now), so the sidebar carries its own 12px bottom
+        // inset here: its bordered box ends exactly where
+        // it always did, 12 above the window's bottom edge.
+        container(
+            container(content)
+                .width(SIDEBAR_W)
+                .height(Length::Fill)
+                .padding(12)
+                .style(theme::sidebar_container),
+        )
+        .height(Length::Fill)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 12.0,
+            left: 0.0,
+        })
+        .into()
     }
 
     /// Kick off the next chunk of the ModHub detection pass:
@@ -6449,7 +6553,11 @@ impl App {
         let base = column![
             Space::with_height(top_hole),
             content,
-            Space::with_height(27),
+            // 39, not 27: the status slab's 27 plus the
+            // 12 the shell row used to pad below the stack
+            // (that band is the slab's to cover now — card
+            // icons paint past the grid's clip into it).
+            Space::with_height(39),
         ]
         .width(Length::Fill)
         .height(Length::Fill);
@@ -6483,7 +6591,12 @@ impl App {
                 .padding(iced::Padding {
                     top: 10.0,
                     right: 0.0,
-                    bottom: 0.0,
+                    // The extra 12 below the text makes the
+                    // slab 39 tall, reaching the window's
+                    // bottom edge (the shell row no longer
+                    // pads there) so no card paint can leak
+                    // past it.
+                    bottom: 12.0,
                     left: 0.0,
                 })
                 .width(Length::Fill)
@@ -6500,7 +6613,17 @@ impl App {
 
         row![self.sidebar_view(), main]
             .spacing(10)
-            .padding(12)
+            // No bottom padding: the stack runs to the
+            // window's bottom edge, where the status slab
+            // (now 39 tall) covers the band card icons used
+            // to leak into. The sidebar restores its own
+            // 12px bottom inset inside sidebar_view.
+            .padding(iced::Padding {
+                top: 12.0,
+                right: 12.0,
+                bottom: 0.0,
+                left: 12.0,
+            })
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

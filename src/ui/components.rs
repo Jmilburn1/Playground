@@ -1,6 +1,7 @@
 use crate::mod_manager::conflict::Conflict;
 use crate::mod_manager::icons::LoadedIcon;
 use crate::mod_manager::types::{Mod, ModState};
+use crate::ui::theme;
 use crate::update_db::{DbSummary, UpdateRow};
 use iced::widget::{button, column, container, row, text};
 use iced::{Color, Element, Length};
@@ -313,7 +314,7 @@ impl std::fmt::Display for BrowseView {
             BrowseView::Archived => write!(f, "Archived mods"),
             BrowseView::Favorites => write!(f, "Favorite mods"),
             BrowseView::Updates => write!(f, "Updates"),
-            BrowseView::Category(c) => write!(f, "Category: {}", c),
+            BrowseView::Category(c) => write!(f, "{}", c),
         }
     }
 }
@@ -756,9 +757,7 @@ pub fn mod_card<'a>(
     .height(26)
     .padding(0)
     .style(|_, _| button::Style {
-        background: Some(iced::Background::Color(Color::from_rgba(
-            0.05, 0.05, 0.06, 0.85,
-        ))),
+        background: Some(iced::Background::Color(theme::PANEL)),
         border: iced::Border {
             radius: 13.0.into(),
             ..iced::Border::default()
@@ -960,7 +959,7 @@ pub fn mod_card<'a>(
             background: Some(iced::Background::Color(if is_selected {
                 Color::from_rgb(0.20, 0.21, 0.24)
             } else {
-                Color::from_rgb(0.13, 0.14, 0.16)
+                theme::BASE
             })),
             border: iced::Border {
                 color: if is_selected {
