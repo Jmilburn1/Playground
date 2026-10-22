@@ -105,5 +105,8 @@ target\release\playground.exe
 
 ## Credits
 
+I want to thank Mark Thor, FarmSimGuy, and HLLMR for the great work
+they have done, and for the inspiration to put Playground together.
+
 V1.5.2 © 2026 Farmer Jay.
 Created with the Assistance of Albert — Farmer Jay's Muse AI Agent.
