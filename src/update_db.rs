@@ -353,7 +353,7 @@ async fn fill_at(
     let mh_links: HashMap<String, String> = mm.modhub_links().into_iter().collect();
 
     // The catalog join: whole index, local lookups only.
-    let cat = catalog::ensure(&mm.catalog_url()).await;
+    let cat = catalog::ensure(&mm.catalog_url(), mm.cache_ttl_hours()).await;
     let index = cat.as_ref().map(catalog::by_stem);
 
     let (base, token) = mm.github_endpoint();
@@ -915,7 +915,6 @@ mod tests {
             settings: Settings {
                 archive_directory: archive,
                 active_directory: active,
-                auto_update: false,
                 check_conflicts: true,
                 parallel_scans: 2,
                 cache_ttl_hours: 24,

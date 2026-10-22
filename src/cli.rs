@@ -273,7 +273,7 @@ pub fn run_cli(mod_manager: &mut ModManager, args: &[String]) -> anyhow::Result<
                 // in which case it updates like a linked mod.
                 let rt = tokio::runtime::Runtime::new()?;
                 mh_id = rt.block_on(async {
-                    match crate::sources::catalog::ensure(&mod_manager.catalog_url()).await {
+                    match crate::sources::catalog::ensure(&mod_manager.catalog_url(), mod_manager.cache_ttl_hours()).await {
                         Some(cat) => crate::sources::catalog::by_stem(&cat)
                             .get(&stem)
                             .map(|e| {
@@ -879,7 +879,7 @@ pub fn detect_modhub(
         // The published catalog (run order step 2).
         let runtime = tokio::runtime::Runtime::new()?;
         let catalog_index = runtime.block_on(async {
-            match crate::sources::catalog::ensure(&mod_manager.catalog_url()).await {
+            match crate::sources::catalog::ensure(&mod_manager.catalog_url(), mod_manager.cache_ttl_hours()).await {
                 Some(cat) => crate::sources::catalog::by_stem(&cat),
                 None => std::collections::HashMap::new(),
             }
@@ -1215,7 +1215,7 @@ fn audit_tree(mod_manager: &mut ModManager, root: &std::path::Path) {
 /// available updates plus a one-line summary. Returns
 /// whether the catalog recognized anything at all.
 async fn catalog_updates_pass(mod_manager: &ModManager, standalone: bool) -> bool {
-    let Some(cat) = crate::sources::catalog::ensure(&mod_manager.catalog_url()).await else {
+    let Some(cat) = crate::sources::catalog::ensure(&mod_manager.catalog_url(), mod_manager.cache_ttl_hours()).await else {
         return false;
     };
     let index = crate::sources::catalog::by_stem(&cat);
@@ -1392,7 +1392,6 @@ mod tests {
             settings: Settings {
                 archive_directory: archive,
                 active_directory: active,
-                auto_update: false,
                 check_conflicts: true,
                 parallel_scans: 2,
                 cache_ttl_hours: 24,

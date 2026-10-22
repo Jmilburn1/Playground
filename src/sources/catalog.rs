@@ -49,8 +49,11 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn is_fresh(cat: &Catalog) -> bool {
-    now_secs().saturating_sub(cat.generated_at) < CACHE_TTL_HOURS * 3600
+fn is_fresh(cat: &Catalog, ttl_hours: u64) -> bool {
+    !crate::config::is_stale(
+        now_secs().saturating_sub(cat.generated_at),
+        ttl_hours,
+    )
 }
 
 /// The published catalog's file name (owner's naming,
@@ -133,10 +136,10 @@ async fn fetch_one(client: &reqwest::Client, url: &str) -> Result<Catalog> {
 /// a stale or missing cache triggers one fetch attempt; a
 /// failed fetch falls back to the stale cache rather than
 /// leaving the caller with nothing.
-pub async fn ensure(url: &str) -> Option<Catalog> {
+pub async fn ensure(url: &str, ttl_hours: u64) -> Option<Catalog> {
     let cached = load_cache();
     if let Some(cat) = &cached {
-        if is_fresh(cat) {
+        if is_fresh(cat, ttl_hours) {
             return cached;
         }
     }

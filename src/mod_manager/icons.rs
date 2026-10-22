@@ -313,21 +313,48 @@ pub fn icon_cache_key(mod_path: &Path) -> Option<String> {
     Some(format!("{}-{}-{}", clean, meta.len(), mtime))
 }
 
-/// load_icon with the on-disk cache in front of it.
+/// Read one cache entry only while it is inside its
+/// TTL: an entry older than the configured cache
+/// lifetime is stale and the caller re-decodes instead.
+/// The age is the cache file's own modification time —
+/// the moment the decoded icon was written.
+fn read_fresh_cache_entry(path: &Path, ttl_hours: u64) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let age = std::time::SystemTime::now()
+        .duration_since(modified)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if crate::config::is_stale(age, ttl_hours) {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
+/// load_icon with the on-disk cache in front of it. A
+/// cached entry is served only within `cache_ttl_hours`
+/// (the Settings page's cache lifetime); past it, the
+/// icon is decoded fresh and the entry rewritten.
 pub fn load_icon_cached(
     mod_path: &Path,
     icon_filename: Option<&str>,
     cache_dir: Option<&Path>,
+    cache_ttl_hours: u64,
 ) -> Option<LoadedIcon> {
     let key = cache_dir.and_then(|dir| {
         icon_cache_key(mod_path).map(|k| (dir.to_path_buf(), k))
     });
     if let Some((dir, k)) = &key {
         for ext in ["png", "jpg"] {
-            if let Ok(bytes) = std::fs::read(dir.join(format!("{}.{}", k, ext))) {
-                if !bytes.is_empty() {
-                    return Some(LoadedIcon::Encoded(bytes));
-                }
+            if let Some(bytes) =
+                read_fresh_cache_entry(&dir.join(format!("{}.{}", k, ext)), cache_ttl_hours)
+            {
+                return Some(LoadedIcon::Encoded(bytes));
             }
         }
     }

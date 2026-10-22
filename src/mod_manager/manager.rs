@@ -1,5 +1,5 @@
 use super::types::{Mod, ModState, ModType};
-use crate::config::Config;
+use crate::config::{Config, ModSources};
 use crate::sources::catalog_miss::{CatalogMiss, Decision};
 use crate::sources::catalog_other::{CatalogOther, OtherRow};
 use anyhow::{Context, Result};
@@ -179,8 +179,73 @@ impl ModManager {
         (
             self.archive_dir.clone(),
             self.active_dir.clone(),
-            self.config.settings.parallel_scans,
+            crate::config::clamp_parallel_scans(self.config.settings.parallel_scans),
         )
+    }
+
+    /// Whether conflict detection runs in the scan/load
+    /// pipeline (Settings page, Library section).
+    pub fn check_conflicts(&self) -> bool {
+        self.config.settings.check_conflicts
+    }
+
+    /// The configured scan parallelism, held to the
+    /// Settings page's 1..=16 range.
+    pub fn parallel_scans(&self) -> usize {
+        crate::config::clamp_parallel_scans(self.config.settings.parallel_scans)
+    }
+
+    /// How long a cached catalog or decoded icon may live
+    /// before it is stale (Settings page, Library
+    /// section), held to at least one hour.
+    pub fn cache_ttl_hours(&self) -> u64 {
+        crate::config::clamp_cache_ttl_hours(self.config.settings.cache_ttl_hours)
+    }
+
+    /// The configured mod sources (Settings page, Catalog
+    /// & Sources section): the entries catalog-other
+    /// absorbs, with their enabled flags.
+    pub fn mod_sources(&self) -> ModSources {
+        self.config.mod_sources.clone()
+    }
+
+    /// Save the whole Settings page in one write: the two
+    /// folders (created if needed, a leading `~` expanded)
+    /// plus every Library and Catalog & Sources value the
+    /// page stages. This is the page's one save model —
+    /// its Save folders button commits all of it through
+    /// the ordinary config save, and the caller starts the
+    /// rescan that applies the folders and the conflict
+    /// switch to the library.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_settings_page(
+        &mut self,
+        active_dir: PathBuf,
+        archive_dir: PathBuf,
+        check_conflicts: bool,
+        parallel_scans: usize,
+        cache_ttl_hours: u64,
+        catalog_url: String,
+        mod_sources: ModSources,
+    ) -> Result<()> {
+        let active_dir = crate::config::expand_tilde(&active_dir);
+        let archive_dir = crate::config::expand_tilde(&archive_dir);
+        std::fs::create_dir_all(&active_dir)
+            .with_context(|| format!("Failed to create active directory: {:?}", active_dir))?;
+        std::fs::create_dir_all(&archive_dir)
+            .with_context(|| format!("Failed to create archive directory: {:?}", archive_dir))?;
+        self.active_dir = active_dir.clone();
+        self.archive_dir = archive_dir.clone();
+        self.config.settings.active_directory = active_dir;
+        self.config.settings.archive_directory = archive_dir;
+        self.config.settings.check_conflicts = check_conflicts;
+        self.config.settings.parallel_scans =
+            crate::config::clamp_parallel_scans(parallel_scans);
+        self.config.settings.cache_ttl_hours =
+            crate::config::clamp_cache_ttl_hours(cache_ttl_hours);
+        self.config.settings.catalog_url = catalog_url.trim().to_string();
+        self.config.mod_sources = mod_sources;
+        self.config.save()
     }
 
     /// Scan both folders into a fresh mod map without touching any
@@ -1523,7 +1588,6 @@ mod tests {
             settings: Settings {
                 archive_directory: archive.clone(),
                 active_directory: active.clone(),
-                auto_update: false,
                 check_conflicts: true,
                 parallel_scans: 2,
                 cache_ttl_hours: 24,
@@ -1579,7 +1643,6 @@ mod tests {
             settings: Settings {
                 archive_directory: archive,
                 active_directory: active,
-                auto_update: false,
                 check_conflicts: true,
                 parallel_scans: 2,
                 cache_ttl_hours: 24,

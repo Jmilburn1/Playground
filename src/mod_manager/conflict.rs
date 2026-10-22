@@ -20,6 +20,18 @@ pub enum ConflictType {
 pub struct ConflictDetector;
 
 impl ConflictDetector {
+    /// The scan/load pipeline's entry point: conflict
+    /// detection runs only when the `check_conflicts`
+    /// setting is on. Off means the computation is skipped
+    /// entirely and the honest answer is no conflicts.
+    pub fn detect_conflicts_if_enabled(mods: &[Mod], enabled: bool) -> Vec<Conflict> {
+        if enabled {
+            Self::detect_conflicts(mods)
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn detect_conflicts(mods: &[Mod]) -> Vec<Conflict> {
         let mut conflicts = Vec::new();
 
@@ -106,5 +118,46 @@ impl ConflictDetector {
                 }
             }
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One folder mod named SameMod under `parent`: two of
+    /// these, one per parent, are exact-name duplicates.
+    fn fixture_mod(parent: &std::path::Path) -> Mod {
+        let dir = parent.join("SameMod");
+        std::fs::create_dir_all(&dir).unwrap();
+        Mod::new(dir).unwrap()
+    }
+
+    #[test]
+    fn duplicate_conflict_computes_only_when_enabled() {
+        let base = std::env::temp_dir().join(format!(
+            "conflict-gate-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let mods = vec![
+            fixture_mod(&base.join("a")),
+            fixture_mod(&base.join("b")),
+        ];
+
+        let on = ConflictDetector::detect_conflicts_if_enabled(&mods, true);
+        assert!(
+            on.iter()
+                .any(|c| c.conflict_type == ConflictType::DuplicateMod),
+            "the duplicate fixture must conflict when checking is on: {:?}",
+            on.iter().map(|c| &c.description).collect::<Vec<_>>()
+        );
+
+        let off = ConflictDetector::detect_conflicts_if_enabled(&mods, false);
+        assert!(
+            off.is_empty(),
+            "checking off must compute no conflicts at all"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

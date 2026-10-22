@@ -282,6 +282,15 @@ pub enum FolderTarget {
     Game,
 }
 
+/// Which configured source list a Settings page toggle
+/// belongs to (Catalog & Sources section).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceList {
+    ModHub,
+    GitHub,
+    KingMods,
+}
+
 /// What the browse grid is showing: everything, one folder's mods,
 /// favorites, or (once category parsing lands) one category.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,6 +502,18 @@ pub enum Message {
     ActiveDirChanged(String),
     ArchiveDirChanged(String),
     SaveDirectories,
+    /// Settings page, Library section: the conflict-
+    /// checking switch and the two numeric fields, staged
+    /// on the page and committed by SaveDirectories (the
+    /// page's one explicit save).
+    SettingsCheckConflictsToggled(bool),
+    SettingsParallelScansChanged(String),
+    SettingsCacheTtlChanged(String),
+    /// Settings page, Catalog & Sources section: the
+    /// catalog URL field and one source's enabled toggle,
+    /// staged the same way.
+    SettingsCatalogUrlChanged(String),
+    SettingsSourceToggled(SourceList, usize, bool),
     BrowseFolder(FolderTarget),
     FolderPicked(FolderTarget, Option<PathBuf>),
     ToggleConsole(bool),

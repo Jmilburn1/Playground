@@ -1,4 +1,5 @@
 use crate::app_update::{self, AppRelease};
+use crate::config::ModSources;
 use crate::mod_manager::conflict::{Conflict, ConflictDetector, ConflictType};
 use crate::mod_manager::game_files;
 use crate::mod_manager::icons::{
@@ -20,7 +21,7 @@ use crate::ui::components::{
     format_size, mod_card, BrowseView, DownloadEvent, DownloadJob,
     DownloadJobState, DownloadRegistry, DropdownTick, FolderTarget,
     LayoutEvent, LayoutRunOutcome, LoadEvent, LoadOutcome, LoadPhase,
-    LogKind, LogLine, LogOutcome, Message, ScanOutcome, Tab,
+    LogKind, LogLine, LogOutcome, Message, ScanOutcome, SourceList, Tab,
     UpdateDbPresentation, UpdateJudgement,
 };
 use futures::SinkExt as _;
@@ -384,17 +385,28 @@ pub struct App {
     /// switch state read from its game.xml (None = unknown).
     game_dir_input: String,
     console_on: Option<bool>,
+    /// Settings page staging (Round 1): the Library and
+    /// Catalog & Sources values as edited on the page.
+    /// Nothing here touches the config until Save folders
+    /// — the page's one explicit save — commits all of it
+    /// at once (see ModManager::save_settings_page).
+    settings_check_conflicts: bool,
+    settings_parallel_input: String,
+    settings_cache_ttl_input: String,
+    settings_catalog_url_input: String,
+    settings_sources: ModSources,
     /// A status note to show once the current load finishes
     /// (e.g. the folder switcher's gameSettings.xml result,
     /// which a rescan would otherwise overwrite).
     pending_status: Option<String>,
     status: String,
     loading: bool,
-    /// True from launch until the first load finishes both its
-    /// phases: while it holds, the splash owns the window and
-    /// the main UI isn't rendered at all. Later loads (Rescan,
-    /// folder changes) never set it again — they report
-    /// progress through the status line like before.
+    /// True from launch until the first load and the icon
+    /// pass behind it have both finished: while it holds, the
+    /// splash owns the window and the main UI isn't rendered
+    /// at all. Later loads (Rescan, folder changes) never
+    /// set it again — they report progress through the
+    /// status line like before.
     booting: bool,
     /// The running load's progress, fed by LoadEvent ticks:
     /// which phase is working and its real counts.
@@ -540,6 +552,11 @@ impl App {
         let console_on = mod_manager
             .game_directory()
             .and_then(|d| game_files::console_enabled(&d));
+        let settings_check_conflicts = mod_manager.check_conflicts();
+        let settings_parallel_input = mod_manager.parallel_scans().to_string();
+        let settings_cache_ttl_input = mod_manager.cache_ttl_hours().to_string();
+        let settings_catalog_url_input = mod_manager.catalog_url();
+        let settings_sources = mod_manager.mod_sources();
         Self {
             mod_manager,
             current_tab: Tab::Browse,
@@ -554,6 +571,11 @@ impl App {
             archive_dir_input,
             game_dir_input,
             console_on,
+            settings_check_conflicts,
+            settings_parallel_input,
+            settings_cache_ttl_input,
+            settings_catalog_url_input,
+            settings_sources,
             pending_status: None,
             status: "Loading mods…".to_string(),
             loading: true,
@@ -645,8 +667,9 @@ impl App {
         // it doesn't need — the next one is already coming. The
         // finish event is sent with a blocking send instead, so
         // it can never be dropped.
+        let check_conflicts = self.mod_manager.check_conflicts();
         let (tx, rx) = futures::channel::mpsc::channel::<LoadEvent>(128);
-        std::thread::spawn(move || load_job(archive, active, parallel, tx));
+        std::thread::spawn(move || load_job(archive, active, parallel, check_conflicts, tx));
         Task::run(rx, Message::LoadEvent)
     }
 
@@ -753,7 +776,11 @@ impl App {
             .into_iter()
             .map(|m| (m.id.clone(), m.path.clone(), m.icon_filename.clone()))
             .collect();
-        Task::perform(async move { icon_job(jobs) }, Message::IconsLoaded)
+        let cache_ttl_hours = self.mod_manager.cache_ttl_hours();
+        Task::perform(
+            async move { icon_job(jobs, cache_ttl_hours) },
+            Message::IconsLoaded,
+        )
     }
 
     /// Begin one registered download job: flip it to
@@ -914,6 +941,14 @@ impl App {
 
     /// Save the folder inputs and rescan — the Settings tab's
     /// Save button and the Browse pickers share this path.
+    /// The Settings page's one explicit save (its Save
+    /// folders button, and the folder pickers that have
+    /// always saved on pick): the folders AND every staged
+    /// Library / Catalog & Sources value commit together
+    /// through the config save, then the rescan the folder
+    /// save has always started applies them. A numeric
+    /// field that doesn't parse refuses the whole save —
+    /// nothing is written half-way.
     fn apply_directories(&mut self) -> Task<Message> {
         if self.loading {
             self.status =
@@ -923,17 +958,43 @@ impl App {
         }
         let active = std::path::PathBuf::from(self.active_dir_input.trim());
         let archive = std::path::PathBuf::from(self.archive_dir_input.trim());
-        match self.mod_manager.set_directories(active, archive) {
+        let Ok(parallel) = self.settings_parallel_input.trim().parse::<usize>() else {
+            self.status =
+                "Parallel scans must be a whole number (1–16) — nothing was saved."
+                    .to_string();
+            return Task::none();
+        };
+        let Ok(cache_ttl) = self.settings_cache_ttl_input.trim().parse::<u64>() else {
+            self.status =
+                "Cache lifetime must be a whole number of hours (minimum 1) — nothing was saved."
+                    .to_string();
+            return Task::none();
+        };
+        match self.mod_manager.save_settings_page(
+            active,
+            archive,
+            self.settings_check_conflicts,
+            parallel,
+            cache_ttl,
+            self.settings_catalog_url_input.clone(),
+            self.settings_sources.clone(),
+        ) {
             Ok(()) => {
-                // Show the folders as saved (tilde expanded).
+                // Show the values as saved (folders tilde-
+                // expanded, numbers clamped to their ranges).
                 self.active_dir_input =
                     self.mod_manager.get_active_dir().display().to_string();
                 self.archive_dir_input =
                     self.mod_manager.get_archive_dir().display().to_string();
+                self.settings_parallel_input =
+                    self.mod_manager.parallel_scans().to_string();
+                self.settings_cache_ttl_input =
+                    self.mod_manager.cache_ttl_hours().to_string();
+                self.settings_catalog_url_input = self.mod_manager.catalog_url();
                 self.begin_load()
             }
             Err(e) => {
-                self.status = format!("Could not change folders: {}", e);
+                self.status = format!("Could not save settings: {}", e);
                 Task::none()
             }
         }
@@ -1025,6 +1086,13 @@ impl App {
     }
 
     fn recompute_conflicts(&mut self) {
+        // The check_conflicts setting gates every recompute:
+        // off clears whatever was computed before, so no
+        // stale conflict can outlive the switch.
+        if !self.mod_manager.check_conflicts() {
+            self.conflicts = Vec::new();
+            return;
+        }
         let mods: Vec<Mod> = self.mod_manager.get_mods().into_iter().cloned().collect();
         self.conflicts = ConflictDetector::detect_conflicts(&mods);
     }
@@ -1609,18 +1677,19 @@ impl App {
                             self.selected_mod = None;
                         }
                     }
-                    // Both phases are done: the splash hands
-                    // over to the main window — which first
-                    // gets its ordinary shape back (decorated,
-                    // 1280x800; see restore_window). (Icons
-                    // keep loading behind it, as before.)
-                    // The handover belongs to the boot only:
-                    // a rescan's load finishing must never
-                    // touch the window (the decorations
-                    // toggle is stateful — firing it per load
-                    // would flip the frame off again).
+                    // Both load phases are done — but on a
+                    // boot the splash does NOT hand over here
+                    // any more: the icons are still loading,
+                    // and the handover waits for them in
+                    // IconsLoaded, so the main window never
+                    // sits at splash size wearing the main UI
+                    // while the icon pass runs (John's ruling,
+                    // 2026-10-22, after a boot showed exactly
+                    // that trap). `booting` stays up here;
+                    // only the icon pass starts. (A rescan's
+                    // load never held the splash anyway —
+                    // nothing changes for it.)
                     let was_booting = self.booting;
-                    self.booting = false;
                     if was_booting {
                         // A boot load just completed whole:
                         // if this launch is a self-updated
@@ -1631,11 +1700,7 @@ impl App {
                         app_update::cleanup_stale_backups();
                     }
                     self.status = format!("Loaded {} mods — loading icons…", count);
-                    let icons = self.begin_icon_load();
-                    if was_booting {
-                        return Task::batch(vec![icons, Self::restore_window()]);
-                    }
-                    return icons;
+                    return self.begin_icon_load();
                 }
                 LoadEvent::Finished(Err(e)) => {
                     let was_booting = self.booting;
@@ -1674,6 +1739,24 @@ impl App {
                 }
                 if let Some(note) = self.pending_status.take() {
                     self.status = note;
+                }
+                if self.booting {
+                    // The boot hold releases here: the scan
+                    // and the icons are both in, so the
+                    // splash hands over to the finished main
+                    // window in one shape change (see
+                    // restore_window). Only a boot can arrive
+                    // here with `booting` still up — a
+                    // rescan's icon pass finds it long down —
+                    // so the stateful decorations toggle
+                    // still fires exactly once per launch.
+                    self.booting = false;
+                    let restore = Self::restore_window();
+                    if self.detect_after_scan {
+                        self.detect_after_scan = false;
+                        return Task::batch(vec![self.start_detect(), restore]);
+                    }
+                    return restore;
                 }
                 if self.detect_after_scan {
                     self.detect_after_scan = false;
@@ -2594,6 +2677,28 @@ impl App {
             Message::ActiveDirChanged(value) => self.active_dir_input = value,
             Message::ArchiveDirChanged(value) => self.archive_dir_input = value,
             Message::SaveDirectories => return self.apply_directories(),
+            Message::SettingsCheckConflictsToggled(on) => {
+                self.settings_check_conflicts = on
+            }
+            Message::SettingsParallelScansChanged(value) => {
+                self.settings_parallel_input = value
+            }
+            Message::SettingsCacheTtlChanged(value) => {
+                self.settings_cache_ttl_input = value
+            }
+            Message::SettingsCatalogUrlChanged(value) => {
+                self.settings_catalog_url_input = value
+            }
+            Message::SettingsSourceToggled(list, index, enabled) => {
+                let entries = match list {
+                    SourceList::ModHub => &mut self.settings_sources.mod_hub,
+                    SourceList::GitHub => &mut self.settings_sources.github,
+                    SourceList::KingMods => &mut self.settings_sources.kingmods,
+                };
+                if let Some(source) = entries.get_mut(index) {
+                    source.enabled = enabled;
+                }
+            }
             Message::BrowseFolder(target) => {
                 let title = match target {
                     FolderTarget::Active => "Choose the game's mods folder",
@@ -5189,52 +5294,185 @@ impl App {
         } else {
             self.game_dir_input.clone()
         };
+
+        // ---- Folders -----------------------------------
+        let folders = wizard_section(
+            "Folders",
+            vec![
+                text("Game mods folder (Browse also points the game here via gameSettings.xml):")
+                    .size(13)
+                    .into(),
+                row![
+                    text_input("Game mods folder path", &self.active_dir_input)
+                        .on_input(Message::ActiveDirChanged)
+                        .padding(8)
+                        .width(Length::Fill),
+                    button(text("Browse"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::BrowseFolder(FolderTarget::Active)),
+                ]
+                .spacing(8)
+                .into(),
+                text("Library folder (stored mods):").size(13).into(),
+                row![
+                    text_input("Library folder path", &self.archive_dir_input)
+                        .on_input(Message::ArchiveDirChanged)
+                        .padding(8)
+                        .width(Length::Fill),
+                    button(text("Browse"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::BrowseFolder(FolderTarget::Archive)),
+                ]
+                .spacing(8)
+                .into(),
+                text("Game install folder (holds game.xml):")
+                    .size(13)
+                    .into(),
+                row![
+                    text(game_folder_label),
+                    button(text("Browse"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::BrowseFolder(FolderTarget::Game)),
+                ]
+                .spacing(8)
+                .into(),
+                console_row,
+                row![
+                    button(text("Save folders"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::SaveDirectories),
+                    text("Save folders saves every setting on this page to config.toml.")
+                        .size(12)
+                        .color(theme::TEXT_DIM),
+                ]
+                .spacing(8)
+                .into(),
+            ],
+        );
+
+        // ---- Library -----------------------------------
+        let library = wizard_section(
+            "Library",
+            vec![
+                checkbox(
+                    "Check for conflicts",
+                    self.settings_check_conflicts,
+                )
+                .on_toggle(Message::SettingsCheckConflictsToggled)
+                .into(),
+                text("When off, conflicts are not computed and the Conflicts page shows none.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+                row![
+                    text("Parallel scans (1–16):").size(13).width(220),
+                    text_input("4", &self.settings_parallel_input)
+                        .on_input(Message::SettingsParallelScansChanged)
+                        .padding(8)
+                        .width(90),
+                ]
+                .spacing(8)
+                .into(),
+                row![
+                    text("Cache lifetime (hours, minimum 1):")
+                        .size(13)
+                        .width(220),
+                    text_input("24", &self.settings_cache_ttl_input)
+                        .on_input(Message::SettingsCacheTtlChanged)
+                        .padding(8)
+                        .width(90),
+                ]
+                .spacing(8)
+                .into(),
+                text("The cache lifetime covers the downloaded ModHub catalog and the decoded icon cache.")
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                    .into(),
+            ],
+        );
+
+        // ---- Catalog & Sources -------------------------
+        let mut source_rows: Vec<Element<'_, Message>> = vec![
+            text("Catalog URL (the published ModHub catalog):")
+                .size(13)
+                .into(),
+            text_input("Catalog URL", &self.settings_catalog_url_input)
+                .on_input(Message::SettingsCatalogUrlChanged)
+                .padding(8)
+                .width(Length::Fill)
+                .into(),
+            text("Leave the catalog URL empty to turn catalog fetching off — a catalog already downloaded is still used from its cache.")
+                .size(12)
+                .color(theme::TEXT_DIM)
+                .into(),
+            text("Mod sources:").size(13).into(),
+        ];
+        for (list, heading, entries) in [
+            (
+                SourceList::ModHub,
+                "ModHub",
+                &self.settings_sources.mod_hub,
+            ),
+            (
+                SourceList::GitHub,
+                "GitHub",
+                &self.settings_sources.github,
+            ),
+            (
+                SourceList::KingMods,
+                "KingMods",
+                &self.settings_sources.kingmods,
+            ),
+        ] {
+            source_rows.push(text(heading).size(13).color(theme::TEXT_DIM).into());
+            if entries.is_empty() {
+                source_rows.push(
+                    text("No sources configured.").size(12).into(),
+                );
+            }
+            for (index, source) in entries.iter().enumerate() {
+                source_rows.push(
+                    row![
+                        checkbox(source.name.clone(), source.enabled)
+                            .on_toggle(move |on| {
+                                Message::SettingsSourceToggled(list, index, on)
+                            })
+                            .width(220),
+                        text(source.url.clone())
+                            .size(12)
+                            .color(theme::TEXT_DIM),
+                    ]
+                    .spacing(8)
+                    .into(),
+                );
+            }
+        }
+        source_rows.push(
+            text("Source names and URLs are shown as configured; this round only their on/off switches are editable here.")
+                .size(12)
+                .color(theme::TEXT_DIM)
+                .into(),
+        );
+        let catalog = wizard_section("Catalog & Sources", source_rows);
+
+        let sections = column![folders, library, catalog].spacing(10);
         column![
             text("Settings").size(20),
-            text("Game mods folder (Browse also points the game here via gameSettings.xml):"),
+            scrollable(sections).height(Length::Fill).width(Length::Fill),
             row![
-                text_input("Game mods folder path", &self.active_dir_input)
-                    .on_input(Message::ActiveDirChanged)
-                    .padding(8)
-                    .width(Length::Fill),
-                button(text("Browse"))
-                    .style(theme::nav_pill(true))
-                    .on_press(Message::BrowseFolder(FolderTarget::Active)),
+                text(format!(
+                    "Mods: {} total — {} active, {} archived · Favorites: {}",
+                    total,
+                    active,
+                    archived,
+                    self.mod_manager.favorites_count()
+                )),
+                Space::with_width(Length::Fill),
+                button(text("Rescan folders"))
+                    .style(theme::danger_pill())
+                    .on_press(Message::Scan),
             ]
             .spacing(8),
-            text("Library folder (stored mods):"),
-            row![
-                text_input("Library folder path", &self.archive_dir_input)
-                    .on_input(Message::ArchiveDirChanged)
-                    .padding(8)
-                    .width(Length::Fill),
-                button(text("Browse"))
-                    .style(theme::nav_pill(true))
-                    .on_press(Message::BrowseFolder(FolderTarget::Archive)),
-            ]
-            .spacing(8),
-            button(text("Save folders"))
-                .style(theme::nav_pill(true))
-                .on_press(Message::SaveDirectories),
-            text("Game install folder (holds game.xml):"),
-            row![
-                text(game_folder_label),
-                button(text("Browse"))
-                    .style(theme::nav_pill(true))
-                    .on_press(Message::BrowseFolder(FolderTarget::Game)),
-            ]
-            .spacing(8),
-            console_row,
-            text(format!(
-                "Mods: {} total — {} active, {} archived",
-                total, active, archived
-            )),
-            text(format!("Favorites: {}", self.mod_manager.favorites_count())),
-            text("Paths are saved to config.toml when you click Save folders.")
-                .size(12),
-            button(text("Rescan folders"))
-                .style(theme::danger_pill())
-                .on_press(Message::Scan),
         ]
         .spacing(10)
         .into()
@@ -5617,7 +5855,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.5.2  © 2026 Farmer Jay.")
+            text("V1.5.3  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -5743,9 +5981,10 @@ impl App {
         // searching.
         self.status = "Checking the ModHub catalog…".to_string();
         let url = self.mod_manager.catalog_url();
+        let ttl_hours = self.mod_manager.cache_ttl_hours();
         Task::perform(
             async move {
-                let pairs = match crate::sources::catalog::ensure(&url).await {
+                let pairs = match crate::sources::catalog::ensure(&url, ttl_hours).await {
                     Some(cat) => cat
                         .mods
                         .iter()
@@ -5884,8 +6123,11 @@ impl App {
     /// bar steel-teal on petrol, the phase counts in pale
     /// ice, all from the palette in ui::theme. It owns the
     /// window until the first load finishes BOTH phases —
-    /// mods, then updates judged — so the main window never
-    /// opens onto numbers that are still settling.
+    /// mods, then updates judged — and, since the 1.5.3
+    /// hold, until the icon pass behind them lands too, so
+    /// the main window never opens onto numbers that are
+    /// still settling. While the icons load, the readout's
+    /// line speaks the status text instead of the counts.
     fn splash_view(&self) -> Element<'_, Message> {
         let logo = iced::widget::image(iced::widget::image::Handle::from_bytes(
             include_bytes!("../../assets/logo.png").to_vec(),
@@ -5897,7 +6139,18 @@ impl App {
             LoadPhase::Mods => "Loading mods…",
             LoadPhase::Updates => "Loading updates…",
         };
-        let counts = if self.load_total > 0 {
+        // The counts speak for the two scan phases. Once
+        // both are done and only the icon pass is still
+        // running — the boot hold keeps the splash up for
+        // it — the counts have nothing left to count, so
+        // the line speaks the status text instead ("Loaded
+        // N mods — loading icons…"): the phase stays
+        // visible while it lasts.
+        let phases_done =
+            self.load_total > 0 && self.load_done >= self.load_total;
+        let counts = if phases_done && self.loading {
+            self.status.clone()
+        } else if self.load_total > 0 {
             format!("{}  {} / {}", label, self.load_done, self.load_total)
         } else {
             label.to_string()
@@ -6416,6 +6669,7 @@ fn load_job(
     archive: PathBuf,
     active: PathBuf,
     parallel: usize,
+    check_conflicts: bool,
     mut tx: futures::channel::mpsc::Sender<LoadEvent>,
 ) {
     // The senders the progress closures share: futures'
@@ -6437,7 +6691,8 @@ fn load_job(
     let finished = match scan {
         Ok(mods) => {
             let mod_list: Vec<Mod> = mods.into_values().collect();
-            let conflicts = ConflictDetector::detect_conflicts(&mod_list);
+            let conflicts =
+                ConflictDetector::detect_conflicts_if_enabled(&mod_list, check_conflicts);
             let updates = updates_job(&mod_list, &|done, total| {
                 if let Ok(mut sender) = progress_tx.lock() {
                     let _ = sender.try_send(LoadEvent::Progress {
@@ -6582,7 +6837,10 @@ fn log_job(
     })
 }
 
-fn icon_job(jobs: Vec<(String, PathBuf, Option<String>)>) -> Vec<(String, LoadedIcon)> {
+fn icon_job(
+    jobs: Vec<(String, PathBuf, Option<String>)>,
+    cache_ttl_hours: u64,
+) -> Vec<(String, LoadedIcon)> {
     // Decoded icons are cached on disk (see icons.rs): the
     // first pass pays the archive opens and decodes, later
     // launches read ready-made thumbnails. The sweep after
@@ -6595,7 +6853,7 @@ fn icon_job(jobs: Vec<(String, PathBuf, Option<String>)>) -> Vec<(String, Loaded
     let out: Vec<(String, LoadedIcon)> = jobs
         .par_iter()
         .filter_map(|(id, path, icon)| {
-            load_icon_cached(path, icon.as_deref(), cache_dir.as_deref())
+            load_icon_cached(path, icon.as_deref(), cache_dir.as_deref(), cache_ttl_hours)
                 .map(|loaded| (id.clone(), loaded))
         })
         .collect();

@@ -35,7 +35,6 @@ pub struct SourceConfig {
 pub struct Settings {
     pub archive_directory: PathBuf,
     pub active_directory: PathBuf,
-    pub auto_update: bool,
     pub check_conflicts: bool,
     pub parallel_scans: usize,
     pub cache_ttl_hours: u64,
@@ -71,6 +70,29 @@ pub struct Settings {
 /// Serde default for Settings::catalog_url.
 fn default_catalog_url() -> String {
     crate::sources::catalog::DEFAULT_CATALOG_URL.to_string()
+}
+
+/// Clamp the scan-parallelism setting to the range the
+/// Settings page offers: at least one scan worker, and no
+/// more than sixteen.
+pub fn clamp_parallel_scans(value: usize) -> usize {
+    value.clamp(1, 16)
+}
+
+/// Clamp the cache lifetime setting: a cache must be
+/// allowed at least one hour before it can go stale.
+pub fn clamp_cache_ttl_hours(value: u64) -> u64 {
+    value.max(1)
+}
+
+/// The one staleness decision every cache in the app
+/// shares (the downloaded catalog and the decoded-icon
+/// cache): an entry whose age has reached its TTL is
+/// stale. The TTL is clamped to at least an hour, so a
+/// zero in a hand-edited config cannot make every entry
+/// permanently stale.
+pub fn is_stale(age_secs: u64, ttl_hours: u64) -> bool {
+    age_secs >= clamp_cache_ttl_hours(ttl_hours).saturating_mul(3600)
 }
 
 /// Expand a leading `~` in a configured path. Configs written by other
@@ -169,7 +191,6 @@ impl Config {
             settings: Settings {
                 archive_directory: home.join("FSMods").join("Archive"),
                 active_directory: home.join("FSMods").join("Active"),
-                auto_update: true,
                 check_conflicts: true,
                 parallel_scans: 4,
                 cache_ttl_hours: 24,
@@ -181,5 +202,53 @@ impl Config {
                 catalog_url: crate::sources::catalog::DEFAULT_CATALOG_URL.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_auto_update_key_is_ignored() {
+        // Config files written before the dead `auto_update`
+        // flag was deleted carry the key; serde's default
+        // unknown-field behavior must keep them loading.
+        let settings: Settings = toml::from_str(
+            r#"
+archive_directory = "/tmp/archive"
+active_directory = "/tmp/active"
+auto_update = true
+check_conflicts = true
+parallel_scans = 2
+cache_ttl_hours = 24
+"#,
+        )
+        .unwrap();
+        assert!(settings.check_conflicts);
+        assert_eq!(settings.parallel_scans, 2);
+        assert_eq!(settings.cache_ttl_hours, 24);
+    }
+
+    #[test]
+    fn settings_clamps_hold_their_ranges() {
+        assert_eq!(clamp_parallel_scans(0), 1);
+        assert_eq!(clamp_parallel_scans(4), 4);
+        assert_eq!(clamp_parallel_scans(99), 16);
+        assert_eq!(clamp_cache_ttl_hours(0), 1);
+        assert_eq!(clamp_cache_ttl_hours(24), 24);
+    }
+
+    #[test]
+    fn staleness_turns_at_the_ttl_boundary() {
+        assert!(!is_stale(0, 1));
+        assert!(!is_stale(3599, 1));
+        assert!(is_stale(3600, 1));
+        assert!(!is_stale(86_399, 24));
+        assert!(is_stale(86_400, 24));
+        // A zero TTL clamps to one hour rather than making
+        // everything stale at age zero.
+        assert!(!is_stale(0, 0));
+        assert!(is_stale(3600, 0));
     }
 }
