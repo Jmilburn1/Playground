@@ -1,3 +1,4 @@
+use crate::app_update::{self, AppRelease};
 use crate::mod_manager::conflict::{Conflict, ConflictDetector, ConflictType};
 use crate::mod_manager::game_files;
 use crate::mod_manager::icons::{
@@ -491,6 +492,18 @@ pub struct App {
     /// apart so a failure never reads as a success.
     layout_outcome: Option<String>,
     layout_error: Option<String>,
+    /// App self-update (owner, 2026-10-22): the launch
+    /// check's finding, when a newer Playground release
+    /// exists. The notice over the status bar renders
+    /// from these three alone; nothing is persisted, so
+    /// a dismissal lasts only this launch.
+    app_update: Option<AppRelease>,
+    /// The Install click's job (download + verify +
+    /// stage) is in flight.
+    app_update_installing: bool,
+    /// The last install attempt's failure, shown in the
+    /// notice until dismissed or retried.
+    app_update_failed: Option<String>,
 }
 
 impl App {
@@ -581,6 +594,9 @@ impl App {
             layout_total: 0,
             layout_outcome: None,
             layout_error: None,
+            app_update: None,
+            app_update_installing: false,
+            app_update_failed: None,
         }
     }
 
@@ -1424,6 +1440,15 @@ impl App {
                     // would flip the frame off again).
                     let was_booting = self.booting;
                     self.booting = false;
+                    if was_booting {
+                        // A boot load just completed whole:
+                        // if this launch is a self-updated
+                        // binary's first run, it has proven
+                        // itself — its predecessor's .bak
+                        // backups stop earning their keep
+                        // here (see app_update's docs).
+                        app_update::cleanup_stale_backups();
+                    }
                     self.status = format!("Loaded {} mods — loading icons…", count);
                     let icons = self.begin_icon_load();
                     if was_booting {
@@ -1940,6 +1965,65 @@ impl App {
                     }
                 }
                 return self.begin_icon_load();
+            }
+            Message::AppUpdateCheckDone(found) => {
+                // The launch check's only voice: a newer
+                // Playground exists. Every quiet outcome
+                // (None) leaves the app exactly as it was.
+                if let Some(release) = found {
+                    self.app_update = Some(release);
+                }
+            }
+            Message::DismissAppUpdate => {
+                self.app_update = None;
+                self.app_update_failed = None;
+                self.app_update_installing = false;
+            }
+            Message::InstallAppUpdate => {
+                if let Some(release) = self.app_update.clone() {
+                    if !self.app_update_installing {
+                        self.app_update_installing = true;
+                        self.app_update_failed = None;
+                        self.status = format!(
+                            "Downloading Playground {}…",
+                            release.tag
+                        );
+                        return Task::perform(
+                            async move {
+                                app_update::download_and_stage(release)
+                                    .await
+                                    .map_err(|e| format!("{:#}", e))
+                            },
+                            Message::AppUpdateStaged,
+                        );
+                    }
+                }
+            }
+            Message::AppUpdateStaged(result) => {
+                self.app_update_installing = false;
+                match result {
+                    Ok(files) => {
+                        // The new release is staged and
+                        // verified. The swap itself cannot
+                        // run here — this process is the
+                        // binary being replaced — so hand
+                        // it to update.exe and exit; the
+                        // helper waits for this process to
+                        // die, swaps, and relaunches.
+                        match app_update::spawn_apply_helper(&files) {
+                            Ok(_child) => return iced::exit(),
+                            Err(e) => {
+                                self.app_update_failed = Some(format!(
+                                    "Could not start the update helper: {}",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.app_update_failed = Some(e);
+                    }
+                }
             }
             Message::DetectCatalogReady(catalog_pairs) => {
                 if !self.detect_jobs.is_empty() {
@@ -5123,7 +5207,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.4.1  © 2026 Farmer Jay.")
+            text("V1.5.0  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -5452,6 +5536,74 @@ impl App {
             .into()
     }
 
+    /// The app self-update notice: a steel-teal slab in
+    /// the view's top layer, directly above the status
+    /// bar. The top layer already overlays the content's
+    /// foot, so no page's geometry moves when the notice
+    /// appears or clears — and like the status bar it
+    /// sits in the layer the scroll-clip fix protects.
+    /// An empty strip when there is nothing to say.
+    fn app_update_notice(&self) -> Element<'_, Message> {
+        let label: String;
+        let mut actions = row![].spacing(8).align_y(iced::Alignment::Center);
+        if self.app_update_installing {
+            let tag = self
+                .app_update
+                .as_ref()
+                .map(|r| r.tag.as_str())
+                .unwrap_or("");
+            label = format!(
+                "Downloading Playground {} — the app will restart to finish installing.",
+                tag
+            );
+        } else if let Some(failure) = &self.app_update_failed {
+            label = format!("The app update did not install: {}", failure);
+            actions = actions.push(
+                button(text("Dismiss").size(12))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::DismissAppUpdate),
+            );
+        } else if let Some(release) = &self.app_update {
+            label = format!(
+                "Playground {} is available — you are running v{}.",
+                release.tag,
+                env!("CARGO_PKG_VERSION")
+            );
+            actions = actions.push(
+                button(text("Install update").size(12))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::InstallAppUpdate),
+            );
+            actions = actions.push(
+                button(text("Later").size(12))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::DismissAppUpdate),
+            );
+        } else {
+            return Space::with_height(0).into();
+        }
+        container(
+            row![
+                text(label).size(13).color(theme::TEXT),
+                Space::with_width(Length::Fill),
+                actions,
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(iced::Padding {
+            top: 8.0,
+            right: 10.0,
+            bottom: 8.0,
+            left: 10.0,
+        })
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(theme::ACCENT)),
+            ..container::Style::default()
+        })
+        .into()
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         if self.booting {
             return self.splash_view();
@@ -5573,6 +5725,10 @@ impl App {
                 None => Space::with_height(0).into(),
             },
             Space::with_height(Length::Fill),
+            // The app self-update notice (empty when the
+            // launch check found nothing): see
+            // app_update_notice.
+            self.app_update_notice(),
             container(status)
                 .padding(iced::Padding {
                     top: 10.0,
@@ -6087,7 +6243,17 @@ pub fn run(mod_manager: ModManager) -> anyhow::Result<()> {
         .run_with(move || {
             let mut app = App::new(mod_manager);
             let task = app.begin_load();
-            (app, task)
+            // The app self-update launch check (owner,
+            // 2026-10-22): one small request in the
+            // background from the first frame; it never
+            // delays the load, and its only message is
+            // Some when a newer Playground exists (see
+            // app_update::check_at_launch).
+            let check = Task::perform(
+                app_update::check_at_launch(),
+                Message::AppUpdateCheckDone,
+            );
+            (app, Task::batch([task, check]))
         });
     match result {
         Ok(()) => Ok(()),

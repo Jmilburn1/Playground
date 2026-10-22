@@ -353,6 +353,22 @@ pub enum Message {
     RestoreVerifySize(iced::Size),
     GridScrolled(iced::widget::scrollable::Viewport),
     ToggleShowMenu,
+    /// App self-update: the launch check answered. Some
+    /// carries the newer release; None covers up-to-date,
+    /// offline, refused and every other quiet outcome —
+    /// the check is silent unless it finds something.
+    AppUpdateCheckDone(Option<crate::app_update::AppRelease>),
+    /// App self-update: the notice's Install press.
+    InstallAppUpdate,
+    /// App self-update: the notice dismissed for this
+    /// launch (nothing is persisted; the next launch
+    /// checks again).
+    DismissAppUpdate,
+    /// App self-update: the download+verify+stage job
+    /// answered. Ok carries the staging folder holding
+    /// the new binaries; the app then hands the swap to
+    /// update.exe and exits.
+    AppUpdateStaged(Result<PathBuf, String>),
 }
 
 pub fn format_size(bytes: u64) -> String {

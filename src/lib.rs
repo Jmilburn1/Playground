@@ -13,6 +13,7 @@
 //!   and a crash or throttling halt in it can never take
 //!   the app down.
 
+pub mod app_update;
 pub mod cli;
 pub mod config;
 pub mod mod_manager;

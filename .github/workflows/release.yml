@@ -30,6 +30,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/playground.exe dist/
+          # update.exe rides along: the app self-update
+          # (v1.4.2+) swaps BOTH binaries from this zip —
+          # without it here, installed helpers could never
+          # be updated.
+          Copy-Item target/release/update.exe dist/
           Copy-Item README.md dist/ -ErrorAction SilentlyContinue
           Compress-Archive -Path dist/* -DestinationPath Playground-Windows.zip -Force
 
