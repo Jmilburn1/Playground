@@ -390,6 +390,8 @@ pub struct App {
     /// reaches the card's select handler (nested widgets), and this
     /// flag tells it to stand down once.
     just_toggled_favorite: bool,
+    /// The same stand-down flag for a card's activate slider.
+    just_toggled_state: bool,
     /// Configure Save wizard state. The step is 0-based:
     /// 0 Select, 1 Settings, 2 Loadout, 3 Review, 4 Results.
     /// `wizard_original` is the save as read from disk; the
@@ -524,6 +526,7 @@ impl App {
             load_done: 0,
             load_total: 0,
             just_toggled_favorite: false,
+            just_toggled_state: false,
             save_slots_cache: Vec::new(),
             saves_selected: None,
             saves_draft: HashSet::new(),
@@ -2163,6 +2166,8 @@ impl App {
                 // sets this flag first, so ignore that one selection.
                 if self.just_toggled_favorite {
                     self.just_toggled_favorite = false;
+                } else if self.just_toggled_state {
+                    self.just_toggled_state = false;
                 } else {
                     if let Some(m) = self.mod_manager.get_mod(&id) {
                         let stem = ModManager::mod_stem(&m.path);
@@ -2192,6 +2197,37 @@ impl App {
                 // handler right after; flag it to stand down once.
                 self.just_toggled_favorite = true;
                 self.apply_toggle_favorite(&id);
+            }
+            Message::CardToggleState(id) => {
+                // The slider click also reaches the card's select
+                // handler right after; flag it to stand down once.
+                self.just_toggled_state = true;
+                let name = self.mod_manager.get_mod(&id).map(|m| m.name.clone());
+                let is_active = self
+                    .mod_manager
+                    .get_mod(&id)
+                    .map(|m| m.state == ModState::Active)
+                    .unwrap_or(false);
+                // The slider runs the panel's own move operations:
+                // active flips to archive, anything else flips to
+                // active — under the layout these are the link
+                // operations, so the card and the panel can never
+                // disagree about what flipping means.
+                let result = if is_active {
+                    self.mod_manager.move_to_archive(&id)
+                } else {
+                    self.mod_manager.move_to_active(&id)
+                };
+                match result {
+                    Ok(()) => {
+                        self.status = format!(
+                            "{} {}.",
+                            if is_active { "Deactivated" } else { "Activated" },
+                            name.unwrap_or_default()
+                        )
+                    }
+                    Err(e) => self.status = format!("Toggle failed: {}", e),
+                }
             }
             Message::MoveToArchive(id) => {
                 let name = self.mod_manager.get_mod(&id).map(|m| m.name.clone());
@@ -2786,7 +2822,7 @@ impl App {
         // plus the toolbar spacing puts the field at x = 52.
         let menu: Option<Element<'_, Message>> = if self.show_menu_open {
             let option_count = view_options.len();
-            let mut options_col = column![].spacing(0).width(200);
+            let mut options_col = column![].spacing(2).width(200);
             for opt in view_options {
                 let selected = opt == self.view_filter;
                 options_col = options_col.push(
@@ -2794,24 +2830,7 @@ impl App {
                         .width(200)
                         .padding([6, 10])
                         .on_press(Message::BrowseViewChanged(opt))
-                        .style(move |_theme, status| {
-                            let bg = if selected {
-                                iced::Color::from_rgb(0.2, 0.349, 0.855)
-                            } else {
-                                match status {
-                                    iced::widget::button::Status::Hovered
-                                    | iced::widget::button::Status::Pressed => {
-                                        iced::Color::from_rgb(0.45, 0.45, 0.46)
-                                    }
-                                    _ => iced::Color::from_rgb(0.396, 0.4, 0.4),
-                                }
-                            };
-                            iced::widget::button::Style {
-                                background: Some(iced::Background::Color(bg)),
-                                text_color: iced::Color::WHITE,
-                                ..Default::default()
-                            }
-                        }),
+                        .style(theme::nav_pill(selected)),
                 );
             }
             let menu_inner: Element<'_, Message> =
@@ -2823,10 +2842,8 @@ impl App {
             Some(
                 row![
                     Space::with_width(52),
-                    container(menu_inner).style(|_| container::Style {
-                        background: Some(iced::Background::Color(
-                            iced::Color::from_rgb(0.396, 0.4, 0.4),
-                        )),
+                    container(menu_inner).padding(4).style(|_| container::Style {
+                        background: Some(iced::Background::Color(theme::BASE)),
                         border: iced::Border {
                             color: iced::Color::from_rgb(0.35, 0.36, 0.40),
                             width: 1.0,
@@ -3067,10 +3084,11 @@ impl App {
                     .on_press(Message::CheckUpdate(m.id.clone())),
             );
             if let Some(UpdateState::Available(info)) = self.update_status.get(&m.id) {
-                let label = format!("Download && install v{}", info.version);
+                let label = format!("Download & install v{}", info.version);
                 col = col.push(
                     button(centered_label(text(label)))
                         .width(Length::Fill)
+                        .style(theme::nav_pill(true))
                         .on_press(Message::InstallUpdate(m.id.clone())),
                 );
             }
@@ -3093,10 +3111,11 @@ impl App {
                 ))
                 .size(12),
             );
-            let label = format!("Download && install v{}", info.version);
+            let label = format!("Download & install v{}", info.version);
             col = col.push(
                 button(centered_label(text(label)))
                     .width(Length::Fill)
+                    .style(theme::nav_pill(true))
                     .on_press(Message::InstallUpdate(m.id.clone())),
             );
             if m.mod_type != crate::mod_manager::types::ModType::Zip {
@@ -3158,6 +3177,7 @@ impl App {
                     .on_input(Message::LinkInputChanged)
                     .size(13),
                 button(text(if linked.is_some() { "Save link" } else { "Link" }).size(13))
+                    .style(theme::nav_pill(true))
                     .on_press(Message::SaveModLink(m.id.clone())),
             ]
             .spacing(6),
@@ -3169,6 +3189,7 @@ impl App {
                     .on_input(Message::ModHubInputChanged)
                     .size(13),
                 button(text(if mh_linked.is_some() { "Save link" } else { "Link" }).size(13))
+                    .style(theme::nav_pill(true))
                     .on_press(Message::SaveModHubLink(m.id.clone())),
             ]
             .spacing(6),
@@ -4566,7 +4587,9 @@ impl App {
             row![
                 text("Game log (log.txt)").size(17),
                 Space::with_width(Length::Fill),
-                button(text("Refresh")).on_press(Message::RefreshLog),
+                button(text("Refresh"))
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::RefreshLog),
             ]
             .spacing(8),
             checkbox("Errors and warnings only", self.log_errors_only)
@@ -4663,6 +4686,7 @@ impl App {
                         if on { "On" } else { "Off" }
                     )),
                     button(text(if on { "Turn off" } else { "Turn on" }))
+                        .style(theme::nav_pill(true))
                         .on_press(Message::ToggleConsole(!on)),
                 ]
                 .spacing(8)
@@ -4691,7 +4715,9 @@ impl App {
                     .on_input(Message::ActiveDirChanged)
                     .padding(8)
                     .width(Length::Fill),
-                button(text("Browse")).on_press(Message::BrowseFolder(FolderTarget::Active)),
+                button(text("Browse"))
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::BrowseFolder(FolderTarget::Active)),
             ]
             .spacing(8),
             text("Library folder (stored mods):"),
@@ -4701,14 +4727,19 @@ impl App {
                     .padding(8)
                     .width(Length::Fill),
                 button(text("Browse"))
+                    .style(theme::nav_pill(true))
                     .on_press(Message::BrowseFolder(FolderTarget::Archive)),
             ]
             .spacing(8),
-            button(text("Save folders")).on_press(Message::SaveDirectories),
+            button(text("Save folders"))
+                .style(theme::nav_pill(true))
+                .on_press(Message::SaveDirectories),
             text("Game install folder (holds game.xml):"),
             row![
                 text(game_folder_label),
-                button(text("Browse")).on_press(Message::BrowseFolder(FolderTarget::Game)),
+                button(text("Browse"))
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::BrowseFolder(FolderTarget::Game)),
             ]
             .spacing(8),
             console_row,
@@ -4719,7 +4750,9 @@ impl App {
             text(format!("Favorites: {}", self.mod_manager.favorites_count())),
             text("Paths are saved to config.toml when you click Save folders.")
                 .size(12),
-            button(text("Rescan folders")).on_press(Message::Scan),
+            button(text("Rescan folders"))
+                .style(theme::danger_pill())
+                .on_press(Message::Scan),
         ]
         .spacing(10)
         .into()
@@ -4791,7 +4824,7 @@ impl App {
         // ---- Plan preview ------------------------------
         match &self.layout_preview {
             None => {
-                let mut b = button(text("Build plan")).padding(8);
+                let mut b = button(text("Build plan")).style(theme::nav_pill(true));
                 if !busy && !self.loading {
                     b = b.on_press(Message::LayoutBuildPlan);
                 }
@@ -4848,7 +4881,7 @@ impl App {
                     }
                     col = col.push(warns);
                 }
-                let mut rebuild = button(text("Rebuild plan")).padding(8);
+                let mut rebuild = button(text("Rebuild plan")).style(theme::nav_pill(true));
                 if !busy && !self.loading {
                     rebuild = rebuild.on_press(Message::LayoutBuildPlan);
                 }
@@ -5090,7 +5123,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.4.0  © 2026 Farmer Jay.")
+            text("V1.4.1  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -5459,6 +5492,14 @@ impl App {
         // toolbar 36 + spacing 8) at the top, status 17 + spacing
         // 10 at the bottom; the slabs' extra padding (8 bottom /
         // 10 top) covers the spacing gaps at the grid's edges.
+        // With EMPTY top controls the slab is 40 + 10 + 0 + the
+        // 8 of bottom padding = 58 tall, not 50 — the padding
+        // paints BELOW the 50 mark, so a 50 hole left the slab
+        // overpainting the top 8px of every such page's first
+        // row (John, live, 2026-10-22: the Log Reader's title
+        // decapitated under the banner; measured in the rig:
+        // first-row ink flat-clipped at slab bottom on the Log
+        // and Settings pages alike). The non-Browse hole is 58.
         let (top_controls, menu, content, top_hole): (
             Element<'_, Message>,
             Option<Element<'_, Message>>,
@@ -5473,26 +5514,26 @@ impl App {
                 Space::with_height(0).into(),
                 None,
                 self.conflicts_view(),
-                50.0,
+                58.0,
             ),
             Tab::Saves => (
                 Space::with_height(0).into(),
                 None,
                 self.saves_view(),
-                50.0,
+                58.0,
             ),
             Tab::Layout => (
                 Space::with_height(0).into(),
                 None,
                 self.layout_view(),
-                50.0,
+                58.0,
             ),
-            Tab::Log => (Space::with_height(0).into(), None, self.log_view(), 50.0),
+            Tab::Log => (Space::with_height(0).into(), None, self.log_view(), 58.0),
             Tab::Settings => (
                 Space::with_height(0).into(),
                 None,
                 self.settings_view(),
-                50.0,
+                58.0,
             ),
         };
 

@@ -96,9 +96,20 @@ impl LibraryDb {
             return db;
         };
         match serde_json::from_str::<DbFile>(&text) {
-            Ok(file) if file.format == 1 => {
+            Ok(file) if file.format == 2 => {
                 db.loaded = file.rows.clone();
                 db.rows = Mutex::new(file.rows);
+            }
+            Ok(_file) if _file.format == 1 => {
+                // Format 1 rows were parsed under the old
+                // category rules — Playground's own buckets
+                // (owner ruling, 2026-10-22, replaced them
+                // with the game's categories). A stored row
+                // carries nothing to recompute its categories
+                // from, so the rows are left behind for a
+                // one-time re-parse and the next save writes
+                // format 2. A known format, not damage: no
+                // quarantine.
             }
             _ => {
                 // Damaged (or a stranger's format): set the
@@ -177,6 +188,27 @@ impl LibraryDb {
                         stored.categories =
                             vec![super::categories::DLC_CATEGORY.to_string()];
                     }
+                    // A map's only category is "Maps" (owner
+                    // ruling, 2026-10-22): rows stored before
+                    // the ruling can also carry buckets the
+                    // map's bundled store items earned
+                    // ("Animal buildings", "Decorations"), so
+                    // normalize them here the same way — in
+                    // the stored row, so the correction
+                    // persists on the next save and the
+                    // served record matches a fresh parse.
+                    // Only map detection ever assigns "Maps",
+                    // so its presence marks the row as a map's.
+                    if stored
+                        .categories
+                        .iter()
+                        .any(|c| c == super::categories::MAPS)
+                        && stored.categories
+                            != vec![super::categories::MAPS.to_string()]
+                    {
+                        stored.categories =
+                            vec![super::categories::MAPS.to_string()];
+                    }
                     return Some(stored.clone());
                 }
             }
@@ -217,7 +249,7 @@ impl LibraryDb {
             return;
         }
         let file = DbFile {
-            format: 1,
+            format: 2,
             generated_at: now_secs(),
             rows: rows.clone(),
         };

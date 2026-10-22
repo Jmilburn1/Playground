@@ -2,12 +2,18 @@
 //!
 //! There is no single "category" field in modDesc.xml — the category
 //! lives in each store item's own XML as `<storeData><category>`,
-//! where the game keeps ids like `tractorsSmall` or `slurryTanks`.
-//! This module reads every store item the modDesc declares, maps its
-//! category id (or, failing that, its vehicle/placeable type and the
-//! custom-type parent chain) to a player-facing bucket, and returns
-//! the mod's buckets: a pack can land in several. Map mods declare
-//! `<maps>` in the modDesc; a mod with no store items and no map is
+//! where the game keeps ids like `tractorsS` or `slurryTanks`.
+//! This module reads every store item the modDesc declares and
+//! names its category THE GAME'S WAY (owner ruling, 2026-10-22):
+//! the declared shop category, faithfully named, size classes
+//! included — Playground invents no buckets of its own, so the
+//! category here is the same shelf the player buys the item
+//! from in the shop. An item with no declared category falls
+//! back to its vehicle/placeable type and the custom-type
+//! parent chain. A pack can land in several categories. A map
+//! is detected from the file itself (a top-level `maps/`
+//! folder, or a modDesc `<maps>` declaration) and its only
+//! category is Maps; a mod with no store items and no map is
 //! a script/gameplay mod.
 
 use super::moddesc::ModDescInfo;
@@ -36,7 +42,11 @@ pub fn detect_categories(path: &Path, info: Option<&ModDescInfo>) -> Vec<String>
     };
 
     if info.has_map {
-        found.push(MAPS.to_string());
+        // A map is a map (owner ruling, 2026-10-22): maps used to
+        // also inherit buckets from the store items they bundle,
+        // which put maps under "Animal buildings", "Decorations",
+        // and the like. Maps is the map's only category.
+        return vec![MAPS.to_string()];
     }
     for item_file in &info.store_items {
         if let Some(xml) = read_text_file(path, item_file) {
@@ -167,30 +177,34 @@ fn read_text_file(mod_path: &Path, rel: &str) -> Option<String> {
     }
 }
 
-/// Map one store item to its display bucket.
+/// Map one store item to its category — the game's category,
+/// named the game's way (owner ruling, 2026-10-22).
 fn bucket_for(item: &StoreItem, type_parents: &HashMap<String, String>) -> String {
-    if item.root.eq_ignore_ascii_case("placeable") {
-        return placeable_bucket(item);
+    // A declared shop category wins for every kind of item:
+    // the mod itself says which shelf it sits on.
+    if let Some(category) = &item.category {
+        return game_category_name(category);
     }
     if item.root.eq_ignore_ascii_case("handTool") {
         return "Hand tools".to_string();
     }
+    if item.root.eq_ignore_ascii_case("placeable") {
+        // No declared category: the placeable's own type,
+        // cleaned, then the game's catch-all section.
+        if let Some(kind) = &item.placeable_type {
+            return prettify(kind);
+        }
+        return "Placeables".to_string();
+    }
     if !item.root.eq_ignore_ascii_case("vehicle") {
         return prettify(&item.root);
     }
-    // Vehicle: declared shop category first.
-    if let Some(category) = &item.category {
-        if let Some(bucket) = category_bucket(&category.to_lowercase()) {
-            return bucket.to_string();
-        }
-        return prettify(category);
-    }
-    // Then the vehicle type, walking custom-type parents to a vanilla
-    // family when the type itself is unknown.
+    // A vehicle with no declared category: walk its type and
+    // the custom-type parent chain to a vanilla family.
     let mut current = item.type_name.clone();
     for _ in 0..8 {
         let Some(name) = current else { break };
-        if let Some(bucket) = vehicle_type_bucket(&name.to_lowercase()) {
+        if let Some(bucket) = vehicle_type_name(&name.to_lowercase()) {
             return bucket.to_string();
         }
         current = type_parents.get(&name).cloned();
@@ -198,112 +212,41 @@ fn bucket_for(item: &StoreItem, type_parents: &HashMap<String, String>) -> Strin
     "Vehicles".to_string()
 }
 
-fn placeable_bucket(item: &StoreItem) -> String {
-    if let Some(category) = &item.category {
-        let c = category.to_lowercase();
-        if c.contains("silo") {
-            return "Silos & storage".to_string();
-        }
-        if c.contains("husbandry") || c.contains("animal") {
-            return "Animal buildings".to_string();
-        }
-        if c.contains("production") || c.contains("factor") {
-            return "Productions".to_string();
-        }
-        if c.contains("greenhouse") {
-            return "Greenhouses".to_string();
-        }
-        if c.contains("shed") || c.contains("building") || c.contains("house") {
-            return "Sheds & buildings".to_string();
-        }
-        if c.contains("solar") || c.contains("wind") || c.contains("generator") {
-            return "Generators".to_string();
-        }
-        if c.contains("decor") {
-            return "Decorations".to_string();
-        }
-    }
-    if let Some(kind) = &item.placeable_type {
-        let k = kind.to_lowercase();
-        if k.contains("husbandry") {
-            return "Animal buildings".to_string();
-        }
-        if k.contains("silo") {
-            return "Silos & storage".to_string();
-        }
-        if k.contains("production") || k.contains("factory") {
-            return "Productions".to_string();
-        }
-    }
-    "Placeables".to_string()
-}
-
-/// Known game shop-category ids -> display buckets (vehicles/tools).
-/// Order matters: manure is checked before generic "spreader".
-fn category_bucket(c: &str) -> Option<&'static str> {
-    let has = |needle: &str| c.contains(needle);
-    if has("tractor") {
-        Some("Tractors")
-    } else if has("truck") {
-        Some("Trucks")
-    } else if has("car") && !has("scarifier") {
-        Some("Cars")
-    } else if has("harvest") {
-        Some("Harvesters")
-    } else if has("slurry") || has("manure") {
-        Some("Tanks & spreaders")
-    } else if has("sprayer") || has("fertilizer") {
-        Some("Sprayers & fertilizer")
-    } else if has("header") || has("cutter") {
-        Some("Headers & cutters")
-    } else if has("mower") || has("tedder") || has("windrower") || has("bale") || has("forage") {
-        Some("Hay & forage")
-    } else if has("seeder") || has("planter") || has("sowing") {
-        Some("Seeding")
-    } else if has("plow")
-        || has("cultivator")
-        || has("harrow")
-        || has("subsoiler")
-        || has("mulcher")
-        || has("roller")
-        || has("weeder")
-        || has("spader")
-    {
-        Some("Tillage")
-    } else if has("trailer") || has("dolly") || has("lowloader") || has("augerwagon") {
-        Some("Trailers")
-    } else if has("loader") || has("telehandler") || has("weight") || has("forklift") {
-        Some("Loaders & handling")
-    } else if has("forest") || has("wood") {
-        Some("Forestry")
-    } else {
-        None
+/// The game's shop name for a declared category id. The ids
+/// whose cleaned form would lose meaning get their exact shop
+/// names — the size classes (owner, 2026-10-22: the S/M/L
+/// distinction is a map-fit distinction and is preserved).
+/// Every other id is camelCase whose cleaned form IS the
+/// shop's name (slurryTanks -> "Slurry Tanks"), so an id we
+/// don't know displays the game's own word, cleaned — never
+/// a bucket Playground invented.
+fn game_category_name(id: &str) -> String {
+    match id.to_lowercase().as_str() {
+        "tractorss" => "Small Tractors".to_string(),
+        "tractorsm" => "Medium Tractors".to_string(),
+        "tractorsl" => "Large Tractors".to_string(),
+        _ => prettify(id),
     }
 }
 
-/// Vanilla vehicle type names -> display buckets (fallback path).
-fn vehicle_type_bucket(t: &str) -> Option<&'static str> {
-    let has = |needle: &str| t.contains(needle);
-    if has("tractor") {
-        Some("Tractors")
-    } else if has("harvester") || has("combine") {
-        Some("Harvesters")
-    } else if has("sprayer") {
-        Some("Sprayers & fertilizer")
-    } else if has("manure") || has("slurry") {
-        Some("Tanks & spreaders")
-    } else if has("cutter") || has("header") {
-        Some("Headers & cutters")
-    } else if has("baler") || has("mower") {
-        Some("Hay & forage")
-    } else if has("trailer") || has("augerwagon") || has("dolly") {
-        Some("Trailers")
-    } else if has("truck") || has("locomotive") {
-        Some("Trucks")
-    } else if has("car") && !has("scarifier") {
-        Some("Cars")
-    } else {
-        None
+/// Vanilla vehicle type names -> category names (fallback for
+/// a vehicle that declares no shop category of its own).
+fn vehicle_type_name(t: &str) -> Option<&'static str> {
+    match t {
+        "tractor" => Some("Tractors"),
+        "harvester" | "combine" => Some("Harvesters"),
+        "forageharvester" => Some("Forage Harvesters"),
+        "sprayer" => Some("Sprayers"),
+        "trailer" => Some("Trailers"),
+        "truck" => Some("Trucks"),
+        "car" => Some("Cars"),
+        "telehandler" => Some("Telehandlers"),
+        "wheelloader" => Some("Wheel Loaders"),
+        "skidsteer" => Some("Skid Steers"),
+        "frontloader" => Some("Front Loaders"),
+        "baler" => Some("Balers"),
+        "mower" => Some("Mowers"),
+        _ => None,
     }
 }
 

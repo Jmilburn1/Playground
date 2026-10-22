@@ -230,6 +230,9 @@ pub enum Message {
     /// Favorite toggle from a card's star badge (also sets the
     /// select-suppression flag in the app).
     CardToggleFavorite(String),
+    /// Activate/deactivate from a card's slider switch (also
+    /// sets the select-suppression flag in the app).
+    CardToggleState(String),
     ToggleFavoritesOnly,
     MoveToArchive(String),
     MoveToActive(String),
@@ -517,7 +520,8 @@ pub fn mod_card<'a>(
             .size(14)
             .color(Color::from_rgb(0.94, 0.94, 0.96)),
     ]
-    .spacing(3);
+    .spacing(3)
+    .height(Length::Fill);
     if let Some(author) = &mod_data.author {
         bottom = bottom.push(
             text(author.clone())
@@ -597,6 +601,50 @@ pub fn mod_card<'a>(
             pill_block = pill_block.push(r);
         }
         bottom = bottom.push(pill_block);
+    }
+
+    // The activate slider (John, 2026-10-22 — Silo's toggles,
+    // admired live the same night: they look nice and they are
+    // effective): a drawn switch on the card's bottom panel.
+    // Flipping it activates or deactivates the mod without
+    // opening the details panel — the same move operations the
+    // panel's buttons run. Only Active/Archived mods carry
+    // one; a conflicted or errored mod's state is not a
+    // two-position question. Drawn on a canvas like the star:
+    // no font glyph or stock widget is trusted to look the
+    // same on every build.
+    if matches!(mod_data.state, ModState::Active | ModState::Archived) {
+        let is_active = mod_data.state == ModState::Active;
+        let switch = button(
+            container(iced::widget::canvas(SwitchIcon { on: is_active }).width(34).height(19))
+                .width(34)
+                .height(19)
+                .center_x(34)
+                .center_y(19),
+        )
+        .width(34)
+        .height(19)
+        .padding(0)
+        .style(|_, _| button::Style {
+            background: None,
+            ..button::Style::default()
+        })
+        .on_press(Message::CardToggleState(mod_data.id.clone()));
+        // Bottom RIGHT of the card, and wordless (owner
+        // ruling, 2026-10-22, from the Playground room): the
+        // switch alone at the panel's right edge — "the pill
+        // will tell us"; the state pill above already carries
+        // the word, so the toggle is just the switch.
+        // (v1.4.1) The row is anchored to the panel's BOTTOM
+        // too: the Fill-height spacer above it drops it into
+        // the card's bottom-right corner. Before, the row
+        // ended the content stack wherever the pills ended
+        // and floated with dead panel below it — measured in
+        // the rig at ~55px above the card's bottom border.
+        bottom = bottom.push(iced::widget::Space::with_height(Length::Fill));
+        bottom = bottom.push(
+            row![iced::widget::Space::with_width(Length::Fill), switch].spacing(7),
+        );
     }
 
     let panel: Element<'a, Message> = container(bottom)
@@ -687,6 +735,61 @@ impl<Message> iced::widget::canvas::Program<Message> for StarIcon {
                     .with_width(1.4),
             );
         }
+        vec![frame.into_geometry()]
+    }
+}
+
+/// An activate/deactivate slider drawn with canvas paths —
+/// the Silo-style switch (John, 2026-10-22): a pill track and
+/// a round knob, knob right on the steel-teal accent track
+/// when the mod is active, knob left on a dim track when it
+/// is not. The colors are the app palette's own values (see
+/// ui::theme), so the switch wears the layout's colors.
+pub struct SwitchIcon {
+    pub on: bool,
+}
+
+impl<Message> iced::widget::canvas::Program<Message> for SwitchIcon {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        _renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        use iced::widget::canvas::{Frame, Path};
+        let mut frame = Frame::new(_renderer, bounds.size());
+        let w = bounds.width;
+        let h = bounds.height;
+        // theme::ACCENT (#3E5F6E) lit, theme::PANEL's dimmer
+        // sibling grey at rest.
+        let track_color = if self.on {
+            Color::from_rgb(0x3E as f32 / 255.0, 0x5F as f32 / 255.0, 0x6E as f32 / 255.0)
+        } else {
+            Color::from_rgb(0.30, 0.31, 0.34)
+        };
+        let track = Path::rounded_rectangle(
+            iced::Point::new(0.0, 0.0),
+            iced::Size::new(w, h),
+            (h / 2.0).into(),
+        );
+        frame.fill(&track, track_color);
+        let knob_r = h / 2.0 - 2.5;
+        let knob_center = iced::Point::new(
+            if self.on { w - h / 2.0 } else { h / 2.0 },
+            h / 2.0,
+        );
+        // theme::TEXT (#DFE9ED) lit, TEXT_DIM (#ACC3D0) at rest.
+        let knob_color = if self.on {
+            Color::from_rgb(0xDF as f32 / 255.0, 0xE9 as f32 / 255.0, 0xED as f32 / 255.0)
+        } else {
+            Color::from_rgb(0xAC as f32 / 255.0, 0xC3 as f32 / 255.0, 0xD0 as f32 / 255.0)
+        };
+        let knob = Path::circle(knob_center, knob_r);
+        frame.fill(&knob, knob_color);
         vec![frame.into_geometry()]
     }
 }

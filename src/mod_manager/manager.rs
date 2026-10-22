@@ -1920,6 +1920,100 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    fn write_entries_zip(path: &std::path::Path, entries: &[(&str, &str)]) {
+        use std::io::Write as _;
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in entries {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn map_detected_from_maps_folder_not_paperwork() {
+        // Owner ruling, 2026-10-22: a top-level maps/ folder
+        // in the zip makes the mod a map even when the modDesc
+        // declares no <maps> section — and Maps is its only
+        // category, even though the mod bundles a placeable
+        // store item (the old code bucketed it by that item).
+        let base =
+            std::env::temp_dir().join(format!("mm-mapfolder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let zip_path = base.join("FS25_MapNoDeclare.zip");
+        write_entries_zip(
+            &zip_path,
+            &[
+                (
+                    "modDesc.xml",
+                    "<modDesc><author>T</author><title><en>Map</en></title><version>1.0.0.0</version><storeItems><storeItem xmlFilename=\"barn.xml\"/></storeItems></modDesc>",
+                ),
+                (
+                    "barn.xml",
+                    "<placeable><storeData><category>husbandry</category></storeData></placeable>",
+                ),
+                ("maps/testmap/map.xml", "<map/>"),
+            ],
+        );
+        let m = crate::mod_manager::types::Mod::new(zip_path).unwrap();
+        assert_eq!(m.categories, vec!["Maps".to_string()]);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn categories_use_the_games_names_with_sizes() {
+        // Owner ruling, 2026-10-22: the store item's declared
+        // category, named the game's way — tractorsS is Small
+        // Tractors (the size class is preserved, not flattened
+        // into "Tractors"), and an id with no special name
+        // displays cleaned (slurryTanks -> "Slurry Tanks"),
+        // never reinterpreted into an invented bucket.
+        let base =
+            std::env::temp_dir().join(format!("mm-gamecat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let small = base.join("FS25_SmallTractor.zip");
+        write_entries_zip(
+            &small,
+            &[
+                (
+                    "modDesc.xml",
+                    "<modDesc><author>T</author><title><en>Tractor</en></title><version>1.0.0.0</version><storeItems><storeItem xmlFilename=\"tractor.xml\"/></storeItems></modDesc>",
+                ),
+                (
+                    "tractor.xml",
+                    "<vehicle type=\"tractor\"><storeData><category>tractorsS</category></storeData></vehicle>",
+                ),
+            ],
+        );
+        let m = crate::mod_manager::types::Mod::new(small).unwrap();
+        assert_eq!(m.categories, vec!["Small Tractors".to_string()]);
+
+        let tank = base.join("FS25_SlurryTank.zip");
+        write_entries_zip(
+            &tank,
+            &[
+                (
+                    "modDesc.xml",
+                    "<modDesc><author>T</author><title><en>Tank</en></title><version>1.0.0.0</version><storeItems><storeItem xmlFilename=\"tank.xml\"/></storeItems></modDesc>",
+                ),
+                (
+                    "tank.xml",
+                    "<vehicle type=\"trailer\"><storeData><category>slurryTanks</category></storeData></vehicle>",
+                ),
+            ],
+        );
+        let m = crate::mod_manager::types::Mod::new(tank).unwrap();
+        assert_eq!(m.categories, vec!["Slurry Tanks".to_string()]);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// THE acceptance scenario (owner, 2026-10-21, after
     /// the v1.3.0 field test): the migrated library's mod
     /// list must be indistinguishable from the flat

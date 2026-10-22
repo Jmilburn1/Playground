@@ -21,7 +21,12 @@ pub struct ModDescInfo {
     /// mod adds (vehicles, placeables, tools). Category detection
     /// reads each item's own XML for its shop category.
     pub store_items: Vec<String>,
-    /// True when the modDesc declares a `<maps>` section (a map mod).
+    /// True when the mod is a map: the modDesc declares a
+    /// `<maps>` section, or the mod physically carries a
+    /// top-level `maps/` folder — the owner's ground-truth
+    /// signal (2026-10-22): maps are the only mods that have
+    /// one, so the file itself settles what the paperwork
+    /// could get wrong.
     pub has_map: bool,
     /// Custom vehicle/placeable type name -> parent type name, from
     /// `<vehicleTypes>` / `<placeableTypes>`. Lets category detection
@@ -32,42 +37,58 @@ pub struct ModDescInfo {
 
 /// Read and parse the modDesc.xml for the mod at `path`, if one exists.
 pub fn read_metadata(path: &Path) -> Option<ModDescInfo> {
-    let xml = read_moddesc_xml(path)?;
-    parse_moddesc(&xml)
+    let (xml, maps_folder) = read_moddesc_xml(path)?;
+    let mut info = parse_moddesc(&xml)?;
+    // The physical proof (owner ruling, 2026-10-22): a top-level
+    // maps/ folder inside the mod marks it as a map whether or
+    // not the modDesc remembered to declare a <maps> section.
+    if maps_folder {
+        info.has_map = true;
+    }
+    Some(info)
 }
 
-fn read_moddesc_xml(path: &Path) -> Option<String> {
+/// The modDesc.xml text, plus whether the mod physically
+/// carries a top-level `maps/` folder (a `maps` directory for
+/// a folder mod; any `maps/...` entry for a zip).
+fn read_moddesc_xml(path: &Path) -> Option<(String, bool)> {
     if path.is_dir() {
-        std::fs::read_to_string(path.join("modDesc.xml")).ok()
+        let xml = std::fs::read_to_string(path.join("modDesc.xml")).ok()?;
+        let maps_folder = path.join("maps").is_dir();
+        Some((xml, maps_folder))
     } else if path
         .extension()
         .map_or(false, |e| e.eq_ignore_ascii_case("zip"))
     {
         let file = std::fs::File::open(path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
-        // Prefer a root-level modDesc.xml; remember the first nested one as
-        // a fallback for sloppily packed mods.
+        // One pass over the entry list: prefer a root-level
+        // modDesc.xml, remember the first nested one as a
+        // fallback for sloppily packed mods, and note any
+        // top-level maps/ entry on the way.
+        let mut root: Option<usize> = None;
         let mut fallback: Option<usize> = None;
+        let mut maps_folder = false;
         for i in 0..archive.len() {
             let name = {
                 let entry = archive.by_index(i).ok()?;
-                entry.name().to_string()
+                entry.name().replace('\\', "/")
             };
-            if name.eq_ignore_ascii_case("modDesc.xml") {
-                let mut entry = archive.by_index(i).ok()?;
-                let mut s = String::new();
-                entry.read_to_string(&mut s).ok()?;
-                return Some(s);
+            let lower = name.to_lowercase();
+            if lower.starts_with("maps/") {
+                maps_folder = true;
             }
-            if fallback.is_none() && name.to_lowercase().ends_with("/moddesc.xml") {
+            if name.eq_ignore_ascii_case("modDesc.xml") {
+                root = Some(i);
+            } else if fallback.is_none() && lower.ends_with("/moddesc.xml") {
                 fallback = Some(i);
             }
         }
-        let i = fallback?;
+        let i = root.or(fallback)?;
         let mut entry = archive.by_index(i).ok()?;
         let mut s = String::new();
         entry.read_to_string(&mut s).ok()?;
-        Some(s)
+        Some((s, maps_folder))
     } else {
         None
     }
