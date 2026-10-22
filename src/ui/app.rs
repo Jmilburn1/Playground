@@ -28,7 +28,7 @@ use futures::SinkExt as _;
 use iced::widget::image::Handle as ImageHandle;
 use iced::widget::{
     button, checkbox, column, container, progress_bar, row, scrollable, stack,
-    text, text_input, Space,
+    text, text_input, Scrollable, Space,
 };
 use iced::{Element, Length, Size, Subscription, Task, Theme};
 use rayon::prelude::*;
@@ -67,6 +67,34 @@ const RESTORE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 const SIDEBAR_W: f32 = 232.0;
 const GRID_SPACING: f32 = 12.0;
 const DETAILS_W: f32 = 344.0;
+/// The right margin every page keeps between its content
+/// and the scrollbar / window edge (John, 2026-10-22): it
+/// mirrors the shell's 10px sidebar-to-content spacing
+/// (see view()), so a page breathes the same on both
+/// sides. No full-bleed exceptions — the details pane and
+/// the banners keep it too.
+const PAGE_MARGIN: f32 = 10.0;
+
+/// A page's scrollable with PAGE_MARGIN of room on the
+/// content's right (John's app-wide margin rule). The
+/// shell's row spacing already gives every page the same
+/// 10px on its left, so only the right side needs the
+/// pad — and it goes on the scrollable's child, never on
+/// the shell's main stack (padding the shell would shift
+/// the header and status slabs and still leave the
+/// computed-width grids wrong). With the pad inside, the
+/// scrollbar sits at the padded edge, clear of the
+/// content it used to paint over.
+fn page_scroll<'a>(content: impl Into<Element<'a, Message>>) -> Scrollable<'a, Message> {
+    scrollable(
+        container(content)
+            .padding(iced::Padding {
+                right: PAGE_MARGIN,
+                ..Default::default()
+            })
+            .width(Length::Fill),
+    )
+}
 
 /// A lone button label, centered across the button's full
 /// width (John, 2026-10-21: button text centered, app-wide).
@@ -3142,8 +3170,16 @@ impl App {
             // grid now aims for a ~185px card and lets the column count
             // follow the window width. On very narrow windows the count
             // steps down so a card never gets narrower than readable.
-            let content_w = (self.window_size.width - 24.0 - SIDEBAR_W - GRID_SPACING)
-                .max(150.0);
+            // Width math from the real shell geometry
+            // (John's margin rule): window padding 24 +
+            // sidebar + the shell's 10 spacing +
+            // PAGE_MARGIN on the right, so the last card
+            // ends PAGE_MARGIN from the edge. (Deducting
+            // GRID_SPACING instead left the cards ~2px
+            // from it.)
+            let content_w =
+                (self.window_size.width - 24.0 - SIDEBAR_W - 10.0 - PAGE_MARGIN)
+                    .max(150.0);
             let grid_w = if pane_open {
                 (content_w - DETAILS_W - GRID_SPACING).max(150.0)
             } else {
@@ -3225,10 +3261,24 @@ impl App {
         };
 
         let body: Element<'_, Message> = if let Some(details) = self.details_view() {
-            row![content, details]
-                .spacing(GRID_SPACING)
-                .height(Length::Fill)
-                .into()
+            // The pane keeps PAGE_MARGIN on its right too
+            // (John's rule, no exceptions): the row rides
+            // in a right-padded container, and the grid's
+            // content_w above already reserved the pane's
+            // width plus this margin, so grid and pane
+            // never overlap. The pane's own inner padding
+            // (14) is untouched.
+            container(
+                row![content, details]
+                    .spacing(GRID_SPACING)
+                    .height(Length::Fill),
+            )
+            .padding(iced::Padding {
+                right: PAGE_MARGIN,
+                ..Default::default()
+            })
+            .height(Length::Fill)
+            .into()
         } else {
             content
         };
@@ -3278,8 +3328,19 @@ impl App {
 
         // The tiles/toolbar and the body are returned separately:
         // view() draws them in different stack layers (see there).
+        // The top column rides in a right-padded container so
+        // the tiles end PAGE_MARGIN from the edge (John's
+        // margin rule); only the visible content insets —
+        // view()'s opaque cover slab behind it stays
+        // full-width, so the scroll-clip fix keeps its cover.
         (
-            column![tiles, toolbar].spacing(8).into(),
+            container(column![tiles, toolbar].spacing(8))
+                .padding(iced::Padding {
+                    right: PAGE_MARGIN,
+                    ..Default::default()
+                })
+                .width(Length::Fill)
+                .into(),
             menu,
             body,
         )
@@ -3731,8 +3792,12 @@ impl App {
 
         // Responsive card grid, same approach as Browse: aim for
         // ~440px cards, column count follows the window width.
+        // Same shell geometry as the Browse grid (John's
+        // margin rule): window padding 24 + sidebar + the
+        // shell's 10 spacing + PAGE_MARGIN on the right.
         let content_w =
-            (self.window_size.width - 24.0 - SIDEBAR_W - GRID_SPACING).max(200.0);
+            (self.window_size.width - 24.0 - SIDEBAR_W - 10.0 - PAGE_MARGIN)
+                .max(200.0);
         let cols = (((content_w + GRID_SPACING) / (440.0 + GRID_SPACING)).floor()
             as usize)
             .clamp(1, 4);
@@ -3922,7 +3987,7 @@ impl App {
         ]
         .spacing(8);
 
-        scrollable(page)
+        page_scroll(page)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -4087,7 +4152,7 @@ impl App {
                 .color(theme::TEXT_DIM)
                 .into()
         };
-        column![scrollable(col).height(Length::Fill), next]
+        column![page_scroll(col).height(Length::Fill), next]
             .spacing(10)
             .height(Length::Fill)
             .into()
@@ -4538,7 +4603,7 @@ impl App {
         ]
         .spacing(12);
         column![
-            scrollable(sections).height(Length::Fill),
+            page_scroll(sections).height(Length::Fill),
             self.wizard_step_buttons(Some(0), Some((2, "Next: Pick Mods"))),
         ]
         .spacing(10)
@@ -4550,7 +4615,12 @@ impl App {
     /// the Browse grid's arithmetic, at the wizard's card
     /// width.
     fn wizard_card_columns(&self) -> usize {
-        let available = self.window_size.width - SIDEBAR_W - 64.0;
+        // The deduction past the sidebar is the shell's
+        // real non-content width (John's margin rule):
+        // window padding 24 + the shell's 10 spacing +
+        // PAGE_MARGIN on the right = 44. (It was 64, which
+        // left a ragged ~30px piled up on the right.)
+        let available = self.window_size.width - SIDEBAR_W - 44.0;
         ((available / 262.0).floor() as usize).clamp(1, 6)
     }
 
@@ -4758,7 +4828,7 @@ impl App {
             }
         }
         column![
-            scrollable(col).height(Length::Fill),
+            page_scroll(col).height(Length::Fill),
             self.wizard_step_buttons(Some(1), Some((3, "Next: Review"))),
         ]
         .spacing(10)
@@ -4959,7 +5029,7 @@ impl App {
             ]
             .spacing(8),
         );
-        scrollable(col).height(Length::Fill).into()
+        page_scroll(col).height(Length::Fill).into()
     }
 
     /// Step 5 — Results: two lists, what succeeded and
@@ -5019,7 +5089,7 @@ impl App {
             ]
             .spacing(8),
         );
-        scrollable(col).height(Length::Fill).into()
+        page_scroll(col).height(Length::Fill).into()
     }
 
     /// Log Reader: the game's log.txt from the profile folder,
@@ -5112,7 +5182,7 @@ impl App {
             lines_col = lines_col.push(text("No lines to show.").size(12));
         }
         col = col.push(
-            scrollable(lines_col)
+            page_scroll(lines_col)
                 .width(Length::Fill)
                 .height(Length::Fill),
         );
@@ -5248,7 +5318,7 @@ impl App {
             }
         }
         col = col.push(
-            scrollable(list)
+            page_scroll(list)
                 .width(Length::Fill)
                 .height(Length::Fill),
         );
@@ -5458,7 +5528,7 @@ impl App {
         let sections = column![folders, library, catalog].spacing(10);
         column![
             text("Settings").size(20),
-            scrollable(sections).height(Length::Fill).width(Length::Fill),
+            page_scroll(sections).height(Length::Fill).width(Length::Fill),
             row![
                 text(format!(
                     "Mods: {} total — {} active, {} archived · Favorites: {}",
@@ -5733,7 +5803,7 @@ impl App {
             );
         }
 
-        scrollable(col)
+        page_scroll(col)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -5855,7 +5925,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.5.3  © 2026 Farmer Jay.")
+            text("V1.5.5  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -6245,7 +6315,7 @@ impl App {
         } else {
             return Space::with_height(0).into();
         }
-        container(
+        let notice = container(
             row![
                 text(label).size(13).color(theme::TEXT),
                 Space::with_width(Length::Fill),
@@ -6263,8 +6333,19 @@ impl App {
         .style(|_| container::Style {
             background: Some(iced::Background::Color(theme::ACCENT)),
             ..container::Style::default()
-        })
-        .into()
+        });
+        // The visible slab keeps PAGE_MARGIN on its right
+        // (John's margin rule — banners included, no
+        // full-bleed exceptions): it rides in a plain
+        // wrapper so the slab itself insets inside the main
+        // column while everything beneath it stays put.
+        container(notice)
+            .padding(iced::Padding {
+                right: PAGE_MARGIN,
+                ..Default::default()
+            })
+            .width(Length::Fill)
+            .into()
     }
 
     pub fn view(&self) -> Element<'_, Message> {
