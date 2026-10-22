@@ -210,6 +210,21 @@ pub fn sidebar_container(_theme: &Theme) -> container::Style {
     }
 }
 
+/// A mod download's progress bar (Downloads page): the
+/// splash bar's dress — steel-teal fill on a petrol track,
+/// so a download in flight wears the app's own colors.
+pub fn download_bar(_theme: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(PANEL),
+        bar: Background::Color(ACCENT),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 7.0.into(),
+        },
+    }
+}
+
 /// The splash's progress bar: steel-teal fill on a petrol
 /// track, pill-rounded like the menu it precedes.
 pub fn splash_bar(_theme: &Theme) -> progress_bar::Style {

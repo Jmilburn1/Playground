@@ -198,6 +198,19 @@ impl GithubSource {
     /// Stream a release asset to `dest` (a temp file the caller
     /// validates before swapping in). Returns the byte count.
     pub async fn download_to(&self, url: &str, dest: &Path) -> Result<u64> {
+        self.download_to_reporting(url, dest, &mut |_, _| {}).await
+    }
+
+    /// `download_to` with progress: `report` hears (bytes so
+    /// far, total when the server states one) as the stream
+    /// lands, gated by ProgressGate so the caller hears real
+    /// movement — never a call per chunk.
+    pub async fn download_to_reporting(
+        &self,
+        url: &str,
+        dest: &Path,
+        report: &mut (dyn FnMut(u64, Option<u64>) + Send),
+    ) -> Result<u64> {
         use futures::StreamExt;
         let resp = auth(client()?.get(url), &self.token)
             .header("Accept", "application/octet-stream")
@@ -206,21 +219,31 @@ impl GithubSource {
             .context("Download did not start")?
             .error_for_status()
             .context("Download was refused")?;
+        let total = resp.content_length();
         let mut file = tokio::fs::File::create(dest)
             .await
             .with_context(|| format!("Could not create {:?}", dest))?;
         let mut stream = resp.bytes_stream();
         let mut written: u64 = 0;
+        let mut gate = super::ProgressGate::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("Download interrupted")?;
             tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
                 .await
                 .context("Could not write the downloaded file")?;
             written += chunk.len() as u64;
+            if gate.should_report(written, total) {
+                report(written, total);
+            }
         }
         tokio::io::AsyncWriteExt::flush(&mut file)
             .await
             .context("Could not finish the downloaded file")?;
+        // The stream's end is a fact worth reporting even
+        // when the last chunk fell inside the throttle
+        // window (an unknown total has no completion step
+        // of its own to trigger one).
+        report(written, total);
         Ok(written)
     }
 }

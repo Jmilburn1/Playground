@@ -17,10 +17,11 @@ use crate::ui::components::update_types::{UpdateInfo, UpdateState};
 use crate::ui::theme;
 use crate::update_db::{self, UpdateRow};
 use crate::ui::components::{
-    format_size, mod_card, BrowseView, DropdownTick, FolderTarget, LayoutEvent,
-    LayoutRunOutcome, LoadEvent, LoadOutcome, LoadPhase, LogKind, LogLine,
-    LogOutcome, Message, ScanOutcome, Tab, UpdateDbPresentation,
-    UpdateJudgement,
+    format_size, mod_card, BrowseView, DownloadEvent, DownloadJob,
+    DownloadJobState, DownloadRegistry, DropdownTick, FolderTarget,
+    LayoutEvent, LayoutRunOutcome, LoadEvent, LoadOutcome, LoadPhase,
+    LogKind, LogLine, LogOutcome, Message, ScanOutcome, Tab,
+    UpdateDbPresentation, UpdateJudgement,
 };
 use futures::SinkExt as _;
 use iced::widget::image::Handle as ImageHandle;
@@ -354,6 +355,19 @@ fn parse_amount(text: &str) -> Option<i64> {
     cleaned.parse::<i64>().ok()
 }
 
+/// Everything needed to actually start one registered
+/// download job when its turn comes: the update offer it
+/// was clicked from, where the bytes land, and the GitHub
+/// token in force at registration. Kept beside the job
+/// registry (which holds the display state) keyed by job
+/// id, and consumed when the job starts.
+struct PendingDownload {
+    mod_id: String,
+    info: UpdateInfo,
+    dest: PathBuf,
+    token: Option<String>,
+}
+
 pub struct App {
     mod_manager: ModManager,
     current_tab: Tab,
@@ -492,6 +506,15 @@ pub struct App {
     /// apart so a failure never reads as a success.
     layout_outcome: Option<String>,
     layout_error: Option<String>,
+    /// Downloads section (owner, 2026-10-22): every mod
+    /// download this session as a tracked job — the page
+    /// renders from the registry, and the details panel's
+    /// progress line reads the same job state. Session-only
+    /// by design: the registry starts empty every launch.
+    downloads: DownloadRegistry,
+    /// Start payloads for registered jobs that have not
+    /// begun (queued, or the one about to start), by job id.
+    pending_downloads: HashMap<u64, PendingDownload>,
     /// App self-update (owner, 2026-10-22): the launch
     /// check's finding, when a newer Playground release
     /// exists. The notice over the status bar renders
@@ -594,6 +617,8 @@ impl App {
             layout_total: 0,
             layout_outcome: None,
             layout_error: None,
+            downloads: DownloadRegistry::new(),
+            pending_downloads: HashMap::new(),
             app_update: None,
             app_update_installing: false,
             app_update_failed: None,
@@ -729,6 +754,118 @@ impl App {
             .map(|m| (m.id.clone(), m.path.clone(), m.icon_filename.clone()))
             .collect();
         Task::perform(async move { icon_job(jobs) }, Message::IconsLoaded)
+    }
+
+    /// Begin one registered download job: flip it to
+    /// Downloading and run the SAME download the panel has
+    /// always run (GitHub asset, or ModHub with the mod page
+    /// as referer) — now the reporting variant, so progress
+    /// streams into the job registry over a channel while
+    /// completion still arrives as UpdateInstalled. Progress
+    /// sends may drop when the channel is full: a dropped
+    /// sample is replaced by the next one, which is already
+    /// coming (the load job's channel discipline).
+    fn start_download(&mut self, job: u64) -> Task<Message> {
+        let Some(pending) = self.pending_downloads.remove(&job) else {
+            return Task::none();
+        };
+        self.downloads.start(job);
+        let PendingDownload {
+            mod_id: id,
+            info,
+            dest,
+            token,
+        } = pending;
+        let url = info.download_url.clone();
+        let (tx, rx) = futures::channel::mpsc::channel::<DownloadEvent>(64);
+        let progress_task = Task::run(rx, Message::DownloadEvent);
+        if let Some(mh_id) = info.repo.strip_prefix("modhub:") {
+            // ModHub's CDN wants the mod page as the
+            // referer; the GitHub flow doesn't need one.
+            let page = crate::sources::mod_hub::page_url(mh_id);
+            let dest2 = dest.clone();
+            let mut tx2 = tx;
+            let download = Task::perform(
+                async move {
+                    let mut report = move |downloaded: u64, total: Option<u64>| {
+                        let _ = tx2.try_send(DownloadEvent::Progress {
+                            job,
+                            downloaded,
+                            total,
+                        });
+                    };
+                    crate::sources::mod_hub::ModHubSource::new()
+                        .download_to_reporting(&url, &page, &dest2, &mut report)
+                        .await
+                        .map(|_| dest2)
+                        .map_err(|e| e.to_string())
+                },
+                move |result| Message::UpdateInstalled(id.clone(), result),
+            );
+            return Task::batch([download, progress_task]);
+        }
+        let mut tx2 = tx;
+        let download = Task::perform(
+            async move {
+                let mut report = move |downloaded: u64, total: Option<u64>| {
+                    let _ = tx2.try_send(DownloadEvent::Progress {
+                        job,
+                        downloaded,
+                        total,
+                    });
+                };
+                let src = GithubSource::new(token);
+                src.download_to_reporting(&url, &dest, &mut report)
+                    .await
+                    .map(|_| dest)
+                    .map_err(|e| e.to_string())
+            },
+            move |result| Message::UpdateInstalled(id.clone(), result),
+        );
+        Task::batch([download, progress_task])
+    }
+
+    /// Start the queue's head when nothing is running —
+    /// called as each download ends (and on registration
+    /// when the wire is already free, via InstallUpdate's
+    /// own start), so a queued job begins the moment its
+    /// turn comes.
+    fn start_next_download(&mut self) -> Task<Message> {
+        if self.downloads.has_running() {
+            return Task::none();
+        }
+        let Some((job, name, version)) = self
+            .downloads
+            .next_queued()
+            .map(|j| (j.id, j.mod_name.clone(), j.version.clone()))
+        else {
+            return Task::none();
+        };
+        self.status = format!("Downloading {} v{}…", name, version);
+        self.start_download(job)
+    }
+
+    /// The Downloads section's source label for one install:
+    /// the update database's recorded source when the mod
+    /// has a row (that is where KingMods and itch offers
+    /// come from), else the offer's own shape — a "modhub:"
+    /// repo marker means ModHub, anything else a GitHub repo.
+    fn download_source_label(&self, m: &Mod, info: &UpdateInfo) -> String {
+        let stem = ModManager::mod_stem(&m.path);
+        if let Some(row) = self.db_rows.get(&stem) {
+            match row.source_kind.as_str() {
+                "github" => return "GitHub".to_string(),
+                "modhub" => return "ModHub".to_string(),
+                "kingmods" => return "KingMods".to_string(),
+                "itch" => return "itch.io".to_string(),
+                _ => {}
+            }
+        }
+        if info.repo.starts_with("modhub:") {
+            "ModHub".to_string()
+        } else {
+            "GitHub".to_string()
+        }
     }
 
     /// Save the folder inputs and rescan — the Settings tab's
@@ -1896,7 +2033,6 @@ impl App {
                 {
                     self.db_applied.remove(&id);
                     self.update_status.insert(id.clone(), UpdateState::Installing);
-                    self.status = format!("Downloading {} v{}…", m.name, info.version);
                     let (_base, token) = self.mod_manager.github_endpoint();
                     let stem = ModManager::mod_stem(&m.path);
                     let dest = m
@@ -1904,37 +2040,60 @@ impl App {
                         .parent()
                         .map(|p| p.join(format!(".playground-dl-{}.zip", stem)))
                         .unwrap_or_else(|| PathBuf::from(".playground-dl.zip"));
-                    let url = info.download_url.clone();
-                    if let Some(mh_id) = info.repo.strip_prefix("modhub:") {
-                        // ModHub's CDN wants the mod page as the
-                        // referer; the GitHub flow doesn't need one.
-                        let page = crate::sources::mod_hub::page_url(mh_id);
-                        let dest2 = dest.clone();
-                        return Task::perform(
-                            async move {
-                                crate::sources::mod_hub::ModHubSource::new()
-                                    .download_to(&url, &page, &dest2)
-                                    .await
-                                    .map(|_| dest2)
-                                    .map_err(|e| e.to_string())
-                            },
-                            move |result| Message::UpdateInstalled(id.clone(), result),
-                        );
-                    }
-                    return Task::perform(
-                        async move {
-                            let src = GithubSource::new(token);
-                            src.download_to(&url, &dest)
-                                .await
-                                .map(|_| dest)
-                                .map_err(|e| e.to_string())
-                        },
-                        move |result| Message::UpdateInstalled(id.clone(), result),
+                    // Every install becomes a tracked job
+                    // (Downloads section, 2026-10-22): the
+                    // registry holds the job's display state,
+                    // the pending map its start payload. One
+                    // download runs at a time — a click while
+                    // another is on the wire QUEUES and starts
+                    // when it ends. (Before the registry, the
+                    // click simply launched a second download
+                    // in parallel; the same mod was safe only
+                    // because its own state had flipped to
+                    // Installing.)
+                    let source = self.download_source_label(&m, &info);
+                    let version = info.version.clone();
+                    let job = self.downloads.register(
+                        id.clone(),
+                        m.name.clone(),
+                        m.file_name(),
+                        source,
+                        info.version.clone(),
                     );
+                    self.pending_downloads.insert(
+                        job,
+                        PendingDownload {
+                            mod_id: id.clone(),
+                            info,
+                            dest,
+                            token,
+                        },
+                    );
+                    if self.downloads.has_running() {
+                        self.status = format!(
+                            "Queued {} v{} — a download is already running; this one starts when it finishes.",
+                            m.name, version
+                        );
+                        return Task::none();
+                    }
+                    self.status = format!("Downloading {} v{}…", m.name, version);
+                    return self.start_download(job);
                 }
             }
             Message::UpdateInstalled(id, result) => {
                 self.db_applied.remove(&id);
+                // The Downloads job that ran this install.
+                // The download half is over either way: a
+                // success moves the job to Installing while
+                // the file swaps below, and both halves land
+                // it Done or Failed (reason kept) alongside
+                // the panel's own state.
+                let job = self.downloads.live_job_for_mod(&id).map(|j| j.id);
+                if result.is_ok() {
+                    if let Some(job) = job {
+                        self.downloads.begin_install(job);
+                    }
+                }
                 let name = self
                     .mod_manager
                     .get_mod(&id)
@@ -1950,21 +2109,47 @@ impl App {
                                     "Updated {} ({}).",
                                     name, change
                                 );
+                                if let Some(job) = job {
+                                    self.downloads.finish(job, Ok(()));
+                                }
                             }
                             Err(e) => {
                                 self.status = format!("Installing the update for {} failed: {}", name, e);
                                 self.update_status
                                     .insert(id, UpdateState::Failed(e.to_string()));
+                                if let Some(job) = job {
+                                    self.downloads.finish(job, Err(e.to_string()));
+                                }
                             }
                         }
                         let _ = std::fs::remove_file(&downloaded);
                     }
                     Err(e) => {
                         self.status = format!("Download for {} failed: {}", name, e);
+                        if let Some(job) = job {
+                            self.downloads.finish(job, Err(e.clone()));
+                        }
                         self.update_status.insert(id, UpdateState::Failed(e));
                     }
                 }
-                return self.begin_icon_load();
+                // The wire is free: a queued download starts
+                // now, alongside the icon refresh as before.
+                return Task::batch([
+                    self.begin_icon_load(),
+                    self.start_next_download(),
+                ]);
+            }
+            Message::DownloadEvent(event) => match event {
+                DownloadEvent::Progress {
+                    job,
+                    downloaded,
+                    total,
+                } => {
+                    self.downloads.progress(job, downloaded, total);
+                }
+            },
+            Message::ClearFinishedDownloads => {
+                self.downloads.clear_finished();
             }
             Message::AppUpdateCheckDone(found) => {
                 // The launch check's only voice: a newer
@@ -3156,7 +3341,40 @@ impl App {
                 Some(UpdateState::Available(info)) => {
                     format!("Update available: {} ({})", info.version, info.tag)
                 }
-                Some(UpdateState::Installing) => "Downloading and installing…".to_string(),
+                Some(UpdateState::Installing) => {
+                    // The live readout is the Downloads job's
+                    // own state (the same numbers the
+                    // Downloads page shows); the plain line
+                    // remains for a state with no job behind
+                    // it, which no longer occurs in practice.
+                    match self.downloads.live_job_for_mod(&m.id) {
+                        Some(job) => match job.state {
+                            DownloadJobState::Queued => {
+                                "Queued — waiting for the running download to finish."
+                                    .to_string()
+                            }
+                            DownloadJobState::Downloading => match job.percent() {
+                                Some(p) => format!(
+                                    "Downloading v{}… {:.0}% ({} of {})",
+                                    job.version,
+                                    p,
+                                    format_size(job.downloaded),
+                                    format_size(job.total.unwrap_or(0)),
+                                ),
+                                None => format!(
+                                    "Downloading v{}… {} so far",
+                                    job.version,
+                                    format_size(job.downloaded)
+                                ),
+                            },
+                            DownloadJobState::Installing => {
+                                "Downloaded — installing…".to_string()
+                            }
+                            _ => "Downloading and installing…".to_string(),
+                        },
+                        None => "Downloading and installing…".to_string(),
+                    }
+                }
                 Some(UpdateState::Failed(e)) => format!("Check failed: {}", e),
                 None => "Not checked yet.".to_string(),
             };
@@ -4752,6 +4970,142 @@ impl App {
         col.into()
     }
 
+    /// Downloads: this session's mod downloads as tracked
+    /// jobs (owner, 2026-10-22 — "shows which mods are being
+    /// downloaded"). The Log Reader's scaffold: a title row
+    /// with the page's action pill at the right, job cards
+    /// in the suspects box's dress, the list in a scrollable
+    /// that fills the page. Live jobs (queued or working)
+    /// first with their real progress, then the finished
+    /// ones with their outcomes; a failure wears the Log
+    /// Reader's error color and keeps its reason.
+    fn downloads_view(&self) -> Element<'_, Message> {
+        let mut header = row![text("Downloads").size(17)].spacing(8);
+        if self.downloads.has_finished() {
+            header = header
+                .push(Space::with_width(Length::Fill))
+                .push(
+                    button(text("Clear finished"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::ClearFinishedDownloads),
+                );
+        }
+        let mut col = column![header].spacing(8);
+        if self.downloads.is_empty() {
+            col = col.push(text("No downloads yet this session.").size(13));
+            return col.into();
+        }
+        let card = |job: &DownloadJob| -> Element<'_, Message> {
+            let mut inner = column![
+                text(job.mod_name.clone()).size(14),
+                text(format!(
+                    "{} · {} · update to v{}",
+                    job.file_name, job.source, job.version
+                ))
+                .size(12),
+            ]
+            .spacing(3);
+            match job.state {
+                DownloadJobState::Queued => {
+                    inner = inner.push(
+                        text("Queued — starts when the running download finishes.")
+                            .size(12),
+                    );
+                }
+                DownloadJobState::Downloading => {
+                    if let (Some(p), Some(total)) = (job.percent(), job.total) {
+                        inner = inner.push(
+                            progress_bar(0.0..=100.0, p)
+                                .width(Length::Fill)
+                                .height(10)
+                                .style(theme::download_bar),
+                        );
+                        inner = inner.push(
+                            text(format!(
+                                "{:.0}% — {} of {}",
+                                p,
+                                format_size(job.downloaded),
+                                format_size(total)
+                            ))
+                            .size(12),
+                        );
+                    } else {
+                        // No stated total: the byte count
+                        // alone — never an invented total,
+                        // percent, or speed.
+                        inner = inner.push(
+                            text(format!(
+                                "Downloading… {} so far (the server stated no size)",
+                                format_size(job.downloaded)
+                            ))
+                            .size(12),
+                        );
+                    }
+                }
+                DownloadJobState::Installing => {
+                    inner = inner.push(text("Downloaded — installing…").size(12));
+                }
+                DownloadJobState::Done => {
+                    inner = inner.push(text("Done — installed.").size(12));
+                }
+                DownloadJobState::Failed => {
+                    let reason = job.fail_reason.as_deref().unwrap_or("unknown error");
+                    inner = inner.push(
+                        text(format!("Failed: {}", reason))
+                            .size(12)
+                            .color(iced::Color::from_rgb(0.96, 0.46, 0.40)),
+                    );
+                }
+            }
+            container(inner)
+                .padding(8)
+                .width(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgb(
+                        0.13, 0.14, 0.16,
+                    ))),
+                    border: iced::Border {
+                        color: iced::Color::from_rgb(0.30, 0.31, 0.34),
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..container::Style::default()
+                })
+                .into()
+        };
+        let mut list = column![].spacing(8);
+        let live: Vec<&DownloadJob> = self
+            .downloads
+            .jobs()
+            .iter()
+            .filter(|j| j.is_live())
+            .collect();
+        let finished: Vec<&DownloadJob> = self
+            .downloads
+            .jobs()
+            .iter()
+            .filter(|j| j.is_finished())
+            .collect();
+        if !live.is_empty() {
+            list = list.push(text("Downloading and queued").size(13));
+            for job in live {
+                list = list.push(card(job));
+            }
+        }
+        if !finished.is_empty() {
+            list = list.push(text("Finished this session").size(13));
+            for job in finished {
+                list = list.push(card(job));
+            }
+        }
+        col = col.push(
+            scrollable(list)
+                .width(Length::Fill)
+                .height(Length::Fill),
+        );
+        col.into()
+    }
+
     fn settings_view(&self) -> Element<'_, Message> {
         let total = self.mod_manager.get_mods().len();
         let active = self
@@ -5184,6 +5538,18 @@ impl App {
             nav("Configure Save".to_string(), Tab::Saves),
             nav("Layout".to_string(), Tab::Layout),
             nav("Log Reader".to_string(), Tab::Log),
+            // Downloads (2026-10-22): the live count rides
+            // the label only while something is in play —
+            // queued or running — like Conflicts' count
+            // above; an idle section needs no number.
+            nav(
+                if self.downloads.live_count() > 0 {
+                    format!("Downloads ({})", self.downloads.live_count())
+                } else {
+                    "Downloads".to_string()
+                },
+                Tab::Downloads,
+            ),
             nav("Settings".to_string(), Tab::Settings),
             text("LIBRARY").size(11),
             lib_row("Mods", all.len(), BrowseView::All),
@@ -5207,7 +5573,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.5.0  © 2026 Farmer Jay.")
+            text("V1.5.1  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -5681,6 +6047,12 @@ impl App {
                 58.0,
             ),
             Tab::Log => (Space::with_height(0).into(), None, self.log_view(), 58.0),
+            Tab::Downloads => (
+                Space::with_height(0).into(),
+                None,
+                self.downloads_view(),
+                58.0,
+            ),
             Tab::Settings => (
                 Space::with_height(0).into(),
                 None,

@@ -14,7 +14,260 @@ pub enum Tab {
     Saves,
     Layout,
     Log,
+    Downloads,
     Settings,
+}
+
+/// Where one tracked mod download stands (owner, 2026-10-22:
+/// the Downloads section — "shows which mods are being
+/// downloaded"). The registry walks each job Queued ->
+/// Downloading -> Installing -> Done, or -> Failed from any
+/// working state; the transitions are the registry's own
+/// methods, so no caller can skip a step or resurrect a
+/// finished job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadJobState {
+    Queued,
+    Downloading,
+    Installing,
+    Done,
+    Failed,
+}
+
+/// One mod download, tracked from the click that started it
+/// to the install that ends it. Byte counts are the
+/// download stream's own: `total` is what the server stated
+/// (Content-Length) and stays None when it stated nothing —
+/// the page shows bytes alone then, never an invented
+/// total. Times are monotonic instants, for ordering and
+/// duration only; nothing here is persisted — the registry
+/// is this session's history by design.
+#[derive(Debug, Clone)]
+pub struct DownloadJob {
+    pub id: u64,
+    /// The mod's app id (its library identity).
+    pub mod_id: String,
+    /// The mod's display name.
+    pub mod_name: String,
+    /// The mod's exact file name — the app's identity for it.
+    pub file_name: String,
+    /// Where the update came from ("GitHub", "ModHub",
+    /// "KingMods", "itch.io" — from the update record).
+    pub source: String,
+    /// The version being installed.
+    pub version: String,
+    pub state: DownloadJobState,
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    /// The plain-language reason when state is Failed.
+    pub fail_reason: Option<String>,
+    pub started_at: Option<std::time::Instant>,
+    pub finished_at: Option<std::time::Instant>,
+}
+
+impl DownloadJob {
+    /// Whole percent downloaded, when a total is known.
+    /// None when it isn't (or is zero) — callers show the
+    /// byte count alone rather than a fabricated figure.
+    pub fn percent(&self) -> Option<f32> {
+        let total = self.total?;
+        if total == 0 {
+            return None;
+        }
+        Some(((self.downloaded as f64 / total as f64) * 100.0).min(100.0) as f32)
+    }
+
+    /// Still in play: queued or working.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.state,
+            DownloadJobState::Queued
+                | DownloadJobState::Downloading
+                | DownloadJobState::Installing
+        )
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self.state, DownloadJobState::Done | DownloadJobState::Failed)
+    }
+}
+
+/// The session's download jobs, in the order they were
+/// started. One download runs at a time: a start requested
+/// while another is working registers as Queued and begins
+/// when the running one finishes or fails — the queue the
+/// registry's `next_queued` + `has_running` pair drives.
+/// Any future starter (bulk actions, one-click installs)
+/// registers here the same way the details panel does.
+#[derive(Debug, Clone, Default)]
+pub struct DownloadRegistry {
+    jobs: Vec<DownloadJob>,
+    next_id: u64,
+}
+
+impl DownloadRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a download that wants to start. The job is
+    /// Queued; `start` moves it to Downloading when its
+    /// turn comes. Returns the job's id.
+    pub fn register(
+        &mut self,
+        mod_id: String,
+        mod_name: String,
+        file_name: String,
+        source: String,
+        version: String,
+    ) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.jobs.push(DownloadJob {
+            id,
+            mod_id,
+            mod_name,
+            file_name,
+            source,
+            version,
+            state: DownloadJobState::Queued,
+            downloaded: 0,
+            total: None,
+            fail_reason: None,
+            started_at: None,
+            finished_at: None,
+        });
+        id
+    }
+
+    pub fn jobs(&self) -> &[DownloadJob] {
+        &self.jobs
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    /// Jobs still in play (queued or working) — the sidebar
+    /// badge's count.
+    pub fn live_count(&self) -> usize {
+        self.jobs.iter().filter(|j| j.is_live()).count()
+    }
+
+    pub fn has_finished(&self) -> bool {
+        self.jobs.iter().any(|j| j.is_finished())
+    }
+
+    /// A download is on the wire or installing — the queue's
+    /// gate: while this holds, new starts stay Queued.
+    pub fn has_running(&self) -> bool {
+        self.jobs.iter().any(|j| {
+            matches!(
+                j.state,
+                DownloadJobState::Downloading | DownloadJobState::Installing
+            )
+        })
+    }
+
+    /// The oldest job still waiting for its turn.
+    pub fn next_queued(&self) -> Option<&DownloadJob> {
+        self.jobs
+            .iter()
+            .find(|j| j.state == DownloadJobState::Queued)
+    }
+
+    /// The newest live job for one mod — the details panel's
+    /// readout (its progress line reads the same job state
+    /// the Downloads page shows).
+    pub fn live_job_for_mod(&self, mod_id: &str) -> Option<&DownloadJob> {
+        self.jobs
+            .iter()
+            .rev()
+            .find(|j| j.mod_id == mod_id && j.is_live())
+    }
+
+    /// Queued -> Downloading. The start instant is stamped
+    /// here, when the download truly begins — a queued job
+    /// has not started, however long it waits.
+    pub fn start(&mut self, id: u64) {
+        if let Some(job) = self.job_mut(id) {
+            if job.state == DownloadJobState::Queued {
+                job.state = DownloadJobState::Downloading;
+                job.started_at = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// A progress sample from the running download. Only a
+    /// Downloading job takes samples; a late sample for a
+    /// finished job is dropped, not recorded.
+    pub fn progress(&mut self, id: u64, downloaded: u64, total: Option<u64>) {
+        if let Some(job) = self.job_mut(id) {
+            if job.state == DownloadJobState::Downloading {
+                job.downloaded = downloaded;
+                if total.is_some() {
+                    job.total = total;
+                }
+            }
+        }
+    }
+
+    /// Downloading -> Installing: the bytes are all down and
+    /// the manager is swapping the file in.
+    pub fn begin_install(&mut self, id: u64) {
+        if let Some(job) = self.job_mut(id) {
+            if job.state == DownloadJobState::Downloading {
+                job.state = DownloadJobState::Installing;
+            }
+        }
+    }
+
+    /// End a working job: Ok -> Done, Err -> Failed with the
+    /// reason kept in the failure's own words. Only a job
+    /// that actually started (Downloading / Installing) can
+    /// finish — a Queued job has nothing to finish, and a
+    /// finished job stays finished. The finish instant is
+    /// stamped here.
+    pub fn finish(&mut self, id: u64, result: Result<(), String>) {
+        if let Some(job) = self.job_mut(id) {
+            if matches!(
+                job.state,
+                DownloadJobState::Downloading | DownloadJobState::Installing
+            ) {
+                match result {
+                    Ok(()) => job.state = DownloadJobState::Done,
+                    Err(reason) => {
+                        job.state = DownloadJobState::Failed;
+                        job.fail_reason = Some(reason);
+                    }
+                }
+                job.finished_at = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Sweep the finished rows (Done / Failed). Live jobs —
+    /// queued ones included — are never swept.
+    pub fn clear_finished(&mut self) {
+        self.jobs.retain(|j| !j.is_finished());
+    }
+
+    fn job_mut(&mut self, id: u64) -> Option<&mut DownloadJob> {
+        self.jobs.iter_mut().find(|j| j.id == id)
+    }
+}
+
+/// Progress events from a running mod download, streamed to
+/// the app like the load's — real byte counts as the stream
+/// lands (the download itself gates how often, see
+/// sources::ProgressGate).
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    Progress {
+        job: u64,
+        downloaded: u64,
+        total: Option<u64>,
+    },
 }
 
 /// Which folder a Browse picker is choosing (Settings tab).
@@ -369,6 +622,12 @@ pub enum Message {
     /// the new binaries; the app then hands the swap to
     /// update.exe and exits.
     AppUpdateStaged(Result<PathBuf, String>),
+    /// Downloads section: one progress event from a running
+    /// mod download (see DownloadEvent).
+    DownloadEvent(DownloadEvent),
+    /// Downloads section: sweep the finished rows (Done /
+    /// Failed) off the page; live jobs stay.
+    ClearFinishedDownloads,
 }
 
 pub fn format_size(bytes: u64) -> String {
@@ -807,6 +1066,176 @@ impl<Message> iced::widget::canvas::Program<Message> for SwitchIcon {
         let knob = Path::circle(knob_center, knob_r);
         frame.fill(&knob, knob_color);
         vec![frame.into_geometry()]
+    }
+}
+
+#[cfg(test)]
+mod download_registry_tests {
+    use super::{DownloadJobState, DownloadRegistry};
+
+    fn registry_with(names: &[&str]) -> (DownloadRegistry, Vec<u64>) {
+        let mut reg = DownloadRegistry::new();
+        let ids = names
+            .iter()
+            .map(|n| {
+                reg.register(
+                    format!("id-{}", n),
+                    n.to_string(),
+                    format!("FS25_{}.zip", n),
+                    "GitHub".to_string(),
+                    "2.0.0.0".to_string(),
+                )
+            })
+            .collect();
+        (reg, ids)
+    }
+
+    fn state_of(reg: &DownloadRegistry, id: u64) -> DownloadJobState {
+        reg.jobs().iter().find(|j| j.id == id).unwrap().state
+    }
+
+    #[test]
+    fn job_walks_the_full_happy_path() {
+        let (mut reg, ids) = registry_with(&["Alpha"]);
+        let id = ids[0];
+        assert_eq!(state_of(&reg, id), DownloadJobState::Queued);
+        assert!(reg.jobs()[0].started_at.is_none());
+        reg.start(id);
+        assert_eq!(state_of(&reg, id), DownloadJobState::Downloading);
+        assert!(reg.jobs()[0].started_at.is_some());
+        reg.progress(id, 40, Some(100));
+        assert_eq!(reg.jobs()[0].downloaded, 40);
+        assert_eq!(reg.jobs()[0].total, Some(100));
+        reg.begin_install(id);
+        assert_eq!(state_of(&reg, id), DownloadJobState::Installing);
+        reg.finish(id, Ok(()));
+        assert_eq!(state_of(&reg, id), DownloadJobState::Done);
+        assert!(reg.jobs()[0].finished_at.is_some());
+        assert!(reg.jobs()[0].fail_reason.is_none());
+    }
+
+    #[test]
+    fn job_fails_with_its_reason_kept() {
+        let (mut reg, ids) = registry_with(&["Alpha"]);
+        let id = ids[0];
+        reg.start(id);
+        reg.finish(id, Err("Download interrupted".to_string()));
+        assert_eq!(state_of(&reg, id), DownloadJobState::Failed);
+        assert_eq!(
+            reg.jobs()[0].fail_reason.as_deref(),
+            Some("Download interrupted")
+        );
+        assert!(reg.jobs()[0].finished_at.is_some());
+    }
+
+    #[test]
+    fn transitions_refuse_to_skip_or_resurrect() {
+        let (mut reg, ids) = registry_with(&["Alpha"]);
+        let id = ids[0];
+        // Installing out of Queued is not a step.
+        reg.begin_install(id);
+        assert_eq!(state_of(&reg, id), DownloadJobState::Queued);
+        // A finished job stays finished: progress, install
+        // and finish alike are dropped after Done.
+        reg.start(id);
+        reg.finish(id, Ok(()));
+        reg.progress(id, 10, Some(10));
+        assert_eq!(reg.jobs()[0].downloaded, 0);
+        reg.begin_install(id);
+        assert_eq!(state_of(&reg, id), DownloadJobState::Done);
+        reg.finish(id, Err("too late".to_string()));
+        assert_eq!(state_of(&reg, id), DownloadJobState::Done);
+        // A queued job cannot finish before it starts, and
+        // a done job cannot be started back up.
+        let (mut reg2, ids2) = registry_with(&["Beta"]);
+        reg2.finish(ids2[0], Ok(()));
+        assert_eq!(state_of(&reg2, ids2[0]), DownloadJobState::Queued);
+        reg2.start(ids2[0]);
+        reg2.finish(ids2[0], Ok(()));
+        assert_eq!(state_of(&reg2, ids2[0]), DownloadJobState::Done);
+        reg2.start(ids2[0]);
+        assert_eq!(state_of(&reg2, ids2[0]), DownloadJobState::Done);
+    }
+
+    #[test]
+    fn percent_math_needs_a_real_total() {
+        let (mut reg, ids) = registry_with(&["Alpha"]);
+        let id = ids[0];
+        reg.start(id);
+        // No total yet: bytes alone, no percent.
+        reg.progress(id, 500, None);
+        assert_eq!(reg.jobs()[0].percent(), None);
+        reg.progress(id, 50, Some(200));
+        assert_eq!(reg.jobs()[0].percent(), Some(25.0));
+        // An over-run (server understated its length) clamps.
+        reg.progress(id, 250, Some(200));
+        assert_eq!(reg.jobs()[0].percent(), Some(100.0));
+        // A zero total is no total.
+        let (mut reg2, ids2) = registry_with(&["Beta"]);
+        reg2.start(ids2[0]);
+        reg2.progress(ids2[0], 0, Some(0));
+        assert_eq!(reg2.jobs()[0].percent(), None);
+    }
+
+    #[test]
+    fn second_registration_queues_and_dequeues_on_completion() {
+        let (mut reg, ids) = registry_with(&["Alpha", "Beta"]);
+        let (a, b) = (ids[0], ids[1]);
+        reg.start(a);
+        assert!(reg.has_running());
+        // Beta waits: it is the queue's head.
+        assert_eq!(state_of(&reg, b), DownloadJobState::Queued);
+        assert_eq!(reg.next_queued().map(|j| j.id), Some(b));
+        assert_eq!(reg.live_count(), 2);
+        // Alpha finishing opens the gate for Beta.
+        reg.finish(a, Ok(()));
+        assert!(!reg.has_running());
+        assert_eq!(reg.next_queued().map(|j| j.id), Some(b));
+        reg.start(b);
+        assert_eq!(state_of(&reg, b), DownloadJobState::Downloading);
+        assert!(reg.next_queued().is_none());
+    }
+
+    #[test]
+    fn a_failed_download_also_releases_the_queue() {
+        let (mut reg, ids) = registry_with(&["Alpha", "Beta"]);
+        reg.start(ids[0]);
+        assert!(reg.has_running());
+        reg.finish(ids[0], Err("Download was refused".to_string()));
+        assert!(!reg.has_running());
+        assert_eq!(reg.next_queued().map(|j| j.id), Some(ids[1]));
+    }
+
+    #[test]
+    fn clear_finished_sweeps_only_finished_rows() {
+        let (mut reg, ids) = registry_with(&["Alpha", "Beta", "Gamma"]);
+        reg.start(ids[0]);
+        reg.finish(ids[0], Ok(()));
+        reg.start(ids[1]);
+        reg.finish(ids[1], Err("nope".to_string()));
+        // Gamma never got a turn: it is still queued, and
+        // the sweep must leave it (and any live job) alone.
+        reg.clear_finished();
+        let remaining: Vec<u64> = reg.jobs().iter().map(|j| j.id).collect();
+        assert_eq!(remaining, vec![ids[2]]);
+        assert_eq!(state_of(&reg, ids[2]), DownloadJobState::Queued);
+    }
+
+    #[test]
+    fn live_job_for_mod_finds_the_newest_live_one() {
+        let (mut reg, ids) = registry_with(&["Alpha"]);
+        reg.start(ids[0]);
+        reg.finish(ids[0], Ok(()));
+        // The finished job is history, not a live readout.
+        assert!(reg.live_job_for_mod("id-Alpha").is_none());
+        let again = reg.register(
+            "id-Alpha".to_string(),
+            "Alpha".to_string(),
+            "FS25_Alpha.zip".to_string(),
+            "ModHub".to_string(),
+            "3.0.0.0".to_string(),
+        );
+        assert_eq!(reg.live_job_for_mod("id-Alpha").map(|j| j.id), Some(again));
     }
 }
 
