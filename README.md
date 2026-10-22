@@ -4,7 +4,7 @@
 
 # Playground
 
-A farming simulator mod manager — by Farmer Jay.
+A farming simulator mod manager — by Farmer Jay / Albert Einstein.
 
 Playground keeps a large mod library under control: browse your whole
 library as a card grid, spot conflicts, keep a sorted master library,
