@@ -11,6 +11,10 @@ library as a card grid, spot conflicts, keep a sorted master library,
 stage a different mod set for each savegame, and let Playground watch
 for mod updates in the background.
 
+<p align="center">
+  <a href="https://github.com/Jmilburn1/Playground/releases/latest"><img src="assets/download-button.png" alt="Download Playground" width="440"></a>
+</p>
+
 ## Download (no build needed)
 
 Grab the pre-compiled Windows build from the
