@@ -29,6 +29,23 @@ portable: run it from the unzipped folder, a USB stick, wherever.
 Playground also updates itself: when a new release is published it
 offers to download and install it for you.
 
+**Windows will warn you the first time — that's expected.** Playground
+isn't code-signed yet (a signing certificate is a paid subscription,
+and it's on the list for when it can be afforded), so Windows shows
+the publisher as "Unknown" and puts up its blue "Windows protected
+your PC" screen. Windows does that for any new app it hasn't seen
+before — that's caution, not a detection.
+
+To run Playground anyway:
+
+1. On the blue screen, click **More info**.
+2. Click **Run anyway**.
+
+You only get asked once per version. As long as you downloaded
+Playground from this Releases page (or through Playground's own
+self-update), you have the real thing. If you got the zip anywhere
+else, delete it and come back here.
+
 ## First run
 
 Open the **Settings** tab and point Playground at your folders:
