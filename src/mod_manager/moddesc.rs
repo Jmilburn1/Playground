@@ -33,6 +33,23 @@ pub struct ModDescInfo {
     /// resolve a custom item type to the vanilla family it descends
     /// from when the item declares no shop category itself.
     pub type_parents: std::collections::HashMap<String, String>,
+    /// Input actions the mod declares: `<action name="..."
+    /// category="...">` elements. The Keybindings page's
+    /// action -> mod join reads these.
+    pub actions: Vec<DeclaredAction>,
+    /// Action names referenced by `<actionBinding
+    /// action="...">` elements in the modDesc — actions the
+    /// mod binds without a full `<action>` declaration.
+    pub action_bindings: Vec<String>,
+}
+
+/// One input action a mod declares in its modDesc:
+/// `<action name="..." category="...">` (the category is
+/// the mod's own declared grouping, when it declares one).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DeclaredAction {
+    pub name: String,
+    pub category: Option<String>,
 }
 
 /// Read and parse the modDesc.xml for the mod at `path`, if one exists.
@@ -155,6 +172,28 @@ fn apply_structure(
     e: &quick_xml::events::BytesStart,
 ) {
     let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+    // Input declarations, matched by element name alone:
+    // mods nest them under <actions> / binding wrappers
+    // whose shapes vary, and the declaration is the fact
+    // wherever it sits. (A modDesc carries no game-side
+    // <actionBinding> blocks — those live in the profile's
+    // inputBinding.xml — so the name cannot collide.)
+    match name.as_str() {
+        "action" => {
+            if let Some(action_name) = attr_value(e, "name") {
+                info.actions.push(DeclaredAction {
+                    name: action_name,
+                    category: attr_value(e, "category"),
+                });
+            }
+        }
+        "actionBinding" => {
+            if let Some(action_name) = attr_value(e, "action") {
+                info.action_bindings.push(action_name);
+            }
+        }
+        _ => {}
+    }
     let path = format!("{}/{}", stack.join("/"), name);
     match path.as_str() {
         "modDesc/storeItems/storeItem" => {
@@ -215,14 +254,65 @@ fn parse_moddesc(xml: &str) -> Option<ModDescInfo> {
     if info.description.is_none() {
         info.description = desc_first;
     }
+
     if info.title.is_none()
         && info.version.is_none()
         && info.author.is_none()
         && info.store_items.is_empty()
         && !info.has_map
+        && info.actions.is_empty()
+        && info.action_bindings.is_empty()
     {
         None
     } else {
         Some(info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_declared_actions_bindings_and_categories() {
+        let xml = r#"<modDesc descVersion="90">
+    <author>Tester</author>
+    <version>1.0.0.0</version>
+    <title><en>Combo Tools</en></title>
+    <actions>
+        <action name="COMBO_FOG_TOGGLE" category="VEHICLE" axisType="HALF"/>
+        <action name="COMBO_YIELD_CYCLE"/>
+    </actions>
+    <extra>
+        <actionBinding action="COMBO_STORAGE_DIALOG"/>
+    </extra>
+</modDesc>"#;
+        let info = parse_moddesc(xml).expect("fixture parses");
+        assert_eq!(info.title.as_deref(), Some("Combo Tools"));
+        assert_eq!(
+            info.actions,
+            vec![
+                DeclaredAction {
+                    name: "COMBO_FOG_TOGGLE".to_string(),
+                    category: Some("VEHICLE".to_string()),
+                },
+                DeclaredAction {
+                    name: "COMBO_YIELD_CYCLE".to_string(),
+                    category: None,
+                },
+            ]
+        );
+        assert_eq!(
+            info.action_bindings,
+            vec!["COMBO_STORAGE_DIALOG".to_string()]
+        );
+    }
+
+    #[test]
+    fn moddesc_without_actions_still_parses() {
+        let xml = r#"<modDesc><author>T</author><title><en>Plain</en></title><version>1.0.0.0</version></modDesc>"#;
+        let info = parse_moddesc(xml).expect("fixture parses");
+        assert!(info.actions.is_empty());
+        assert!(info.action_bindings.is_empty());
     }
 }

@@ -2,6 +2,7 @@ use crate::app_update::{self, AppRelease};
 use crate::config::ModSources;
 use crate::mod_manager::conflict::{Conflict, ConflictDetector, ConflictType};
 use crate::mod_manager::game_files;
+use crate::mod_manager::keybindings::{self, BindingsFile, FindingKind, KbAction};
 use crate::mod_manager::icons::{
     icon_cache_dir, icon_cache_key, load_icon_cached, sweep_icon_cache, LoadedIcon,
 };
@@ -569,6 +570,16 @@ fn spawn_opener(target: &str, _is_url: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What an armed key capture will do with the next key
+/// press on the Keybindings page: rewrite one existing
+/// binding's input, or append a new binding to an action
+/// that has none on the keyboard device.
+#[derive(Debug, Clone)]
+enum KbCapture {
+    Replace { action: String, pos: usize },
+    Add { action: String },
+}
+
 pub struct App {
     mod_manager: ModManager,
     current_tab: Tab,
@@ -686,6 +697,24 @@ pub struct App {
     log_total_lines: usize,
     log_errors_only: bool,
     log_note: String,
+    /// Keybindings page state. The document is a staged
+    /// working copy of the profile's inputBinding.xml:
+    /// every edit lands on it, and nothing touches the
+    /// file on disk until the page's explicit Save —
+    /// the Settings one-save pattern. `kb_original` is
+    /// the text as loaded, the discard target and the
+    /// dirty count's baseline.
+    kb_doc: Option<BindingsFile>,
+    kb_original: Option<String>,
+    kb_profile: Option<PathBuf>,
+    kb_device: Option<String>,
+    kb_search: String,
+    kb_unassigned_only: bool,
+    kb_conflicts_only: bool,
+    kb_collapsed: HashSet<String>,
+    kb_capture: Option<KbCapture>,
+    kb_backups: Vec<(PathBuf, u64)>,
+    kb_reset_armed: bool,
     /// Update checks (GitHub): per-mod check state by mod id, and
     /// the details panel's repo link field.
     update_status: HashMap<String, UpdateState>,
@@ -892,6 +921,17 @@ impl App {
             log_total_lines: 0,
             log_errors_only: false,
             log_note: String::new(),
+            kb_doc: None,
+            kb_original: None,
+            kb_profile: None,
+            kb_device: None,
+            kb_search: String::new(),
+            kb_unassigned_only: false,
+            kb_conflicts_only: false,
+            kb_collapsed: HashSet::new(),
+            kb_capture: None,
+            kb_backups: Vec::new(),
+            kb_reset_armed: false,
             update_status: HashMap::new(),
             db_rows: HashMap::new(),
             db_generated_at: None,
@@ -2733,6 +2773,314 @@ impl App {
                     self.start_next_download(),
                 ]);
             }
+            Message::KeybindingsDeviceSelected(device) => {
+                self.kb_device = Some(device);
+                self.kb_capture = None;
+                self.kb_reset_armed = false;
+            }
+            Message::KeybindingsSearchChanged(query) => {
+                self.kb_search = query;
+            }
+            Message::KeybindingsUnassignedOnlyToggled(on) => {
+                self.kb_unassigned_only = on;
+            }
+            Message::KeybindingsConflictsOnlyToggled(on) => {
+                self.kb_conflicts_only = on;
+            }
+            Message::KeybindingsExpandAll(expand) => {
+                if expand {
+                    self.kb_collapsed.clear();
+                } else {
+                    self.kb_collapsed = self
+                        .kb_grouped_actions()
+                        .into_iter()
+                        .map(|(group, _)| group)
+                        .collect();
+                }
+            }
+            Message::KeybindingsToggleGroup(group) => {
+                if !self.kb_collapsed.remove(&group) {
+                    self.kb_collapsed.insert(group);
+                }
+            }
+            Message::KeybindingsCaptureStart(action, pos) => {
+                self.kb_capture = Some(KbCapture::Replace { action, pos });
+                self.status =
+                    "Press a key to bind it — Esc cancels.".to_string();
+            }
+            Message::KeybindingsAddBinding(action) => {
+                self.kb_capture = Some(KbCapture::Add { action });
+                self.status =
+                    "Press a key to bind it — Esc cancels.".to_string();
+            }
+            Message::KeybindingsCaptureKey(key, location, modifiers) => {
+                let Some(capture) = self.kb_capture.clone() else {
+                    return Task::none();
+                };
+                if matches!(
+                    key,
+                    iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+                ) {
+                    self.kb_capture = None;
+                    self.status = "Key capture cancelled.".to_string();
+                    return Task::none();
+                }
+                match keybindings::fs_input_for_key(&key, location, modifiers) {
+                    Some(input) => {
+                        let applied = match (&capture, &mut self.kb_doc) {
+                            (
+                                KbCapture::Replace { action, pos },
+                                Some(doc),
+                            ) => doc.set_input(action, *pos, &input),
+                            (KbCapture::Add { action }, Some(doc)) => doc
+                                .add_binding(
+                                    action,
+                                    keybindings::KEYBOARD_DEVICE,
+                                    &input,
+                                ),
+                            _ => false,
+                        };
+                        self.kb_capture = None;
+                        if applied {
+                            self.status = format!(
+                                "Bound {} — staged, not saved yet.",
+                                keybindings::humanize_input(&input)
+                            );
+                        } else {
+                            self.status =
+                                "That binding is no longer there — the edit was dropped."
+                                    .to_string();
+                        }
+                    }
+                    None => {
+                        // The capture stays armed: the user
+                        // can simply press another key.
+                        self.status = "That key can't be mapped yet.".to_string();
+                    }
+                }
+            }
+            Message::KeybindingsClearBinding(action, pos) => {
+                self.kb_capture = None;
+                if let Some(doc) = &mut self.kb_doc {
+                    if doc.remove_binding(&action, pos) {
+                        self.status =
+                            "Binding cleared — staged, not saved yet.".to_string();
+                    }
+                }
+            }
+            Message::KeybindingsAutoResolve(group) => {
+                self.kb_reset_armed = false;
+                let Some(device) = self.kb_device.clone() else {
+                    return Task::none();
+                };
+                let names: HashSet<String> = self
+                    .kb_grouped_actions()
+                    .into_iter()
+                    .find(|(name, _)| *name == group)
+                    .map(|(_, actions)| {
+                        actions.iter().map(|a| a.name.clone()).collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(doc) = &mut self.kb_doc {
+                    let cleared = doc.auto_resolve(&device, &names);
+                    self.status = if cleared == 0 {
+                        format!(
+                            "Auto-Resolve: no conflicts to clear in {}.",
+                            group
+                        )
+                    } else {
+                        format!(
+                            "Auto-Resolve cleared {} binding{} in {} — staged, not saved yet.",
+                            cleared,
+                            if cleared == 1 { "" } else { "s" },
+                            group
+                        )
+                    };
+                }
+            }
+            Message::KeybindingsSave => {
+                self.kb_reset_armed = false;
+                let (Some(profile), Some(doc)) =
+                    (self.kb_profile.clone(), self.kb_doc.clone())
+                else {
+                    return Task::none();
+                };
+                // The backup comes FIRST and a failed
+                // backup aborts the save: the live file is
+                // never written unbacked-up.
+                match keybindings::backup_current(&profile) {
+                    Err(e) => {
+                        self.status = format!(
+                            "Save stopped — the backup could not be made: {}",
+                            e
+                        );
+                    }
+                    Ok(_) => {
+                        let path = keybindings::bindings_path(&profile);
+                        match std::fs::write(&path, doc.text()) {
+                            Ok(()) => {
+                                self.kb_original = Some(doc.text().to_string());
+                                self.kb_backups =
+                                    keybindings::list_backups(&profile);
+                                self.status = "Bindings saved — the previous file is in the backups folder.".to_string();
+                            }
+                            Err(e) => {
+                                self.status = format!(
+                                    "Could not write {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Message::KeybindingsDiscard => {
+                self.kb_capture = None;
+                self.kb_reset_armed = false;
+                if let Some(original) = self.kb_original.clone() {
+                    self.kb_doc = Some(BindingsFile::parse(original));
+                    self.status = "Staged binding changes discarded.".to_string();
+                }
+            }
+            Message::KeybindingsRestoreBackup(path) => {
+                self.kb_reset_armed = false;
+                let Some(profile) = self.kb_profile.clone() else {
+                    return Task::none();
+                };
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match keybindings::restore_backup(&profile, &path) {
+                    Ok(()) => {
+                        self.kb_reload();
+                        self.status = format!(
+                            "Restored {} — the file it replaced was backed up first.",
+                            name
+                        );
+                    }
+                    Err(e) => {
+                        self.status =
+                            format!("Could not restore {}: {}", name, e);
+                    }
+                }
+            }
+            Message::KeybindingsResetDefaults => {
+                let Some(profile) = self.kb_profile.clone() else {
+                    return Task::none();
+                };
+                if !self.kb_reset_armed {
+                    self.kb_reset_armed = true;
+                    self.status = "Reset moves inputBinding.xml into the backups folder — click Reset again to confirm.".to_string();
+                    return Task::none();
+                }
+                self.kb_reset_armed = false;
+                match keybindings::reset_to_defaults(&profile) {
+                    Ok(dest) => {
+                        self.kb_doc = None;
+                        self.kb_original = None;
+                        self.kb_capture = None;
+                        self.kb_backups = keybindings::list_backups(&profile);
+                        self.status = format!(
+                            "inputBinding.xml moved to {} — the game regenerates its factory defaults on its next launch.",
+                            dest.display()
+                        );
+                    }
+                    Err(e) => {
+                        self.status =
+                            format!("Could not reset the bindings: {}", e);
+                    }
+                }
+            }
+            Message::OpenKingModsPage(id) => {
+                match self.kingmods_page_url(&id) {
+                    Some(url) => {
+                        if let Err(e) = open_url(&url) {
+                            self.status =
+                                format!("Could not open the KingMods page: {}", e);
+                        }
+                    }
+                    None => {
+                        self.status =
+                            "No KingMods page is recorded for this mod.".to_string();
+                    }
+                }
+            }
+            Message::ImportKingModsFile(id) => {
+                return Task::perform(
+                    async move {
+                        let picked = rfd::AsyncFileDialog::new()
+                            .set_title(
+                                "Choose the file you downloaded from KingMods",
+                            )
+                            .add_filter("Mod archive", &["zip"])
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_path_buf());
+                        (id, picked)
+                    },
+                    |(id, picked)| Message::KingModsFilePicked(id, picked),
+                );
+            }
+            Message::KingModsFilePicked(id, picked) => {
+                let Some(picked) = picked else {
+                    return Task::none();
+                };
+                let Some(m) = self.mod_manager.get_mod(&id).cloned() else {
+                    return Task::none();
+                };
+                // Stage a copy under the funnel's own
+                // download name, beside the mod — the
+                // completion path deletes its input file
+                // when it lands, and that file must be our
+                // copy, never the user's download. (A
+                // download whose name differs from the
+                // mod's own is carried in under this staging
+                // name, so the funnel's checks meet the file
+                // they expect.)
+                let stem = ModManager::mod_stem(&m.path);
+                let staged = m
+                    .path
+                    .parent()
+                    .map(|p| p.join(format!(".playground-dl-{}.zip", stem)))
+                    .unwrap_or_else(|| PathBuf::from(".playground-dl.zip"));
+                if let Err(e) = std::fs::copy(&picked, &staged) {
+                    self.status = format!(
+                        "Could not stage {} for installing: {}",
+                        picked.display(),
+                        e
+                    );
+                    return Task::none();
+                }
+                // The job is the history entry: registered
+                // and started like any install's, with the
+                // manual import named in its source.
+                let version = match self.update_status.get(&id) {
+                    Some(UpdateState::Available(info)) => info.version.clone(),
+                    _ => self
+                        .db_rows
+                        .get(&stem)
+                        .and_then(|r| r.latest_version.clone())
+                        .unwrap_or_default(),
+                };
+                let job = self.downloads.register(
+                    id.clone(),
+                    m.name.clone(),
+                    m.file_name(),
+                    "KingMods (manual import)".to_string(),
+                    version,
+                );
+                self.downloads.start(job);
+                self.status = format!(
+                    "Installing the file you picked for {}…",
+                    m.name
+                );
+                // The staged copy rides the exact message a
+                // finished download lands with — the same
+                // funnel, the same bookkeeping, no fork.
+                return Task::done(Message::UpdateInstalled(id, Ok(staged)));
+            }
             Message::DownloadEvent(event) => match event {
                 DownloadEvent::Progress {
                     job,
@@ -3019,6 +3367,9 @@ impl App {
                     self.layout_arm_rollback = false;
                 }
                 self.current_tab = tab;
+                if tab == Tab::Keybindings {
+                    self.kb_reload();
+                }
                 if tab == Tab::Log {
                     return self.begin_log_load();
                 }
@@ -4236,6 +4587,9 @@ impl App {
                         .on_press(Message::InstallUpdate(m.id.clone())),
                 );
             }
+            if let Some(manual) = self.kingmods_manual_buttons(m) {
+                col = col.push(manual);
+            }
             if m.mod_type != crate::mod_manager::types::ModType::Zip {
                 col = col.push(
                     text("Update installs work on .zip mods; this is a folder mod.").size(12),
@@ -4262,6 +4616,9 @@ impl App {
                     .style(theme::nav_pill(true))
                     .on_press(Message::InstallUpdate(m.id.clone())),
             );
+            if let Some(manual) = self.kingmods_manual_buttons(m) {
+                col = col.push(manual);
+            }
             if m.mod_type != crate::mod_manager::types::ModType::Zip {
                 col = col.push(
                     text("Update installs work on .zip mods; this is a folder mod.").size(12),
@@ -6972,6 +7329,513 @@ impl App {
             .into()
     }
 
+    /// (Re)load the Keybindings page's staged document
+    /// from the profile's inputBinding.xml. A missing file
+    /// is the friendly empty state, never an error; a read
+    /// failure says so in the status line.
+    fn kb_reload(&mut self) {
+        self.kb_capture = None;
+        self.kb_reset_armed = false;
+        let profile = self.mod_manager.profile_dir();
+        self.kb_profile = profile.clone();
+        self.kb_backups = profile
+            .as_ref()
+            .map(|p| keybindings::list_backups(p))
+            .unwrap_or_default();
+        let Some(profile) = profile else {
+            self.kb_doc = None;
+            self.kb_original = None;
+            return;
+        };
+        let path = keybindings::bindings_path(&profile);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let doc = BindingsFile::parse(text);
+                // Stay on the device the user is viewing
+                // when it still exists; otherwise the
+                // keyboard tab when present, else the
+                // file's first device.
+                let devices = doc.devices();
+                let keep = self
+                    .kb_device
+                    .clone()
+                    .filter(|d| devices.contains(d));
+                self.kb_device = keep.or_else(|| {
+                    if devices
+                        .iter()
+                        .any(|d| d == keybindings::KEYBOARD_DEVICE)
+                    {
+                        Some(keybindings::KEYBOARD_DEVICE.to_string())
+                    } else {
+                        devices.first().cloned()
+                    }
+                });
+                self.kb_original = Some(doc.text().to_string());
+                self.kb_doc = Some(doc);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.kb_doc = None;
+                self.kb_original = None;
+            }
+            Err(e) => {
+                self.kb_doc = None;
+                self.kb_original = None;
+                self.status =
+                    format!("Could not read {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    /// The staged document's actions grouped for the
+    /// page: Base Game first (actions no loaded mod
+    /// claims), then one group per owning mod, A-Z.
+    /// Actions keep file order inside a group.
+    fn kb_grouped_actions(&self) -> Vec<(String, Vec<KbAction>)> {
+        let Some(doc) = &self.kb_doc else {
+            return Vec::new();
+        };
+        let mut base: Vec<KbAction> = Vec::new();
+        let mut by_mod: std::collections::BTreeMap<String, Vec<KbAction>> =
+            std::collections::BTreeMap::new();
+        for action in doc.actions() {
+            match self.mod_manager.action_owner(&action.name) {
+                Some((title, _)) => {
+                    by_mod.entry(title.clone()).or_default().push(action)
+                }
+                None => base.push(action),
+            }
+        }
+        let mut out = vec![("Base Game".to_string(), base)];
+        out.extend(by_mod.into_iter());
+        out
+    }
+
+    /// A KingMods-sourced mod's page URL: the update
+    /// offer's repo (for a KingMods offer the repo IS the
+    /// mod's page), falling back to the database row's
+    /// recorded source reference.
+    fn kingmods_page_url(&self, id: &str) -> Option<String> {
+        if let Some(UpdateState::Available(info)) = self.update_status.get(id) {
+            if info.repo.starts_with("http") {
+                return Some(info.repo.clone());
+            }
+        }
+        let m = self.mod_manager.get_mod(id)?;
+        let stem = ModManager::mod_stem(&m.path);
+        let row = self.db_rows.get(&stem)?;
+        if row.source_kind == "kingmods" {
+            row.source_ref
+                .clone()
+                .filter(|u| u.starts_with("http"))
+        } else {
+            None
+        }
+    }
+
+    /// The KingMods manual path's two buttons, for the
+    /// details panel: shown only for a KingMods-sourced
+    /// mod with an update on offer (or a failed attempt
+    /// behind it). Every other source's rows are untouched.
+    fn kingmods_manual_buttons(&self, m: &Mod) -> Option<Element<'_, Message>> {
+        let stem = ModManager::mod_stem(&m.path);
+        let row = self.db_rows.get(&stem)?;
+        if row.source_kind != "kingmods" {
+            return None;
+        }
+        match self.update_status.get(&m.id) {
+            Some(UpdateState::Available(_)) | Some(UpdateState::Failed(_)) => {}
+            _ => return None,
+        }
+        Some(
+            column![
+                text("KingMods' own download is refused by the site's checks — the manual path:")
+                    .size(12),
+                button(centered_label(text("Open KingMods page")))
+                    .width(Length::Fill)
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::OpenKingModsPage(m.id.clone())),
+                button(centered_label(text("Import downloaded file...")))
+                    .width(Length::Fill)
+                    .style(theme::nav_pill(true))
+                    .on_press(Message::ImportKingModsFile(m.id.clone())),
+            ]
+            .spacing(6)
+            .into(),
+        )
+    }
+
+    /// The Keybindings page's Backups box: the timestamped
+    /// backups (newest first) with Restore, the profile
+    /// folder opener, and the arm-to-confirm reset.
+    fn kb_backups_box(&self) -> Element<'_, Message> {
+        let mut col = column![text("Backups").size(15)].spacing(7);
+        if self.kb_backups.is_empty() {
+            col = col.push(
+                text("No backups yet — one is taken automatically before every save.")
+                    .size(12)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        for (path, size) in &self.kb_backups {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            col = col.push(
+                row![
+                    text(format!("{} ({})", name, format_size(*size)))
+                        .size(12)
+                        .width(Length::Fill),
+                    button(text("Restore"))
+                        .style(theme::nav_pill(false))
+                        .on_press(Message::KeybindingsRestoreBackup(
+                            path.clone(),
+                        )),
+                ]
+                .spacing(8),
+            );
+        }
+        let mut buttons = row![].spacing(8);
+        if let Some(profile) = &self.kb_profile {
+            buttons = buttons.push(
+                button(text("Open profile folder"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::OpenFolder(profile.clone())),
+            );
+        }
+        if self.kb_doc.is_some() {
+            let label = if self.kb_reset_armed {
+                "Click again to confirm reset"
+            } else {
+                "Reset to game defaults"
+            };
+            buttons = buttons.push(
+                button(text(label))
+                    .style(theme::nav_pill(self.kb_reset_armed))
+                    .on_press(Message::KeybindingsResetDefaults),
+            );
+        }
+        col = col.push(buttons);
+        container(col)
+            .width(Length::Fill)
+            .padding(11)
+            .style(wizard_section_box)
+            .into()
+    }
+
+    /// The Keybindings page: device tabs over collapsible
+    /// per-owner groups of action rows, staged editing
+    /// with a save footer, and the Backups box. The model
+    /// is the game's own inputBinding.xml (see
+    /// mod_manager::keybindings) — nothing here writes it
+    /// except the page's explicit Save.
+    fn keybindings_view(&self) -> Element<'_, Message> {
+        let title = text("Keybindings").size(20);
+        if self.kb_profile.is_none() {
+            return column![
+                title,
+                text("No game profile folder was found — check that the game mods folder really is a game's mods folder.")
+                    .size(13),
+            ]
+            .spacing(10)
+            .into();
+        }
+        let Some(doc) = &self.kb_doc else {
+            return column![
+                title,
+                text("No inputBinding.xml in the profile folder yet — the game creates this file the first time it runs. Once it exists, your bindings show up here.")
+                    .size(13),
+                self.kb_backups_box(),
+            ]
+            .spacing(10)
+            .into();
+        };
+
+        let actions = doc.actions();
+        let devices = doc.devices();
+        let device = self
+            .kb_device
+            .clone()
+            .filter(|d| devices.contains(d))
+            .unwrap_or_else(|| {
+                devices
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| keybindings::KEYBOARD_DEVICE.to_string())
+            });
+        let is_keyboard = device == keybindings::KEYBOARD_DEVICE;
+
+        // Device tabs, as nav pills.
+        let mut tabs = row![].spacing(6);
+        for d in &devices {
+            tabs = tabs.push(
+                button(text(keybindings::device_label(d)))
+                    .style(theme::nav_pill(*d == device))
+                    .on_press(Message::KeybindingsDeviceSelected(d.clone())),
+            );
+        }
+
+        // Findings on the selected device, and the banner
+        // over them.
+        let findings = keybindings::analyze(&actions, &device);
+        let conflict_count = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::Conflict)
+            .count();
+        let warning_count = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::Warning)
+            .count();
+        let affected_mods: HashSet<&str> = findings
+            .iter()
+            .flat_map(|f| f.actions.iter())
+            .filter_map(|a| {
+                self.mod_manager
+                    .action_owner(a)
+                    .map(|(title, _)| title.as_str())
+            })
+            .collect();
+        let finding_actions: HashSet<&str> = findings
+            .iter()
+            .flat_map(|f| f.actions.iter().map(|s| s.as_str()))
+            .collect();
+
+        // Filters.
+        let query = self.kb_search.trim().to_lowercase();
+        let action_visible = |group: &str, a: &KbAction| -> bool {
+            if self.kb_unassigned_only
+                && a.bindings.iter().any(|b| b.device == device)
+            {
+                return false;
+            }
+            if self.kb_conflicts_only && !finding_actions.contains(a.name.as_str()) {
+                return false;
+            }
+            if !query.is_empty() {
+                let in_name = a.name.to_lowercase().contains(&query)
+                    || keybindings::humanize_action(&a.name)
+                        .to_lowercase()
+                        .contains(&query);
+                if !in_name && !group.to_lowercase().contains(&query) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let mut groups_col = column![].spacing(10);
+        for (group, group_actions) in self.kb_grouped_actions() {
+            let visible: Vec<&KbAction> = group_actions
+                .iter()
+                .filter(|a| action_visible(&group, a))
+                .collect();
+            if visible.is_empty() {
+                continue;
+            }
+            let group_conflicts = findings
+                .iter()
+                .filter(|f| {
+                    f.actions
+                        .iter()
+                        .any(|a| group_actions.iter().any(|ga| &ga.name == a))
+                })
+                .count();
+            let collapsed = self.kb_collapsed.contains(&group);
+            let header = row![
+                button(text(if collapsed { "+" } else { "–" }).size(14))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::KeybindingsToggleGroup(group.clone())),
+                text(format!("{} ({})", group, group_actions.len())).size(15),
+                if group_conflicts > 0 {
+                    text(format!(
+                        "{} conflict{}",
+                        group_conflicts,
+                        if group_conflicts == 1 { "" } else { "s" }
+                    ))
+                    .size(12)
+                    .color(theme::TEXT_DIM)
+                } else {
+                    text("").size(12)
+                },
+                Space::with_width(Length::Fill),
+                button(text("Auto-Resolve"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::KeybindingsAutoResolve(group.clone())),
+            ]
+            .spacing(8);
+            let mut box_col = column![header].spacing(7);
+            if !collapsed {
+                for a in visible {
+                    let category = self
+                        .mod_manager
+                        .action_owner(&a.name)
+                        .and_then(|(_, c)| c.clone());
+                    let mut name_col =
+                        column![text(keybindings::humanize_action(&a.name)).size(13)]
+                            .spacing(2);
+                    if let Some(category) = category {
+                        name_col = name_col.push(
+                            text(category).size(11).color(theme::TEXT_DIM),
+                        );
+                    }
+                    let mut chips = row![].spacing(6);
+                    let device_bindings: Vec<_> = a
+                        .bindings
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, b)| b.device == device)
+                        .collect();
+                    if device_bindings.is_empty() {
+                        let capturing = matches!(
+                            &self.kb_capture,
+                            Some(KbCapture::Add { action }) if action == &a.name
+                        );
+                        if capturing {
+                            chips = chips.push(
+                                button(text("Press a key... (Esc cancels)").size(12))
+                                    .style(theme::nav_pill(true)),
+                            );
+                        } else if is_keyboard {
+                            chips = chips.push(
+                                button(text("Unassigned — Add").size(12))
+                                    .style(theme::nav_pill(false))
+                                    .on_press(Message::KeybindingsAddBinding(
+                                        a.name.clone(),
+                                    )),
+                            );
+                        } else {
+                            chips = chips.push(
+                                text("Unassigned").size(12).color(theme::TEXT_DIM),
+                            );
+                        }
+                    } else {
+                        for (pos, binding) in device_bindings {
+                            let capturing = matches!(
+                                &self.kb_capture,
+                                Some(KbCapture::Replace { action, pos: p })
+                                    if action == &a.name && *p == pos
+                            );
+                            let label = if capturing {
+                                "Press a key... (Esc cancels)".to_string()
+                            } else {
+                                keybindings::humanize_input(&binding.input)
+                            };
+                            let mut chip =
+                                button(text(label).size(12)).style(
+                                    theme::nav_pill(capturing),
+                                );
+                            if is_keyboard {
+                                chip = chip.on_press(
+                                    Message::KeybindingsCaptureStart(
+                                        a.name.clone(),
+                                        pos,
+                                    ),
+                                );
+                            }
+                            chips = chips.push(
+                                row![
+                                    chip,
+                                    button(text("x").size(12))
+                                        .style(theme::nav_pill(false))
+                                        .on_press(
+                                            Message::KeybindingsClearBinding(
+                                                a.name.clone(),
+                                                pos,
+                                            ),
+                                        ),
+                                ]
+                                .spacing(2),
+                            );
+                        }
+                    }
+                    box_col = box_col.push(
+                        row![
+                            name_col.width(Length::Fill),
+                            chips,
+                        ]
+                        .spacing(8),
+                    );
+                }
+            }
+            groups_col = groups_col.push(
+                container(box_col)
+                    .width(Length::Fill)
+                    .padding(11)
+                    .style(wizard_section_box),
+            );
+        }
+        groups_col = groups_col.push(self.kb_backups_box());
+
+        let top_bar = row![
+            text_input("Search actions or mods", &self.kb_search)
+                .on_input(Message::KeybindingsSearchChanged)
+                .width(260),
+            checkbox("Unassigned only", self.kb_unassigned_only)
+                .on_toggle(Message::KeybindingsUnassignedOnlyToggled),
+            checkbox("Conflicts only", self.kb_conflicts_only)
+                .on_toggle(Message::KeybindingsConflictsOnlyToggled),
+            Space::with_width(Length::Fill),
+            button(text("Expand all"))
+                .style(theme::nav_pill(false))
+                .on_press(Message::KeybindingsExpandAll(true)),
+            button(text("Collapse all"))
+                .style(theme::nav_pill(false))
+                .on_press(Message::KeybindingsExpandAll(false)),
+        ]
+        .spacing(10);
+
+        let mut page = column![title, tabs].spacing(10);
+        if !findings.is_empty() {
+            page = page.push(text(format!(
+                "{} Keybinding Conflicts & {} Warnings Detected (Affecting {} Mods)",
+                conflict_count,
+                warning_count,
+                affected_mods.len()
+            )));
+        }
+        page = page.push(top_bar);
+        if !is_keyboard {
+            page = page.push(
+                text("Key capture is keyboard-only for now — on this device you can view and clear bindings.")
+                    .size(12)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        page = page.push(
+            page_scroll_pad(groups_col, PAGE_MARGIN + SCROLLBAR_W)
+                .height(Length::Fill)
+                .width(Length::Fill),
+        );
+        // The save footer, visible only while staged edits
+        // exist: the Settings one-save pattern.
+        let dirty = match &self.kb_original {
+            Some(original) => {
+                doc.changed_blocks(&BindingsFile::parse(original.clone()))
+            }
+            None => 0,
+        };
+        if dirty > 0 {
+            page = page.push(
+                row![
+                    button(text("Save bindings"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::KeybindingsSave),
+                    button(text("Discard changes"))
+                        .style(theme::nav_pill(false))
+                        .on_press(Message::KeybindingsDiscard),
+                    text(format!(
+                        "{} unsaved change{}",
+                        dirty,
+                        if dirty == 1 { "" } else { "s" }
+                    ))
+                    .size(12),
+                ]
+                .spacing(8),
+            );
+        }
+        page.into()
+    }
+
     /// Left sidebar (John, round 4 — the Hub layout piece): logo and
     /// app name up top, section navigation, then the LIBRARY counts
     /// that jump the Browse grid straight to that view.
@@ -7053,6 +7917,7 @@ impl App {
             nav("Configure Save".to_string(), Tab::Saves),
             nav("Layout".to_string(), Tab::Layout),
             nav("Log Reader".to_string(), Tab::Log),
+            nav("Keybindings".to_string(), Tab::Keybindings),
             // Downloads (2026-10-22): the live count rides
             // the label only while something is in play —
             // queued or running — like Conflicts' count
@@ -7088,7 +7953,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.6.0  © 2026 Farmer Jay.")
+            text("V1.6.1  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -7602,6 +8467,12 @@ impl App {
                 58.0,
             ),
             Tab::Log => (Space::with_height(0).into(), None, self.log_view(), 58.0),
+            Tab::Keybindings => (
+                Space::with_height(0).into(),
+                None,
+                self.keybindings_view(),
+                58.0,
+            ),
             Tab::Downloads => (
                 Space::with_height(0).into(),
                 None,
@@ -7714,14 +8585,25 @@ impl App {
         // verify net's schedule) and is gone the moment
         // the handover settles, so the app carries no
         // timer for the rest of its life.
+        let mut subs = vec![events];
         if self.window_restore.ticking() {
-            Subscription::batch(vec![
-                events,
-                iced::time::every(RESTORE_TICK).map(|_| Message::RestoreTick),
-            ])
-        } else {
-            events
+            subs.push(iced::time::every(RESTORE_TICK).map(|_| Message::RestoreTick));
         }
+        // Key capture (Keybindings page): a keyboard
+        // listener exists only while a capture is armed,
+        // so ordinary key presses never reach the app.
+        if self.kb_capture.is_some() {
+            subs.push(iced::event::listen_with(|event, _status, _id| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key,
+                    location,
+                    modifiers,
+                    ..
+                }) => Some(Message::KeybindingsCaptureKey(key, location, modifiers)),
+                _ => None,
+            }));
+        }
+        Subscription::batch(subs)
     }
 }
 

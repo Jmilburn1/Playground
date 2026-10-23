@@ -763,6 +763,8 @@ mod tests {
             hash: None,
             icon_filename: None,
             categories: categories.iter().map(|s| s.to_string()).collect(),
+            declared_actions: Vec::new(),
+            action_binding_refs: Vec::new(),
         }
     }
 

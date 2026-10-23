@@ -16,6 +16,7 @@ pub enum Tab {
     Layout,
     Log,
     Downloads,
+    Keybindings,
     Settings,
 }
 
@@ -793,6 +794,7 @@ pub enum Message {
     /// Settings, Diagnostics: copy the diagnostics summary
     /// to the clipboard.
     CopyDiagnostics,
+    CopyLaunchFlags,
     /// Settings, Diagnostics: save the diagnostics summary
     /// to a text file the user picks.
     ExportDiagnostics,
@@ -801,6 +803,58 @@ pub enum Message {
     /// Settings, Maintenance: forget the library database's
     /// fingerprints and rescan, re-reading every mod.
     RereadEveryMod,
+    /// Keybindings: switch the device tab.
+    KeybindingsDeviceSelected(String),
+    /// Keybindings: the search field.
+    KeybindingsSearchChanged(String),
+    /// Keybindings: show unassigned actions only.
+    KeybindingsUnassignedOnlyToggled(bool),
+    /// Keybindings: show conflicted actions only.
+    KeybindingsConflictsOnlyToggled(bool),
+    /// Keybindings: expand (true) or collapse (false)
+    /// every group at once.
+    KeybindingsExpandAll(bool),
+    /// Keybindings: collapse or expand one group, by name.
+    KeybindingsToggleGroup(String),
+    /// Keybindings: start key capture to REPLACE one
+    /// binding (the action's binding at this position in
+    /// the staged document).
+    KeybindingsCaptureStart(String, usize),
+    /// Keybindings: start key capture to ADD a binding to
+    /// an unassigned action (keyboard tab).
+    KeybindingsAddBinding(String),
+    /// Keybindings: one key press while capture is armed.
+    KeybindingsCaptureKey(
+        iced::keyboard::Key,
+        iced::keyboard::Location,
+        iced::keyboard::Modifiers,
+    ),
+    /// Keybindings: remove one binding (the action's
+    /// binding at this position in the staged document).
+    KeybindingsClearBinding(String, usize),
+    /// Keybindings: one group's Auto-Resolve press.
+    KeybindingsAutoResolve(String),
+    /// Keybindings: commit the staged edits (a backup of
+    /// the live file is taken first; a failed backup
+    /// aborts the save).
+    KeybindingsSave,
+    /// Keybindings: throw the staged edits away.
+    KeybindingsDiscard,
+    /// Keybindings: restore one backup over the live file
+    /// (the live file is backed up first).
+    KeybindingsRestoreBackup(PathBuf),
+    /// Keybindings: reset to game defaults — arm on the
+    /// first press, execute on the second.
+    KeybindingsResetDefaults,
+    /// KingMods manual path: open the mod's KingMods page
+    /// in the browser.
+    OpenKingModsPage(String),
+    /// KingMods manual path: pick the file the user
+    /// downloaded by hand for this mod's update.
+    ImportKingModsFile(String),
+    /// KingMods manual path: the picker answered; the
+    /// chosen file rides the ordinary install funnel.
+    KingModsFilePicked(String, Option<PathBuf>),
 }
 
 /// One of the Launch Configuration's switches (Settings,

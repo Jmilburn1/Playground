@@ -114,20 +114,22 @@ impl LibraryDb {
             return db;
         };
         match serde_json::from_str::<DbFile>(&text) {
-            Ok(file) if file.format == 2 => {
+            Ok(file) if file.format == 3 => {
                 db.loaded = file.rows.clone();
                 db.rows = Mutex::new(file.rows);
             }
-            Ok(_file) if _file.format == 1 => {
+            Ok(_file) if _file.format == 1 || _file.format == 2 => {
                 // Format 1 rows were parsed under the old
                 // category rules — Playground's own buckets
                 // (owner ruling, 2026-10-22, replaced them
-                // with the game's categories). A stored row
-                // carries nothing to recompute its categories
-                // from, so the rows are left behind for a
-                // one-time re-parse and the next save writes
-                // format 2. A known format, not damage: no
-                // quarantine.
+                // with the game's categories). Format 2 rows
+                // predate the modDesc action extraction the
+                // Keybindings page joins on (2026-10-22). A
+                // stored row carries nothing to recompute
+                // either from, so the rows are left behind
+                // for a one-time re-parse and the next save
+                // writes format 3. A known format, not
+                // damage: no quarantine.
             }
             _ => {
                 // Damaged (or a stranger's format): set the
@@ -267,7 +269,7 @@ impl LibraryDb {
             return;
         }
         let file = DbFile {
-            format: 2,
+            format: 3,
             generated_at: now_secs(),
             rows: rows.clone(),
         };

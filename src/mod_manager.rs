@@ -10,6 +10,7 @@ pub mod categories;
 pub mod saves;
 pub mod savegame;
 pub mod game_files;
+pub mod keybindings;
 
 use crate::config::Config;
 

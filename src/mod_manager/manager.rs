@@ -122,6 +122,14 @@ pub struct ModManager {
     /// is remembered like a link, so no search is ever
     /// burned twice (owner, 2026-10-20).
     miss: CatalogMiss,
+    /// The Keybindings page's action -> owner join:
+    /// action name -> (owning mod's title, the category
+    /// its modDesc declared for the action, if any). Built
+    /// from the loaded mods' declared actions wherever the
+    /// mod map is installed — never per render, and with
+    /// no file IO of its own (the scan already parsed
+    /// every modDesc).
+    action_owners: HashMap<String, (String, Option<String>)>,
 }
 
 impl ModManager {
@@ -152,6 +160,7 @@ impl ModManager {
             other: CatalogOther::load_default(),
             other_migrated: false,
             miss: CatalogMiss::load_default(),
+            action_owners: HashMap::new(),
         })
     }
 
@@ -159,7 +168,37 @@ impl ModManager {
         let (archive_dir, active_dir, parallel) = self.scan_params();
         self.mods = Self::scan_directories(archive_dir, active_dir, parallel)?;
         self.migrate_other_links();
+        self.rebuild_action_owners();
         Ok(())
+    }
+
+    /// Rebuild the action -> owner join from the loaded
+    /// mods. Mods are visited in title order so the owner
+    /// of a multiply-declared action is deterministic;
+    /// the first declaration wins.
+    fn rebuild_action_owners(&mut self) {
+        let mut mods: Vec<&Mod> = self.mods.values().collect();
+        mods.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut map: HashMap<String, (String, Option<String>)> = HashMap::new();
+        for m in mods {
+            for declared in &m.declared_actions {
+                map.entry(declared.name.clone())
+                    .or_insert_with(|| (m.name.clone(), declared.category.clone()));
+            }
+            for referenced in &m.action_binding_refs {
+                map.entry(referenced.clone())
+                    .or_insert_with(|| (m.name.clone(), None));
+            }
+        }
+        self.action_owners = map;
+    }
+
+    /// Who owns this input action, per the loaded mods'
+    /// modDesc declarations: (mod title, declared
+    /// category). None = no loaded mod claims it — the
+    /// Keybindings page groups those under Base Game.
+    pub fn action_owner(&self, action: &str) -> Option<&(String, Option<String>)> {
+        self.action_owners.get(action)
     }
 
     /// The one-time migration of config.toml's GitHub links
@@ -532,6 +571,7 @@ impl ModManager {
     pub fn install_mods(&mut self, mods: HashMap<String, Mod>) {
         self.mods = mods;
         self.migrate_other_links();
+        self.rebuild_action_owners();
     }
 
     /// List the LIBRARY folder's mod candidates: the root
@@ -1397,6 +1437,9 @@ impl ModManager {
             self.refresh_projection(&fresh);
         }
         self.mods.insert(fresh.id.clone(), fresh);
+        // The replacement's modDesc may declare a
+        // different action set than the file it replaced.
+        self.rebuild_action_owners();
 
         let mut dirty = false;
         let favs = &mut self.config.settings.favorites;

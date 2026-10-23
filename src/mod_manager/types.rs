@@ -45,6 +45,15 @@ pub struct Mod {
     /// detected from the mod's store items at scan time.
     #[serde(default)]
     pub categories: Vec<String>,
+    /// Input actions this mod declares in its modDesc
+    /// (`<action name category>`), and the action names its
+    /// modDesc's `<actionBinding>` elements reference. The
+    /// Keybindings page's action -> mod join is built from
+    /// these at scan/install time.
+    #[serde(default)]
+    pub declared_actions: Vec<moddesc::DeclaredAction>,
+    #[serde(default)]
+    pub action_binding_refs: Vec<String>,
 }
 
 /// A mod's stable ID: a hash of its canonical path. The same
@@ -122,6 +131,8 @@ impl Mod {
             hash: None,
             icon_filename: None,
             categories: Vec::new(),
+            declared_actions: Vec::new(),
+            action_binding_refs: Vec::new(),
         };
 
         // Real metadata from modDesc.xml, when the mod has one. Missing or
@@ -130,6 +141,8 @@ impl Mod {
             // Categories first: the fields below are moved out of
             // `info` one by one, and detection still needs to read it.
             m.categories = super::categories::detect_categories(&m.path, Some(&info));
+            m.declared_actions = info.actions.clone();
+            m.action_binding_refs = info.action_bindings.clone();
             if let Some(title) = info.title {
                 if !title.trim().is_empty() {
                     m.name = title;
