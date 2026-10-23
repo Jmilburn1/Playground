@@ -603,6 +603,16 @@ pub enum Message {
     RemoveHoldStarted(String),
     RemoveHoldReleased,
     RemoveHoldTick,
+    /// The feel pass's shared animation clock (2026-10-23):
+    /// one tick drives the switch glides, the rolling
+    /// counts, the easing progress bars and the
+    /// indeterminate pulse. Subscribed only while an
+    /// animation is live or settling.
+    AnimTick,
+    /// A browse card's hover state (feel pass, 2026-10-23):
+    /// Some(id) on enter, None on exit — the hovered card
+    /// lifts.
+    CardHover(Option<String>),
     SaveDirectories,
     /// Settings page, Library section: the conflict-
     /// checking switch and the two numeric fields, staged
@@ -986,6 +996,8 @@ pub fn mod_card<'a>(
     update_available: bool,
     width: f32,
     height: f32,
+    is_hovered: bool,
+    switch_t: f32,
 ) -> Element<'a, Message> {
     const ICON_H: f32 = 100.0;
     let icon_img: Element<'a, Message> = match icon {
@@ -1179,9 +1191,8 @@ pub fn mod_card<'a>(
     // no font glyph or stock widget is trusted to look the
     // same on every build.
     if matches!(mod_data.state, ModState::Active | ModState::Archived) {
-        let is_active = mod_data.state == ModState::Active;
         let switch = button(
-            container(iced::widget::canvas(SwitchIcon { on: is_active }).width(34).height(19))
+            container(iced::widget::canvas(SwitchIcon { t: switch_t }).width(34).height(19))
                 .width(34)
                 .height(19)
                 .center_x(34)
@@ -1225,28 +1236,51 @@ pub fn mod_card<'a>(
     let card = container(content)
         .width(width)
         .height(height)
-        .style(move |_| container::Style {
-            background: Some(iced::Background::Color(if is_selected {
-                Color::from_rgb(0.20, 0.21, 0.24)
-            } else {
-                theme::BASE
-            })),
-            border: iced::Border {
-                color: if is_selected {
-                    Color::from_rgb(0.82, 0.83, 0.87)
-                } else if is_favorite {
-                    Color::from_rgb(0.58, 0.59, 0.63)
+        .style(move |_| {
+            // Hover lift (feel pass, 2026-10-23): the
+            // hovered card rises off the grid — its ground
+            // lightens a step toward the panel, its edge
+            // leans toward the accent, and a soft shadow
+            // appears under it. Selected still wins.
+            let lifted = is_hovered && !is_selected;
+            container::Style {
+                background: Some(iced::Background::Color(if is_selected {
+                    Color::from_rgb(0.20, 0.21, 0.24)
+                } else if lifted {
+                    Color::from_rgb(0.11, 0.13, 0.15)
                 } else {
-                    Color::from_rgb(0.30, 0.31, 0.34)
+                    theme::BASE
+                })),
+                border: iced::Border {
+                    color: if is_selected {
+                        Color::from_rgb(0.82, 0.83, 0.87)
+                    } else if lifted {
+                        theme::ACCENT
+                    } else if is_favorite {
+                        Color::from_rgb(0.58, 0.59, 0.63)
+                    } else {
+                        Color::from_rgb(0.30, 0.31, 0.34)
+                    },
+                    width: if is_selected || is_favorite { 2.0 } else { 1.0 },
+                    radius: 8.0.into(),
                 },
-                width: if is_selected || is_favorite { 2.0 } else { 1.0 },
-                radius: 8.0.into(),
-            },
-            ..container::Style::default()
+                shadow: if lifted {
+                    iced::Shadow {
+                        color: Color { a: 0.5, ..theme::BASE },
+                        offset: iced::Vector::new(0.0, 3.0),
+                        blur_radius: 10.0,
+                    }
+                } else {
+                    iced::Shadow::default()
+                },
+                ..container::Style::default()
+            }
         });
 
     iced::widget::mouse_area(card)
         .on_release(Message::SelectMod(mod_data.id.clone()))
+        .on_enter(Message::CardHover(Some(mod_data.id.clone())))
+        .on_exit(Message::CardHover(None))
         .into()
 }
 
@@ -1311,7 +1345,11 @@ impl<Message> iced::widget::canvas::Program<Message> for StarIcon {
 /// is not. The colors are the app palette's own values (see
 /// ui::theme), so the switch wears the layout's colors.
 pub struct SwitchIcon {
-    pub on: bool,
+    /// Knob position, 0.0 (off, left) to 1.0 (on, right).
+    /// The feel pass (2026-10-23) glides this between the
+    /// ends instead of snapping; at rest it sits exactly
+    /// on an end.
+    pub t: f32,
 }
 
 impl<Message> iced::widget::canvas::Program<Message> for SwitchIcon {
@@ -1329,13 +1367,19 @@ impl<Message> iced::widget::canvas::Program<Message> for SwitchIcon {
         let mut frame = Frame::new(_renderer, bounds.size());
         let w = bounds.width;
         let h = bounds.height;
-        // theme::ACCENT (#3E5F6E) lit, theme::PANEL's dimmer
-        // sibling grey at rest.
-        let track_color = if self.on {
-            Color::from_rgb(0x3E as f32 / 255.0, 0x5F as f32 / 255.0, 0x6E as f32 / 255.0)
-        } else {
-            Color::from_rgb(0.30, 0.31, 0.34)
+        let t = self.t.clamp(0.0, 1.0);
+        let blend = |a: Color, b: Color| Color {
+            r: a.r + (b.r - a.r) * t,
+            g: a.g + (b.g - a.g) * t,
+            b: a.b + (b.b - a.b) * t,
+            a: 1.0,
         };
+        // theme::ACCENT (#3E5F6E) lit, theme::PANEL's dimmer
+        // sibling grey at rest — blended by the glide.
+        let track_color = blend(
+            Color::from_rgb(0.30, 0.31, 0.34),
+            Color::from_rgb(0x3E as f32 / 255.0, 0x5F as f32 / 255.0, 0x6E as f32 / 255.0),
+        );
         let track = Path::rounded_rectangle(
             iced::Point::new(0.0, 0.0),
             iced::Size::new(w, h),
@@ -1343,16 +1387,12 @@ impl<Message> iced::widget::canvas::Program<Message> for SwitchIcon {
         );
         frame.fill(&track, track_color);
         let knob_r = h / 2.0 - 2.5;
-        let knob_center = iced::Point::new(
-            if self.on { w - h / 2.0 } else { h / 2.0 },
-            h / 2.0,
-        );
+        let knob_center = iced::Point::new(h / 2.0 + t * (w - h), h / 2.0);
         // theme::TEXT (#DFE9ED) lit, TEXT_DIM (#ACC3D0) at rest.
-        let knob_color = if self.on {
-            Color::from_rgb(0xDF as f32 / 255.0, 0xE9 as f32 / 255.0, 0xED as f32 / 255.0)
-        } else {
-            Color::from_rgb(0xAC as f32 / 255.0, 0xC3 as f32 / 255.0, 0xD0 as f32 / 255.0)
-        };
+        let knob_color = blend(
+            Color::from_rgb(0xAC as f32 / 255.0, 0xC3 as f32 / 255.0, 0xD0 as f32 / 255.0),
+            Color::from_rgb(0xDF as f32 / 255.0, 0xE9 as f32 / 255.0, 0xED as f32 / 255.0),
+        );
         let knob = Path::circle(knob_center, knob_r);
         frame.fill(&knob, knob_color);
         vec![frame.into_geometry()]

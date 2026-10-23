@@ -88,6 +88,22 @@ const RESTORE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 /// fires, and the hold clock's tick while one is live.
 const REMOVE_HOLD_TIME: std::time::Duration = std::time::Duration::from_millis(700);
 const REMOVE_HOLD_TICK: std::time::Duration = std::time::Duration::from_millis(25);
+/// The feel pass's animation constants (2026-10-23):
+/// one 16ms clock drives every micro-animation; a card
+/// switch glides over 160ms; the clock stays alive for
+/// a 900ms tail after the last kick so settles finish.
+const ANIM_TICK: std::time::Duration = std::time::Duration::from_millis(16);
+const SWITCH_ANIM_DUR: std::time::Duration = std::time::Duration::from_millis(160);
+const ANIM_TAIL: std::time::Duration = std::time::Duration::from_millis(900);
+
+/// One card switch's glide (feel pass, 2026-10-23):
+/// the knob eases from `from` to `to` (the 0.0/1.0
+/// ends) over SWITCH_ANIM_DUR from `started`.
+struct SwitchAnim {
+    from: f32,
+    to: f32,
+    started: std::time::Instant,
+}
 const SIDEBAR_W: f32 = 232.0;
 const GRID_SPACING: f32 = 12.0;
 const DETAILS_W: f32 = 344.0;
@@ -617,6 +633,21 @@ pub struct App {
     /// 2026-10-23 — replaces the arm-to-confirm
     /// pending_remove for routine single-mod deletes).
     remove_hold: Option<(String, std::time::Instant)>,
+    /// The feel pass's animation state (2026-10-23):
+    /// `anim_epoch` phases the indeterminate pulse;
+    /// `anim_until` keeps the shared AnimTick clock
+    /// subscribed while anything is settling;
+    /// `switch_anims` holds the card switches mid-glide;
+    /// `shown_counts` the rolling numbers (displayed
+    /// value, target); `eased_bars` the progress bars'
+    /// displayed fractions; `hovered_card` the card the
+    /// mouse is over (it lifts).
+    anim_epoch: std::time::Instant,
+    anim_until: std::time::Instant,
+    switch_anims: HashMap<String, SwitchAnim>,
+    shown_counts: HashMap<&'static str, (f32, usize)>,
+    eased_bars: HashMap<String, f32>,
+    hovered_card: Option<String>,
     conflicts: Vec<Conflict>,
     icons: HashMap<String, ImageHandle>,
     active_dir_input: String,
@@ -945,6 +976,12 @@ impl App {
             favorites_only: false,
             selected_mod: None,
             remove_hold: None,
+            anim_epoch: std::time::Instant::now(),
+            anim_until: std::time::Instant::now(),
+            switch_anims: HashMap::new(),
+            shown_counts: HashMap::new(),
+            eased_bars: HashMap::new(),
+            hovered_card: None,
             conflicts: Vec::new(),
             icons: HashMap::new(),
             active_dir_input,
@@ -1607,6 +1644,7 @@ impl App {
     /// freezing.
     fn begin_layout_apply(&mut self, preview: LayoutPlan) -> Task<Message> {
         self.layout_running = Some(LayoutRun::Apply);
+        self.kick_anim();
         self.layout_done = 0;
         self.layout_total = 0;
         self.layout_outcome = None;
@@ -1625,6 +1663,7 @@ impl App {
     /// included.
     fn begin_layout_rollback(&mut self) -> Task<Message> {
         self.layout_running = Some(LayoutRun::Rollback);
+        self.kick_anim();
         self.layout_outcome = None;
         self.layout_error = None;
         self.status = "Rolling back the layout…".to_string();
@@ -1673,10 +1712,15 @@ impl App {
         // stale conflict can outlive the switch.
         if !self.mod_manager.check_conflicts() {
             self.conflicts = Vec::new();
+            self.retarget_counts();
             return;
         }
         let mods: Vec<Mod> = self.mod_manager.get_mods().into_iter().cloned().collect();
         self.conflicts = ConflictDetector::detect_conflicts(&mods);
+        // Nearly every data change flows through here, so
+        // this is the rolling counts' main artery too
+        // (feel pass, 2026-10-23).
+        self.retarget_counts();
     }
 
     fn filtered_mods(&self) -> Vec<&Mod> {
@@ -3868,6 +3912,19 @@ impl App {
                     .get_mod(&id)
                     .map(|m| m.state == ModState::Active)
                     .unwrap_or(false);
+                // Feel pass: the switch GLIDES — start its
+                // animation from wherever the knob sits now
+                // toward the state it is flipping to.
+                let from = self.switch_t(&id, is_active);
+                self.switch_anims.insert(
+                    id.clone(),
+                    SwitchAnim {
+                        from,
+                        to: if is_active { 0.0 } else { 1.0 },
+                        started: std::time::Instant::now(),
+                    },
+                );
+                self.kick_anim();
                 // The slider runs the panel's own move operations:
                 // active flips to archive, anything else flips to
                 // active — under the layout these are the link
@@ -3931,6 +3988,63 @@ impl App {
                         name
                     );
                 }
+            }
+            Message::AnimTick => {
+                // The feel pass's shared clock: settle
+                // every live animation a step.
+                let now = std::time::Instant::now();
+                self.switch_anims
+                    .retain(|_, a| now.duration_since(a.started) < SWITCH_ANIM_DUR);
+                // Rolling counts travel a third of the
+                // remaining distance per tick, plus a
+                // floor step so small moves still land.
+                let mut traveling = false;
+                for (shown, target) in self.shown_counts.values_mut() {
+                    let t = *target as f32;
+                    let diff = t - *shown;
+                    if diff.abs() < 0.5 {
+                        *shown = t;
+                    } else {
+                        traveling = true;
+                        *shown += diff * 0.3 + diff.signum() * 0.5;
+                        if (t - *shown).abs() < 0.5 {
+                            *shown = t;
+                        }
+                    }
+                }
+                // Easing bars step toward their live
+                // actuals; keys for finished downloads
+                // are pruned.
+                if self.layout_running.is_some() && self.layout_total > 0 {
+                    let frac = self.layout_done as f32 / self.layout_total as f32;
+                    self.step_bar("layout", frac);
+                }
+                let jobs: Vec<(String, f32)> = self
+                    .downloads
+                    .jobs()
+                    .iter()
+                    .filter(|j| j.state == DownloadJobState::Downloading)
+                    .filter_map(|j| j.percent().map(|p| (format!("dl-{}", j.id), p)))
+                    .collect();
+                let live_keys: Vec<String> =
+                    jobs.iter().map(|(k, _)| k.clone()).collect();
+                for (k, p) in &jobs {
+                    self.step_bar(k, *p);
+                }
+                self.eased_bars
+                    .retain(|k, _| k == "layout" || live_keys.contains(k));
+                // The clock lives while anything travels
+                // or a job runs (the pulse needs it too).
+                if traveling
+                    || !self.switch_anims.is_empty()
+                    || self.layout_running.is_some()
+                    || self.downloads.live_count() > 0
+                {
+                    self.anim_until = now + ANIM_TAIL;
+                }
+            }
+            Message::CardHover(id) => {
+                self.hovered_card = id;
             }
             Message::RemoveHoldTick => {
                 let due = matches!(
@@ -4500,11 +4614,18 @@ impl App {
             })
         };
         let tiles = row![
-            tile(total_count.to_string(), "TOTAL MODS"),
-            tile(active_count.to_string(), "ACTIVE MODS"),
-            tile(archived_count.to_string(), "ARCHIVED MODS"),
-            tile(self.mod_manager.favorites_count().to_string(), "FAVORITE MODS"),
-            tile(maps_count.to_string(), "MAPS"),
+            tile(self.shown_count("mods", total_count).to_string(), "TOTAL MODS"),
+            tile(self.shown_count("active", active_count).to_string(), "ACTIVE MODS"),
+            tile(
+                self.shown_count("archived", archived_count).to_string(),
+                "ARCHIVED MODS",
+            ),
+            tile(
+                self.shown_count("favs", self.mod_manager.favorites_count())
+                    .to_string(),
+                "FAVORITE MODS",
+            ),
+            tile(self.shown_count("maps", maps_count).to_string(), "MAPS"),
             tile(
                 match self.db_generated_at {
                     // The tile counts the SAME live map the
@@ -4701,6 +4822,8 @@ impl App {
                         update_available,
                         card_w,
                         CARD_H,
+                        self.hovered_card.as_deref() == Some(m.id.as_str()),
+                        self.switch_t(&m.id, m.state == ModState::Active),
                     ));
                 }
                 grid = grid.push(r);
@@ -6760,10 +6883,13 @@ impl App {
                 DownloadJobState::Downloading => {
                     if let (Some(p), Some(total)) = (job.percent(), job.total) {
                         inner = inner.push(
-                            progress_bar(0.0..=100.0, p)
-                                .width(Length::Fill)
-                                .height(10)
-                                .style(theme::download_bar),
+                            progress_bar(
+                                0.0..=100.0,
+                                self.eased_bar(&format!("dl-{}", job.id), p),
+                            )
+                            .width(Length::Fill)
+                            .height(10)
+                            .style(theme::download_bar),
                         );
                         inner = inner.push(
                             text(format!(
@@ -7798,9 +7924,14 @@ impl App {
         // ---- Progress while a run lands -----------------
         if running == Some(LayoutRun::Apply) {
             let frac = if self.layout_total > 0 {
-                self.layout_done as f32 / self.layout_total as f32
+                self.eased_bar(
+                    "layout",
+                    self.layout_done as f32 / self.layout_total as f32,
+                )
             } else {
-                0.0
+                // No total yet: the bar breathes instead
+                // of sitting frozen at zero (feel pass).
+                self.pulse_frac()
             };
             col = col.push(progress_bar(0.0..=1.0, frac).width(Length::Fill));
             col = col.push(
@@ -7965,6 +8096,118 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// Keep the feel-pass animation clock alive for a
+    /// tail (ANIM_TAIL) — long enough for every glide,
+    /// roll and ease kicked by the same event to settle.
+    fn kick_anim(&mut self) {
+        self.anim_until = std::time::Instant::now() + ANIM_TAIL;
+    }
+
+    /// The numbers the rolling counts roll toward
+    /// (feel pass, 2026-10-23): the sidebar library
+    /// rows, the two counted nav labels, and the Browse
+    /// stat tiles — all read from live state.
+    fn count_targets(&self) -> [(&'static str, usize); 8] {
+        let all = self.mod_manager.get_mods();
+        let cat = |name: &str| {
+            all.iter()
+                .filter(|m| m.categories.iter().any(|c| c == name))
+                .count()
+        };
+        [
+            ("mods", all.len()),
+            ("favs", self.mod_manager.favorites_count()),
+            ("maps", cat("Maps")),
+            ("scripts", cat("Scripts")),
+            (
+                "active",
+                all.iter().filter(|m| m.state == ModState::Active).count(),
+            ),
+            (
+                "archived",
+                all.iter().filter(|m| m.state == ModState::Archived).count(),
+            ),
+            ("conflicts", self.conflicts.len()),
+            ("downloads", self.downloads.live_count()),
+        ]
+    }
+
+    /// Point every rolling count at its current target
+    /// and keep the clock alive while they travel.
+    fn retarget_counts(&mut self) {
+        for (key, target) in self.count_targets() {
+            match self.shown_counts.get_mut(key) {
+                Some((_, t)) => *t = target,
+                None => {
+                    self.shown_counts.insert(key, (target as f32, target));
+                }
+            }
+        }
+        self.kick_anim();
+    }
+
+    /// The number a rolling count shows right now. If
+    /// the stored target disagrees with the live actual
+    /// (a change that reached the view without a
+    /// retarget), the truth wins and the count snaps —
+    /// a displayed number is never wrong, only
+    /// sometimes unrolled.
+    fn shown_count(&self, key: &'static str, actual: usize) -> usize {
+        match self.shown_counts.get(key) {
+            Some(&(shown, target)) if target == actual => shown.round() as usize,
+            _ => actual,
+        }
+    }
+
+    /// A progress bar's displayed value: the eased one
+    /// when the animation clock has one stored, the
+    /// actual otherwise.
+    fn eased_bar(&self, key: &str, actual: f32) -> f32 {
+        self.eased_bars.get(key).copied().unwrap_or(actual)
+    }
+
+    /// Step one eased bar toward its actual (AnimTick).
+    fn step_bar(&mut self, key: &str, actual: f32) {
+        let entry = self.eased_bars.entry(key.to_string()).or_insert(actual);
+        let diff = actual - *entry;
+        if diff.abs() < 0.004 {
+            *entry = actual;
+        } else {
+            *entry += diff * 0.35;
+        }
+    }
+
+    /// A card switch's knob position right now: mid-
+    /// glide it eases (cubic out) between the anim's
+    /// ends; at rest it sits exactly on the state's end.
+    fn switch_t(&self, id: &str, on: bool) -> f32 {
+        match self.switch_anims.get(id) {
+            Some(a) => {
+                let raw = (a.started.elapsed().as_secs_f32()
+                    / SWITCH_ANIM_DUR.as_secs_f32())
+                .min(1.0);
+                let eased = 1.0 - (1.0 - raw).powi(3);
+                a.from + (a.to - a.from) * eased
+            }
+            None => {
+                if on {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    /// The indeterminate progress pulse (feel pass): a
+    /// slow breath between 15% and 85%, phased off the
+    /// animation epoch — what a running job with no
+    /// known total shows instead of a frozen zero bar.
+    fn pulse_frac(&self) -> f32 {
+        let secs = self.anim_epoch.elapsed().as_secs_f32();
+        0.5 - 0.35 * (secs * std::f32::consts::TAU / 1.8).cos()
     }
 
     /// The Reclaim census over the app's two pools
@@ -9206,7 +9449,13 @@ impl App {
                 .width(Length::Fill)
                 .style(theme::danger_pill())
                 .on_press(Message::Scan),
-            nav(format!("Conflicts ({})", self.conflicts.len()), Tab::Conflicts),
+            nav(
+                format!(
+                    "Conflicts ({})",
+                    self.shown_count("conflicts", self.conflicts.len())
+                ),
+                Tab::Conflicts,
+            ),
             nav("Configure Save".to_string(), Tab::Saves),
             nav("Layout".to_string(), Tab::Layout),
             nav("Log Reader".to_string(), Tab::Log),
@@ -9218,7 +9467,10 @@ impl App {
             // above; an idle section needs no number.
             nav(
                 if self.downloads.live_count() > 0 {
-                    format!("Downloads ({})", self.downloads.live_count())
+                    format!(
+                        "Downloads ({})",
+                        self.shown_count("downloads", self.downloads.live_count())
+                    )
                 } else {
                     "Downloads".to_string()
                 },
@@ -9226,7 +9478,7 @@ impl App {
             ),
             nav("Settings".to_string(), Tab::Settings),
             text("LIBRARY").size(11),
-            lib_row("Mods", all.len(), BrowseView::All),
+            lib_row("Mods", self.shown_count("mods", all.len()), BrowseView::All),
             // Favourites lives in LIBRARY, directly under
             // Mods (John, 2026-10-21 — his later call the
             // same day reverses its brief stay in the
@@ -9234,12 +9486,20 @@ impl App {
             // rows' label+count dress, its count the same
             // favorites_count the FAVORITE MODS tile reads,
             // and it lights when that view is on screen.
-            lib_row("Favourites", self.mod_manager.favorites_count(), BrowseView::Favorites),
-            lib_row("Maps", count_cat("Maps"), BrowseView::Category("Maps".to_string())),
+            lib_row(
+                "Favourites",
+                self.shown_count("favs", self.mod_manager.favorites_count()),
+                BrowseView::Favorites,
+            ),
+            lib_row(
+                "Maps",
+                self.shown_count("maps", count_cat("Maps")),
+                BrowseView::Category("Maps".to_string()),
+            ),
             lib_row(
                 "Scripts",
-                count_cat("Scripts"),
-                BrowseView::Category("Scripts".to_string())
+                self.shown_count("scripts", count_cat("Scripts")),
+                BrowseView::Category("Scripts".to_string()),
             ),
             // Disk usage rides with the library block, right
             // under the Scripts row (John, 2026-10-18) — the
@@ -9247,7 +9507,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.6.8  © 2026 Farmer Jay.")
+            text("V1.6.9  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -9893,6 +10153,12 @@ impl App {
         // Remove hold is live (feel pass, 2026-10-23).
         if self.remove_hold.is_some() {
             subs.push(iced::time::every(REMOVE_HOLD_TICK).map(|_| Message::RemoveHoldTick));
+        }
+        // The feel pass's shared clock (2026-10-23):
+        // subscribed only while an animation is live or
+        // settling — the app carries no idle timer.
+        if std::time::Instant::now() < self.anim_until || !self.switch_anims.is_empty() {
+            subs.push(iced::time::every(ANIM_TICK).map(|_| Message::AnimTick));
         }
         // Key capture (Keybindings page): a keyboard
         // listener exists only while a capture is armed,

@@ -20,7 +20,7 @@
 //! Both clear the 4.5:1 bar for ordinary text.
 
 use iced::widget::{button, container, progress_bar};
-use iced::{Background, Border, Color, Shadow, Theme};
+use iced::{Background, Border, Color, Shadow, Theme, Vector};
 
 /// #181A1B — near-black: the deep base (sidebar ground,
 /// the splash theme's text-side anchor).
@@ -77,6 +77,25 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
+/// The pill's lift (feel pass, 2026-10-23): at rest a
+/// pill floats a hair off the ground — a soft shadow in
+/// the palette's own base at half strength. Pressed, the
+/// shadow is GONE: the pill sits flat on the ground.
+/// That vanishing, with the fill settling toward BASE in
+/// each style's Pressed arm, is the press "dip" — the
+/// click lands visually before the action fires.
+fn pill_shadow(pressed: bool) -> Shadow {
+    if pressed {
+        Shadow::default()
+    } else {
+        Shadow {
+            color: Color { a: 0.45, ..BASE },
+            offset: Vector::new(0.0, 1.0),
+            blur_radius: 3.0,
+        }
+    }
+}
+
 /// A fully rounded border: the radius sits far past half
 /// of any of these buttons' heights, so the ends close
 /// into semicircles whatever height the button ends up —
@@ -98,16 +117,17 @@ pub fn nav_pill(selected: bool) -> impl Fn(&Theme, button::Status) -> button::St
     move |_theme, status| {
         let (fill, label) = match (selected, status) {
             (true, button::Status::Hovered) => (mix(ACCENT, TEXT_DIM, 0.18), TEXT),
+            (true, button::Status::Pressed) => (mix(ACCENT, BASE, 0.22), TEXT),
             (true, _) => (ACCENT, TEXT),
             (false, button::Status::Hovered) => (mix(PANEL, ACCENT, 0.5), TEXT),
-            (false, button::Status::Pressed) => (ACCENT, TEXT),
+            (false, button::Status::Pressed) => (mix(ACCENT, BASE, 0.22), TEXT),
             (false, _) => (PANEL, TEXT_DIM),
         };
         button::Style {
             background: Some(Background::Color(fill)),
             text_color: label,
             border: pill_border(),
-            shadow: Shadow::default(),
+            shadow: pill_shadow(matches!(status, button::Status::Pressed)),
         }
     }
 }
@@ -129,7 +149,7 @@ pub fn close_button() -> impl Fn(&Theme, button::Status) -> button::Style {
             background: Some(Background::Color(fill)),
             text_color: TEXT,
             border: pill_border(),
-            shadow: Shadow::default(),
+            shadow: pill_shadow(matches!(status, button::Status::Pressed)),
         }
     }
 }
@@ -143,9 +163,11 @@ pub fn close_button() -> impl Fn(&Theme, button::Status) -> button::Style {
 pub fn dropdown_field() -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let fill = match status {
-            button::Status::Hovered | button::Status::Pressed => {
-                mix(ACCENT, TEXT_DIM, 0.18)
-            }
+            button::Status::Hovered => mix(ACCENT, TEXT_DIM, 0.18),
+            // Pressed DIPS (feel pass, 2026-10-23): the
+            // fill settles toward the base instead of
+            // lightening with the hover.
+            button::Status::Pressed => mix(ACCENT, BASE, 0.15),
             _ => ACCENT,
         };
         button::Style {
@@ -156,7 +178,7 @@ pub fn dropdown_field() -> impl Fn(&Theme, button::Status) -> button::Style {
                 width: 1.0,
                 radius: 8.0.into(),
             },
-            shadow: Shadow::default(),
+            shadow: pill_shadow(matches!(status, button::Status::Pressed)),
         }
     }
 }
@@ -191,7 +213,7 @@ pub fn danger_pill() -> impl Fn(&Theme, button::Status) -> button::Style {
             background: Some(Background::Color(fill)),
             text_color: TEXT,
             border: pill_border(),
-            shadow: Shadow::default(),
+            shadow: pill_shadow(matches!(status, button::Status::Pressed)),
         }
     }
 }
