@@ -3265,6 +3265,32 @@ impl App {
                 self.status = "Diagnostics copied to the clipboard.".to_string();
                 return iced::clipboard::write(self.diagnostics_summary());
             }
+            Message::CopyLaunchFlags => {
+                // Copy the flags alone — the form Steam's
+                // Launch Options field takes. The slot reads
+                // from its field, exactly as the preview does.
+                let slot = self
+                    .settings_launch_slot_input
+                    .trim()
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|n| (1..=20).contains(n));
+                let flags = crate::config::launch_flags(
+                    &crate::config::LaunchConfig {
+                        slot,
+                        ..self.settings_launch.clone()
+                    },
+                );
+                if flags.is_empty() {
+                    self.status =
+                        "No launch options are set — nothing to copy.".to_string();
+                } else {
+                    self.status = "Launch flags copied — paste them into \
+                                   Steam's Launch Options for FS25."
+                        .to_string();
+                    return iced::clipboard::write(flags);
+                }
+            }
             Message::ExportDiagnostics => {
                 return Task::perform(
                     async move {
@@ -6290,8 +6316,15 @@ impl App {
                 ))
                 .into(),
                 text("Launch command preview:").size(13).into(),
-                text(preview).size(13).color(theme::TEXT_DIM).into(),
-                text("A readout only — Playground never runs this command. The Developer Console acts through game.xml when the page saves.")
+                row![
+                    text(preview).size(13).color(theme::TEXT_DIM),
+                    button(text("Copy flags for Steam"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::CopyLaunchFlags),
+                ]
+                .spacing(12)
+                .into(),
+                text("Playground never runs this command. The flags are yours to paste into Steam's Launch Options for FS25 (right-click the game, Properties, General, Launch Options). The Developer Console acts through game.xml when the page saves.")
                     .size(12)
                     .color(theme::TEXT_DIM)
                     .into(),
@@ -7055,7 +7088,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.5.8  © 2026 Farmer Jay.")
+            text("V1.6.0  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
