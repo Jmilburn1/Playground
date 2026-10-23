@@ -18,7 +18,6 @@ pub mod cli;
 pub mod config;
 pub mod mod_manager;
 pub mod paths;
-pub mod scanner;
 pub mod sources;
 pub mod ui;
 pub mod update_db;

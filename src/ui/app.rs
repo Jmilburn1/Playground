@@ -29,7 +29,7 @@ use crate::ui::components::{
 use futures::SinkExt as _;
 use iced::widget::image::Handle as ImageHandle;
 use iced::widget::{
-    button, checkbox, column, container, pick_list, progress_bar, row,
+    button, checkbox, column, container, mouse_area, pick_list, progress_bar, row,
     scrollable, stack, text, text_input, Scrollable, Space,
 };
 use iced::{Element, Length, Size, Subscription, Task, Theme};
@@ -83,6 +83,11 @@ const RESTORE_VERIFY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(600);
 /// The boot handover's clock interval while it is live.
 const RESTORE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+/// Hold-to-delete (feel pass, 2026-10-23): how long a
+/// routine Remove control must be held before the delete
+/// fires, and the hold clock's tick while one is live.
+const REMOVE_HOLD_TIME: std::time::Duration = std::time::Duration::from_millis(700);
+const REMOVE_HOLD_TICK: std::time::Duration = std::time::Duration::from_millis(25);
 const SIDEBAR_W: f32 = 232.0;
 const GRID_SPACING: f32 = 12.0;
 const DETAILS_W: f32 = 344.0;
@@ -605,7 +610,13 @@ pub struct App {
     search_query: String,
     favorites_only: bool,
     selected_mod: Option<String>,
-    pending_remove: Option<String>,
+    /// The live hold-to-delete, if any: the mod id and
+    /// when the press began. Progress is derived from the
+    /// instant at render; the delete fires from the tick
+    /// once REMOVE_HOLD_TIME elapses (feel pass,
+    /// 2026-10-23 — replaces the arm-to-confirm
+    /// pending_remove for routine single-mod deletes).
+    remove_hold: Option<(String, std::time::Instant)>,
     conflicts: Vec<Conflict>,
     icons: HashMap<String, ImageHandle>,
     active_dir_input: String,
@@ -928,7 +939,7 @@ impl App {
             search_query: String::new(),
             favorites_only: false,
             selected_mod: None,
-            pending_remove: None,
+            remove_hold: None,
             conflicts: Vec::new(),
             icons: HashMap::new(),
             active_dir_input,
@@ -2195,10 +2206,54 @@ impl App {
         self.status = "Configure Save applied — see the results.".to_string();
     }
 
+    /// The delete itself, fired by the hold clock once a
+    /// Remove hold completes (feel pass, 2026-10-23).
+    fn execute_remove(&mut self, id: &str) {
+        let name = self.mod_manager.get_mod(id).map(|m| m.name.clone());
+        match self.mod_manager.remove_mod(id) {
+            Ok(()) => {
+                if self.selected_mod.as_deref() == Some(id) {
+                    self.selected_mod = None;
+                }
+                self.icons.remove(id);
+                self.recompute_conflicts();
+                self.status = format!(
+                    "Deleted {}.",
+                    name.unwrap_or_else(|| "mod".to_string())
+                );
+            }
+            Err(e) => self.status = format!("Delete failed: {}", e),
+        }
+    }
+
+    /// Whether this mod's Remove control is being held,
+    /// and its hold progress 0.0..=1.0 (feel pass,
+    /// 2026-10-23).
+    fn remove_holding(&self, id: &str) -> bool {
+        matches!(&self.remove_hold, Some((held, _)) if held == id)
+    }
+
+    fn remove_hold_progress(&self, id: &str) -> f32 {
+        match &self.remove_hold {
+            Some((held, started)) if held == id => (started.elapsed().as_secs_f32()
+                / REMOVE_HOLD_TIME.as_secs_f32())
+            .clamp(0.0, 1.0),
+            _ => 0.0,
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        // Any action other than a confirming second click disarms removal.
-        if !matches!(message, Message::RemoveMod(_)) {
-            self.pending_remove = None;
+        // Hold-to-delete: any action outside the hold's
+        // own messages cancels a live hold unexecuted —
+        // the same disarm discipline the old two-click
+        // confirm lived under.
+        if !matches!(
+            message,
+            Message::RemoveHoldStarted(_)
+                | Message::RemoveHoldReleased
+                | Message::RemoveHoldTick
+        ) {
+            self.remove_hold = None;
         }
 
         match message {
@@ -3821,35 +3876,39 @@ impl App {
                     Err(e) => self.status = format!("Move failed: {}", e),
                 }
             }
-            Message::RemoveMod(id) => {
-                if self.pending_remove.as_deref() == Some(id.as_str()) {
-                    let name = self.mod_manager.get_mod(&id).map(|m| m.name.clone());
-                    match self.mod_manager.remove_mod(&id) {
-                        Ok(()) => {
-                            if self.selected_mod.as_deref() == Some(id.as_str()) {
-                                self.selected_mod = None;
-                            }
-                            self.pending_remove = None;
-                            self.icons.remove(&id);
-                            self.recompute_conflicts();
-                            self.status = format!(
-                                "Deleted {}.",
-                                name.unwrap_or_else(|| "mod".to_string())
-                            );
-                        }
-                        Err(e) => self.status = format!("Delete failed: {}", e),
-                    }
-                } else {
+            Message::RemoveHoldStarted(id) => {
+                let name = self
+                    .mod_manager
+                    .get_mod(&id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| "this mod".to_string());
+                self.remove_hold = Some((id, std::time::Instant::now()));
+                self.status = format!(
+                    "Keep holding to permanently delete {} — release to cancel.",
+                    name
+                );
+            }
+            Message::RemoveHoldReleased => {
+                if let Some((id, _)) = self.remove_hold.take() {
                     let name = self
                         .mod_manager
                         .get_mod(&id)
                         .map(|m| m.name.clone())
                         .unwrap_or_else(|| "this mod".to_string());
-                    self.pending_remove = Some(id);
                     self.status = format!(
-                        "Click Confirm delete to permanently delete {}.",
+                        "Delete cancelled — press and hold Remove to delete {}.",
                         name
                     );
+                }
+            }
+            Message::RemoveHoldTick => {
+                let due = matches!(
+                    &self.remove_hold,
+                    Some((_, started)) if started.elapsed() >= REMOVE_HOLD_TIME
+                );
+                if due {
+                    let (id, _) = self.remove_hold.take().unwrap();
+                    self.execute_remove(&id);
                 }
             }
             Message::SaveDirectories => return self.apply_directories(),
@@ -5016,8 +5075,9 @@ impl App {
         // between them. Now they sit in one cluster of pills
         // in the menu's language — the highlighted pill's
         // accent for favourite and move, the Rescan pill's
-        // danger red for remove. Same messages, same labels,
-        // same arm-to-confirm flow as before.
+        // danger red for remove. Same cluster as before —
+        // except remove itself, which is hold-to-delete
+        // now (feel pass, 2026-10-23).
         let move_label = if m.state == ModState::Active {
             "Move to Archive"
         } else {
@@ -5028,11 +5088,41 @@ impl App {
         } else {
             Message::MoveToActive(m.id.clone())
         };
-        let remove_label = if self.pending_remove.as_deref() == Some(m.id.as_str()) {
-            "Confirm delete (permanent)"
+        // Hold-to-delete (feel pass, 2026-10-23): the
+        // Remove control is held, not clicked twice. One
+        // mouse_area throughout the hold — only its
+        // contents change — so the release that cancels
+        // always lands on the widget that saw the press.
+        // The bar under the label is the hold clock made
+        // visible; releasing early cancels.
+        let remove_label = if self.remove_holding(&m.id) {
+            "Keep holding…"
         } else {
             "Remove mod"
         };
+        let remove_control = mouse_area(
+            container(
+                column![
+                    centered_label(text(remove_label).size(14)),
+                    progress_bar(0.0..=1.0, self.remove_hold_progress(&m.id))
+                        .height(4)
+                        .style(theme::hold_bar),
+                ]
+                .spacing(5),
+            )
+            .width(Length::Fill)
+            .padding(iced::Padding {
+                top: 8.0,
+                right: 12.0,
+                bottom: 8.0,
+                left: 12.0,
+            })
+            .style(theme::danger_box),
+        )
+        .on_press(Message::RemoveHoldStarted(m.id.clone()))
+        .on_release(Message::RemoveHoldReleased)
+        .on_exit(Message::RemoveHoldReleased)
+        .interaction(iced::mouse::Interaction::Pointer);
         col = col.push(
             column![
                 button(centered_label(text(fav_label).size(14)))
@@ -5043,10 +5133,7 @@ impl App {
                     .width(Length::Fill)
                     .style(theme::nav_pill(true))
                     .on_press(move_message),
-                button(centered_label(text(remove_label).size(14)))
-                    .width(Length::Fill)
-                    .style(theme::danger_pill())
-                    .on_press(Message::RemoveMod(m.id.clone())),
+                remove_control,
             ]
             .spacing(6),
         );
@@ -5132,7 +5219,7 @@ impl App {
         // with an Active/Archived pill (same colors as the browse
         // cards), and each copy has its own remove button so John
         // chooses which copy survives. Removal reuses the details
-        // view's arm-to-confirm RemoveMod flow and recomputes
+        // view's hold-to-delete flow and recomputes
         // conflicts afterwards. Other conflict types get a simple
         // card each.
         let card_style = |_: &Theme| container::Style {
@@ -5257,16 +5344,31 @@ impl App {
                     .file_name()
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let armed = self.pending_remove.as_deref() == Some(m.id.as_str());
-                // Remove control (John): a red circle with a minus,
-                // sitting where Browse cards carry the favorite
-                // star. First click arms it into a Confirm delete
-                // pill; the second click deletes.
-                let btn: Element<'_, Message> = if armed {
-                    button(text("Confirm delete").size(12))
-                        .style(button::danger)
-                        .on_press(Message::RemoveMod(m.id.clone()))
-                        .into()
+                // Remove control (John): a red circle with
+                // a minus, sitting where Browse cards carry
+                // the favorite star. Hold-to-delete (feel
+                // pass, 2026-10-23): press and hold it —
+                // while held, the control becomes the
+                // filling pill; the delete fires only when
+                // the hold completes, and releasing early
+                // cancels. One mouse_area throughout (its
+                // contents swap under it), so the release
+                // always lands on the widget that saw the
+                // press.
+                let btn_content: Element<'_, Message> = if self.remove_holding(&m.id) {
+                    container(
+                        column![
+                            text("Keep holding…").size(11),
+                            progress_bar(0.0..=1.0, self.remove_hold_progress(&m.id))
+                                .height(3)
+                                .style(theme::hold_bar),
+                        ]
+                        .spacing(3),
+                    )
+                    .width(110)
+                    .padding(6)
+                    .style(theme::danger_box)
+                    .into()
                 } else {
                     let bar = container(text("")).width(12).height(3).style(|_| {
                         container::Style {
@@ -5295,12 +5397,14 @@ impl App {
                             },
                             ..container::Style::default()
                         });
-                    button(circle)
-                        .padding(0)
-                        .style(button::text)
-                        .on_press(Message::RemoveMod(m.id.clone()))
-                        .into()
+                    circle.into()
                 };
+                let btn: Element<'_, Message> = mouse_area(btn_content)
+                    .on_press(Message::RemoveHoldStarted(m.id.clone()))
+                    .on_release(Message::RemoveHoldReleased)
+                    .on_exit(Message::RemoveHoldReleased)
+                    .interaction(iced::mouse::Interaction::Pointer)
+                    .into();
                 card_col = card_col.push(
                     row![
                         pill(loc, bg),
@@ -8889,7 +8993,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.6.6  © 2026 Farmer Jay.")
+            text("V1.6.7  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -9530,6 +9634,11 @@ impl App {
         let mut subs = vec![events];
         if self.window_restore.ticking() {
             subs.push(iced::time::every(RESTORE_TICK).map(|_| Message::RestoreTick));
+        }
+        // Hold-to-delete's clock: runs only while a
+        // Remove hold is live (feel pass, 2026-10-23).
+        if self.remove_hold.is_some() {
+            subs.push(iced::time::every(REMOVE_HOLD_TICK).map(|_| Message::RemoveHoldTick));
         }
         // Key capture (Keybindings page): a keyboard
         // listener exists only while a capture is armed,

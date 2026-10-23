@@ -595,7 +595,14 @@ pub enum Message {
     ToggleFavoritesOnly,
     MoveToArchive(String),
     MoveToActive(String),
-    RemoveMod(String),
+    /// Hold-to-delete (feel pass, 2026-10-23): a routine
+    /// single-mod delete no longer arms on one click and
+    /// fires on the next — the Remove control must be
+    /// HELD. Started on press, Released on release/exit
+    /// (a cancel), Tick drives the hold clock.
+    RemoveHoldStarted(String),
+    RemoveHoldReleased,
+    RemoveHoldTick,
     SaveDirectories,
     /// Settings page, Library section: the conflict-
     /// checking switch and the two numeric fields, staged

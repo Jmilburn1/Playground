@@ -196,6 +196,20 @@ pub fn danger_pill() -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
+/// The hold-to-delete control's box (feel pass,
+/// 2026-10-23): danger_pill's dress as a container —
+/// the control is a mouse_area, not a button, so it
+/// needs the pill as a box style. No status lightening:
+/// the progress bar inside carries the feedback.
+pub fn danger_box(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(DANGER)),
+        text_color: Some(TEXT),
+        border: pill_border(),
+        shadow: Shadow::default(),
+    }
+}
+
 /// The sidebar's ground: the near-black base, edged with
 /// petrol where the old style drew a grey border.
 pub fn sidebar_container(_theme: &Theme) -> container::Style {
@@ -221,6 +235,22 @@ pub fn download_bar(_theme: &Theme) -> progress_bar::Style {
             color: Color::TRANSPARENT,
             width: 0.0,
             radius: 7.0.into(),
+        },
+    }
+}
+
+/// The hold-to-delete control's progress bar (feel pass,
+/// 2026-10-23): pale fill on a darkened danger track —
+/// it lives inside the DANGER pill, so it dresses in
+/// the pill's own colors, not the download bar's.
+pub fn hold_bar(_theme: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(mix(DANGER, BASE, 0.45)),
+        bar: Background::Color(TEXT),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 2.0.into(),
         },
     }
 }
