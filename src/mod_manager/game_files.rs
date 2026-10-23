@@ -1,6 +1,6 @@
 //! Surgical edits to the game's own settings files:
 //! gameSettings.xml in the profile folder (the mods directory
-//! override) and game.xml in the install folder (the developer
+//! override) and game.xml in the profile folder (the developer
 //! console switch). Each edit rewrites only the one value it
 //! owns and leaves the rest of the file untouched.
 

@@ -46,10 +46,20 @@ pub struct Settings {
     /// name ("savegame1") -> favorite_keys of the mods that save uses.
     #[serde(default)]
     pub save_loadouts: std::collections::HashMap<String, Vec<String>>,
-    /// The game's install folder (where game.xml lives), picked in
-    /// the Settings tab. Powers the console on/off toggle.
+    /// The game's profile folder (where game.xml lives — FS25
+    /// keeps game.xml in the profile), picked in the Settings
+    /// tab. Powers the console on/off toggle.
     #[serde(default)]
     pub game_directory: Option<PathBuf>,
+    /// The game's true install folder — the one holding the
+    /// `shared` folder Game Screens reads its screens from.
+    /// Distinct from `game_directory` above: that one is the
+    /// profile folder (game.xml), which is NOT where the game
+    /// is installed. Picked on the Game Screens page or in
+    /// Settings > Game Folders; validated to hold a `shared`
+    /// folder before it is ever stored.
+    #[serde(default)]
+    pub game_install_dir: Option<PathBuf>,
     /// Update-check links (GitHub): mod file stem (lowercase, no
     /// .zip) -> "owner/repo". Set per mod in the details panel;
     /// keyed by stem so the link survives moves and version bumps.
@@ -178,25 +188,38 @@ pub struct LaunchConfig {
 /// nothing (the page refuses to save one; this keeps a
 /// hand-edited config honest too).
 pub fn launch_command_preview(launch: &LaunchConfig) -> String {
-    let mut cmd = String::from("FarmingSimulator2025.exe");
+    let flags = launch_flags(launch);
+    if flags.is_empty() {
+        String::from("FarmingSimulator2025.exe")
+    } else {
+        format!("FarmingSimulator2025.exe {}", flags)
+    }
+}
+
+/// The launch flags alone, space-joined, in the same ruled
+/// order as the preview — the form Steam's Launch Options
+/// field takes (Steam supplies the exe itself, so the flags
+/// are what a user pastes there). Empty when nothing is set.
+pub fn launch_flags(launch: &LaunchConfig) -> String {
+    let mut flags: Vec<String> = Vec::new();
     if launch.cheats {
-        cmd.push_str(" -cheats");
+        flags.push("-cheats".to_string());
     }
     if launch.skip_mod_update_dialog {
-        cmd.push_str(" -skipModUpdateDialog");
+        flags.push("-skipModUpdateDialog".to_string());
     }
     if launch.skip_start_videos {
-        cmd.push_str(" -skipStartVideos");
+        flags.push("-skipStartVideos".to_string());
     }
     if launch.autostart {
-        cmd.push_str(" -autostart");
+        flags.push("-autostart".to_string());
     }
     if let Some(slot) = launch.slot {
         if (1..=20).contains(&slot) {
-            cmd.push_str(&format!(" -autoStartSavegameId {}", slot));
+            flags.push(format!("-autoStartSavegameId {}", slot));
         }
     }
-    cmd
+    flags.join(" ")
 }
 
 
@@ -264,6 +287,9 @@ impl Config {
             if let Some(d) = &mut config.settings.game_directory {
                 *d = expand_tilde(d);
             }
+            if let Some(d) = &mut config.settings.game_install_dir {
+                *d = expand_tilde(d);
+            }
             Ok(config)
         } else {
             let config = Self::default();
@@ -325,6 +351,7 @@ impl Config {
                 favorites: Vec::new(),
                 save_loadouts: std::collections::HashMap::new(),
                 game_directory: None,
+                game_install_dir: None,
                 mod_links: std::collections::HashMap::new(),
                 modhub_links: std::collections::HashMap::new(),
                 catalog_url: crate::sources::catalog::DEFAULT_CATALOG_URL.to_string(),
@@ -366,6 +393,9 @@ cache_ttl_hours = 24
         assert!(settings.check_conflicts);
         assert_eq!(settings.parallel_scans, 2);
         assert_eq!(settings.cache_ttl_hours, 24);
+        // The Game Screens install folder (v1.6.5) defaults
+        // to unset in files written before it existed.
+        assert_eq!(settings.game_install_dir, None);
     }
 
     #[test]
@@ -434,6 +464,31 @@ cache_ttl_hours = 24
         assert_eq!(launch_command_preview(&bad), "FarmingSimulator2025.exe");
         bad.slot = Some(21);
         assert_eq!(launch_command_preview(&bad), "FarmingSimulator2025.exe");
+    }
+
+    #[test]
+    fn launch_flags_are_the_preview_without_the_exe() {
+        // Nothing set: no flags — the Steam field stays empty.
+        assert_eq!(launch_flags(&LaunchConfig::default()), "");
+
+        // The fully loaded set, in the ruled order, slot last.
+        let full = LaunchConfig {
+            slot: Some(3),
+            skip_mod_update_dialog: true,
+            cheats: true,
+            autostart: true,
+            skip_start_videos: true,
+        };
+        assert_eq!(
+            launch_flags(&full),
+            "-cheats -skipModUpdateDialog -skipStartVideos \
+             -autostart -autoStartSavegameId 3"
+        );
+
+        // An out-of-range slot contributes nothing.
+        let mut bad = LaunchConfig::default();
+        bad.slot = Some(21);
+        assert_eq!(launch_flags(&bad), "");
     }
 
     #[test]

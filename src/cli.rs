@@ -1415,6 +1415,7 @@ mod tests {
                 favorites: vec![],
                 save_loadouts: std::collections::HashMap::new(),
                 game_directory: None,
+                game_install_dir: None,
                 mod_links: std::collections::HashMap::new(),
                 modhub_links: std::collections::HashMap::new(),
                 catalog_url: String::new(),

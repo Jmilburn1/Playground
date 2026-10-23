@@ -1,3 +1,4 @@
+use super::keybindings::{ActionOwner, KbOwnerState};
 use super::types::{Mod, ModState, ModType};
 use crate::config::{Config, ModSources};
 use crate::sources::catalog_miss::{CatalogMiss, Decision};
@@ -123,13 +124,14 @@ pub struct ModManager {
     /// burned twice (owner, 2026-10-20).
     miss: CatalogMiss,
     /// The Keybindings page's action -> owner join:
-    /// action name -> (owning mod's title, the category
-    /// its modDesc declared for the action, if any). Built
-    /// from the loaded mods' declared actions wherever the
-    /// mod map is installed — never per render, and with
-    /// no file IO of its own (the scan already parsed
-    /// every modDesc).
-    action_owners: HashMap<String, (String, Option<String>)>,
+    /// action name -> the owning mod's title, the category
+    /// its modDesc declared for the action (if any), and
+    /// the mod's state (the page's active-only default and
+    /// purge read the state). Built from the loaded mods'
+    /// declared actions wherever the mod map is installed
+    /// — never per render, and with no file IO of its own
+    /// (the scan already parsed every modDesc).
+    action_owners: HashMap<String, ActionOwner>,
 }
 
 impl ModManager {
@@ -179,25 +181,41 @@ impl ModManager {
     fn rebuild_action_owners(&mut self) {
         let mut mods: Vec<&Mod> = self.mods.values().collect();
         mods.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut map: HashMap<String, (String, Option<String>)> = HashMap::new();
+        let mut map: HashMap<String, ActionOwner> = HashMap::new();
         for m in mods {
+            let state = match m.state {
+                ModState::Active => KbOwnerState::Active,
+                ModState::Archived => KbOwnerState::Archived,
+                ModState::Conflict | ModState::Error => KbOwnerState::Other,
+            };
             for declared in &m.declared_actions {
-                map.entry(declared.name.clone())
-                    .or_insert_with(|| (m.name.clone(), declared.category.clone()));
+                map.entry(declared.name.clone()).or_insert_with(|| {
+                    ActionOwner {
+                        title: m.name.clone(),
+                        category: declared.category.clone(),
+                        state,
+                    }
+                });
             }
             for referenced in &m.action_binding_refs {
-                map.entry(referenced.clone())
-                    .or_insert_with(|| (m.name.clone(), None));
+                map.entry(referenced.clone()).or_insert_with(|| {
+                    ActionOwner {
+                        title: m.name.clone(),
+                        category: None,
+                        state,
+                    }
+                });
             }
         }
         self.action_owners = map;
     }
 
     /// Who owns this input action, per the loaded mods'
-    /// modDesc declarations: (mod title, declared
-    /// category). None = no loaded mod claims it — the
-    /// Keybindings page groups those under Base Game.
-    pub fn action_owner(&self, action: &str) -> Option<&(String, Option<String>)> {
+    /// modDesc declarations: the mod's title, the action's
+    /// declared category, and the mod's state. None = no
+    /// loaded mod claims it — the Keybindings page groups
+    /// those under Base Game.
+    pub fn action_owner(&self, action: &str) -> Option<&ActionOwner> {
         self.action_owners.get(action)
     }
 
@@ -951,16 +969,33 @@ impl ModManager {
         self.config.save()
     }
 
-    /// The remembered game install folder (Settings tab), where
+    /// The remembered profile folder (Settings tab), where
     /// game.xml lives. None until the user picks it.
     pub fn game_directory(&self) -> Option<PathBuf> {
         self.config.settings.game_directory.clone()
     }
 
-    /// Remember the game install folder; persists to the config.
+    /// Remember the profile folder; persists to the config.
     pub fn set_game_directory(&mut self, dir: PathBuf) -> Result<()> {
         let dir = crate::config::expand_tilde(&dir);
         self.config.settings.game_directory = Some(dir);
+        self.config.save()
+    }
+
+    /// The remembered true install folder (Game Screens):
+    /// the folder holding the game's `shared` folder. None
+    /// until the user picks it — it is never guessed from
+    /// the profile folder above.
+    pub fn game_install_dir(&self) -> Option<PathBuf> {
+        self.config.settings.game_install_dir.clone()
+    }
+
+    /// Remember the true install folder; persists to the
+    /// config. Callers validate first (see
+    /// gamescreens::validate_install_pick).
+    pub fn set_game_install_dir(&mut self, dir: PathBuf) -> Result<()> {
+        let dir = crate::config::expand_tilde(&dir);
+        self.config.settings.game_install_dir = Some(dir);
         self.config.save()
     }
 
@@ -1794,6 +1829,7 @@ mod tests {
                 favorites: vec![],
                 save_loadouts: HashMap::new(),
                 game_directory: None,
+                game_install_dir: None,
                 mod_links: std::collections::HashMap::new(),
                 modhub_links: std::collections::HashMap::new(),
                 catalog_url: String::new(),
@@ -1859,6 +1895,7 @@ mod tests {
                 favorites: vec![],
                 save_loadouts: HashMap::new(),
                 game_directory: None,
+                game_install_dir: None,
                 mod_links: std::collections::HashMap::new(),
                 modhub_links: std::collections::HashMap::new(),
                 catalog_url: String::new(),

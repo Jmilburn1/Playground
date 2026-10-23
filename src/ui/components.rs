@@ -1,4 +1,5 @@
 use crate::mod_manager::conflict::Conflict;
+use crate::mod_manager::gamescreens::GsPreset;
 use crate::mod_manager::icons::LoadedIcon;
 use crate::mod_manager::types::{Mod, ModState};
 use crate::ui::theme;
@@ -17,6 +18,7 @@ pub enum Tab {
     Log,
     Downloads,
     Keybindings,
+    GameScreens,
     Settings,
 }
 
@@ -369,8 +371,12 @@ pub enum FolderTarget {
     Active,
     /// The archive folder — picker convenience only.
     Archive,
-    /// The game's install folder, where game.xml lives.
+    /// The game's profile folder, where game.xml lives.
     Game,
+    /// The game's true install folder, where the `shared`
+    /// folder lives (Game Screens). The pick is validated
+    /// to hold a `shared` folder before it is saved.
+    GameInstall,
 }
 
 /// Which configured source list a Settings page toggle
@@ -811,6 +817,10 @@ pub enum Message {
     KeybindingsUnassignedOnlyToggled(bool),
     /// Keybindings: show conflicted actions only.
     KeybindingsConflictsOnlyToggled(bool),
+    /// Keybindings: include archived mods' actions in
+    /// the groups and findings (off = active mods only,
+    /// the default).
+    KeybindingsShowArchivedToggled(bool),
     /// Keybindings: expand (true) or collapse (false)
     /// every group at once.
     KeybindingsExpandAll(bool),
@@ -846,6 +856,33 @@ pub enum Message {
     /// Keybindings: reset to game defaults — arm on the
     /// first press, execute on the second.
     KeybindingsResetDefaults,
+    /// Keybindings: purge the bindings of archived mods —
+    /// the first press counts the candidates and arms, the
+    /// second stages the removals into the document.
+    KeybindingsPurgePressed,
+    /// Game Screens: a preset was chosen in the presets
+    /// row (the stock choice and custom upload are their
+    /// own messages).
+    GameScreensPresetSelected(GsPreset),
+    /// Game Screens: the FS25 Standard (stock) choice in
+    /// the presets row.
+    GameScreensStandardSelected,
+    /// Game Screens: open the file picker for a custom
+    /// image.
+    GameScreensPickCustom,
+    /// Game Screens: the custom-image picker answered.
+    GameScreensCustomPicked(Option<PathBuf>),
+    /// Game Screens: build the chosen screens and write
+    /// them (the current pair is captured first; the stock
+    /// choice restores the oldest capture instead).
+    GameScreensApply,
+    /// Game Screens: the background build/write finished.
+    /// Carries (applied preset, backup folder, splash
+    /// hash) on success.
+    GameScreensApplied(Result<(Option<GsPreset>, String, String), String>),
+    /// Game Screens: restore one listed backup over the
+    /// live files (the live files are captured first).
+    GameScreensRestoreBackup(PathBuf),
     /// KingMods manual path: open the mod's KingMods page
     /// in the browser.
     OpenKingModsPage(String),

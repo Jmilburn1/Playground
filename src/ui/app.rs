@@ -2,7 +2,8 @@ use crate::app_update::{self, AppRelease};
 use crate::config::ModSources;
 use crate::mod_manager::conflict::{Conflict, ConflictDetector, ConflictType};
 use crate::mod_manager::game_files;
-use crate::mod_manager::keybindings::{self, BindingsFile, FindingKind, KbAction};
+use crate::mod_manager::gamescreens::{self, ActiveIdentity, GsPreset, RgbImage};
+use crate::mod_manager::keybindings::{self, BindingsFile, KbAction};
 use crate::mod_manager::icons::{
     icon_cache_dir, icon_cache_key, load_icon_cached, sweep_icon_cache, LoadedIcon,
 };
@@ -35,6 +36,23 @@ use iced::{Element, Length, Size, Subscription, Task, Theme};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+/// The Game Screens presets' master art, bundled with
+/// the app (the two owner-approved Farmer Jay pairs,
+/// productized from the hand-built splashes of
+/// 2026-10-22).
+const DAYLIGHT_MASTER: &[u8] = include_bytes!("../../assets/farmerjay_daylight.png");
+const DARK_MASTER: &[u8] = include_bytes!("../../assets/farmerjay_dark.png");
+
+/// What the Game Screens page's Apply would write: the
+/// stock screens (a restore of the oldest capture), one
+/// of the bundled presets, or the user's own image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GsChoice {
+    Standard,
+    Preset(GsPreset),
+    Custom,
+}
 
 const CARD_H: f32 = 258.0;
 /// Splash window size, px (John, 2026-10-21): the logo at
@@ -592,13 +610,18 @@ pub struct App {
     icons: HashMap<String, ImageHandle>,
     active_dir_input: String,
     archive_dir_input: String,
-    /// Settings: the game install folder display + the console
+    /// Settings: the profile folder display + the console
     /// switch state. Read from game.xml when the folder is
     /// picked; since Round 2 the switch is a staged Settings
     /// value (Launch Configuration) that writes game.xml when
     /// the page saves. None = no switch state known.
     game_dir_input: String,
     console_on: Option<bool>,
+    /// Settings: the true game install folder display (the
+    /// one holding `shared`, for Game Screens). Its own
+    /// setting, picked and validated separately from the
+    /// profile folder above — the two are different places.
+    game_install_dir_input: String,
     /// Settings page staging (Round 1): the Library and
     /// Catalog & Sources values as edited on the page.
     /// Nothing here touches the config until Save folders
@@ -711,10 +734,53 @@ pub struct App {
     kb_search: String,
     kb_unassigned_only: bool,
     kb_conflicts_only: bool,
+    kb_show_archived: bool,
     kb_collapsed: HashSet<String>,
     kb_capture: Option<KbCapture>,
     kb_backups: Vec<(PathBuf, u64)>,
     kb_reset_armed: bool,
+    /// The purge's armed report: (action blocks,
+    /// distinct archived mods) counted on the first
+    /// press; the second press stages the removals and
+    /// clears this. Any reload, discard or save clears
+    /// it too — the count must never outlive the document
+    /// it was counted on.
+    kb_purge: Option<(usize, usize)>,
+    /// Game Screens page state. The page is a working
+    /// surface, not staged state: reads are live (the
+    /// current splash, its hash identity, the backups),
+    /// and writes happen only on an explicit Apply or
+    /// Restore, each preceded by a capture of the current
+    /// files (see mod_manager::gamescreens). The pending
+    /// previews are the exact composition an Apply would
+    /// write, at preview size.
+    gs_shared: Option<PathBuf>,
+    gs_root: Option<PathBuf>,
+    gs_error: Option<String>,
+    /// The install folder the page resolved to (when it
+    /// did) — shown on the page so the location in use is
+    /// never a guess.
+    gs_install: Option<PathBuf>,
+    /// The resolution failed for want of a usable install
+    /// folder: the error state carries the Locate picker.
+    gs_needs_locate: bool,
+    /// Why the last install-folder pick was refused (what
+    /// was picked, what was missing), shown under the
+    /// error until a pick succeeds or the page reloads.
+    gs_pick_note: Option<String>,
+    gs_live_canvas: Option<ImageHandle>,
+    gs_live_band: Option<ImageHandle>,
+    gs_identity: Option<ActiveIdentity>,
+    gs_highlands: bool,
+    gs_choice: GsChoice,
+    gs_pending_canvas: Option<ImageHandle>,
+    gs_pending_band: Option<ImageHandle>,
+    gs_pending_note: String,
+    gs_custom_name: Option<String>,
+    gs_custom_art: Option<RgbImage>,
+    gs_backups: Vec<gamescreens::BackupInfo>,
+    gs_restore_armed: bool,
+    gs_busy: bool,
     /// Update checks (GitHub): per-mod check state by mod id, and
     /// the details panel's repo link field.
     update_status: HashMap<String, UpdateState>,
@@ -812,6 +878,10 @@ impl App {
             .game_directory()
             .map(|d| d.display().to_string())
             .unwrap_or_default();
+        let game_install_dir_input = mod_manager
+            .game_install_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
         let console_on = mod_manager
             .game_directory()
             .and_then(|d| game_files::console_enabled(&d));
@@ -864,6 +934,7 @@ impl App {
             active_dir_input,
             archive_dir_input,
             game_dir_input,
+            game_install_dir_input,
             console_on,
             settings_check_conflicts,
             settings_parallel_input,
@@ -928,10 +999,31 @@ impl App {
             kb_search: String::new(),
             kb_unassigned_only: false,
             kb_conflicts_only: false,
+            kb_show_archived: false,
             kb_collapsed: HashSet::new(),
             kb_capture: None,
             kb_backups: Vec::new(),
             kb_reset_armed: false,
+            kb_purge: None,
+            gs_shared: None,
+            gs_root: None,
+            gs_error: None,
+            gs_install: None,
+            gs_needs_locate: false,
+            gs_pick_note: None,
+            gs_live_canvas: None,
+            gs_live_band: None,
+            gs_identity: None,
+            gs_highlands: false,
+            gs_choice: GsChoice::Preset(GsPreset::Daylight),
+            gs_pending_canvas: None,
+            gs_pending_band: None,
+            gs_pending_note: String::new(),
+            gs_custom_name: None,
+            gs_custom_art: None,
+            gs_backups: Vec::new(),
+            gs_restore_armed: false,
+            gs_busy: false,
             update_status: HashMap::new(),
             db_rows: HashMap::new(),
             db_generated_at: None,
@@ -2787,6 +2879,12 @@ impl App {
             Message::KeybindingsConflictsOnlyToggled(on) => {
                 self.kb_conflicts_only = on;
             }
+            Message::KeybindingsShowArchivedToggled(on) => {
+                self.kb_show_archived = on;
+                // A capture armed on an action the flip
+                // is about to hide must not land later.
+                self.kb_capture = None;
+            }
             Message::KeybindingsExpandAll(expand) => {
                 if expand {
                     self.kb_collapsed.clear();
@@ -2881,11 +2979,19 @@ impl App {
                         actions.iter().map(|a| a.name.clone()).collect()
                     })
                     .unwrap_or_default();
+                let owners: HashMap<String, String> = names
+                    .iter()
+                    .filter_map(|a| {
+                        self.mod_manager
+                            .action_owner(a)
+                            .map(|o| (a.clone(), o.title.clone()))
+                    })
+                    .collect();
                 if let Some(doc) = &mut self.kb_doc {
-                    let cleared = doc.auto_resolve(&device, &names);
+                    let cleared = doc.auto_resolve(&device, &names, &owners);
                     self.status = if cleared == 0 {
                         format!(
-                            "Auto-Resolve: no conflicts to clear in {}.",
+                            "Auto-Resolve: no hard conflicts to clear in {}.",
                             group
                         )
                     } else {
@@ -2896,6 +3002,53 @@ impl App {
                             group
                         )
                     };
+                }
+            }
+            Message::KeybindingsPurgePressed => {
+                self.kb_reset_armed = false;
+                let Some(actions) =
+                    self.kb_doc.as_ref().map(|d| d.actions())
+                else {
+                    return Task::none();
+                };
+                let owners: HashMap<String, keybindings::ActionOwner> =
+                    actions
+                        .iter()
+                        .filter_map(|a| {
+                            self.mod_manager
+                                .action_owner(&a.name)
+                                .map(|o| (a.name.clone(), o.clone()))
+                        })
+                        .collect();
+                if self.kb_purge.take().is_some() {
+                    // Second press: stage the removals into
+                    // the document. Nothing is written to
+                    // disk — the Save bindings flow (with
+                    // its backup first) is still the only
+                    // way anything lands, and Discard
+                    // abandons the purge like any edit.
+                    self.kb_capture = None;
+                    if let Some(doc) = &mut self.kb_doc {
+                        let staged = doc.stage_purge(&owners);
+                        self.status = format!(
+                            "Purge staged: removed {} action{} from {} archived mod{} — not saved yet.",
+                            staged.actions,
+                            if staged.actions == 1 { "" } else { "s" },
+                            staged.mods,
+                            if staged.mods == 1 { "" } else { "s" },
+                        );
+                    }
+                } else {
+                    let summary =
+                        keybindings::purge_summary(&actions, &owners);
+                    if summary.actions == 0 {
+                        self.status =
+                            "Purge: no bindings belong to archived mods."
+                                .to_string();
+                    } else {
+                        self.kb_purge =
+                            Some((summary.actions, summary.mods));
+                    }
                 }
             }
             Message::KeybindingsSave => {
@@ -2920,6 +3073,7 @@ impl App {
                         match std::fs::write(&path, doc.text()) {
                             Ok(()) => {
                                 self.kb_original = Some(doc.text().to_string());
+                                self.kb_purge = None;
                                 self.kb_backups =
                                     keybindings::list_backups(&profile);
                                 self.status = "Bindings saved — the previous file is in the backups folder.".to_string();
@@ -2938,6 +3092,7 @@ impl App {
             Message::KeybindingsDiscard => {
                 self.kb_capture = None;
                 self.kb_reset_armed = false;
+                self.kb_purge = None;
                 if let Some(original) = self.kb_original.clone() {
                     self.kb_doc = Some(BindingsFile::parse(original));
                     self.status = "Staged binding changes discarded.".to_string();
@@ -2981,6 +3136,7 @@ impl App {
                         self.kb_doc = None;
                         self.kb_original = None;
                         self.kb_capture = None;
+                        self.kb_purge = None;
                         self.kb_backups = keybindings::list_backups(&profile);
                         self.status = format!(
                             "inputBinding.xml moved to {} — the game regenerates its factory defaults on its next launch.",
@@ -2992,6 +3148,189 @@ impl App {
                             format!("Could not reset the bindings: {}", e);
                     }
                 }
+            }
+            Message::GameScreensPresetSelected(preset) => {
+                self.gs_choice = GsChoice::Preset(preset);
+                self.gs_restore_armed = false;
+                self.gs_refresh_pending();
+            }
+            Message::GameScreensStandardSelected => {
+                self.gs_choice = GsChoice::Standard;
+                self.gs_restore_armed = false;
+                self.gs_refresh_pending();
+            }
+            Message::GameScreensPickCustom => {
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Choose an image for the menu screen")
+                            .add_filter(
+                                "Images",
+                                &["png", "jpg", "jpeg", "webp", "bmp", "dds"],
+                            )
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::GameScreensCustomPicked,
+                );
+            }
+            Message::GameScreensCustomPicked(picked) => {
+                if let Some(path) = picked {
+                    match std::fs::read(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| {
+                            gamescreens::decode_source(&bytes)
+                                .map_err(|e| format!("{:#}", e))
+                        }) {
+                        Ok(art) => {
+                            self.gs_custom_name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string());
+                            self.gs_custom_art = Some(art);
+                            self.gs_choice = GsChoice::Custom;
+                            self.gs_restore_armed = false;
+                            self.gs_refresh_pending();
+                        }
+                        Err(e) => {
+                            self.status = format!("Game Screens: {}", e);
+                        }
+                    }
+                }
+            }
+            Message::GameScreensApply => {
+                if self.gs_busy || self.gs_error.is_some() {
+                    return Task::none();
+                }
+                let (Some(shared), Some(root)) =
+                    (self.gs_shared.clone(), self.gs_root.clone())
+                else {
+                    return Task::none();
+                };
+                if self.gs_choice == GsChoice::Standard {
+                    // The stock choice is a restore: capture
+                    // the current pair, then put the oldest
+                    // capture back. Two-step, like every
+                    // destructive press on this page's
+                    // neighbours.
+                    if !self.gs_restore_armed {
+                        self.gs_restore_armed = true;
+                        self.status = "Restoring the stock screens replaces the current pair (it is captured first) — click Apply again to confirm.".to_string();
+                        return Task::none();
+                    }
+                    self.gs_restore_armed = false;
+                    let Some(oldest) = gamescreens::oldest_backup(&root) else {
+                        self.status = "No stock capture exists yet — the first Apply of a preset or a custom image captures the current screens as the stock originals.".to_string();
+                        return Task::none();
+                    };
+                    match gamescreens::capture_backup(&shared, &root)
+                        .and_then(|_| gamescreens::restore_backup(&shared, &oldest))
+                    {
+                        Ok(()) => {
+                            self.status =
+                                "Stock screens restored from the oldest capture."
+                                    .to_string();
+                        }
+                        Err(e) => {
+                            self.status =
+                                format!("Could not restore the stock screens: {:#}", e);
+                        }
+                    }
+                    self.gs_reload();
+                    return Task::none();
+                }
+                let (preset, art) = match self.gs_choice {
+                    GsChoice::Preset(p) => {
+                        let bytes = match p {
+                            GsPreset::Daylight => DAYLIGHT_MASTER,
+                            GsPreset::Dark => DARK_MASTER,
+                        };
+                        match gamescreens::decode_source(bytes) {
+                            Ok(art) => (Some(p), art),
+                            Err(e) => {
+                                self.status = format!(
+                                    "The bundled preset art could not be read: {:#}",
+                                    e
+                                );
+                                return Task::none();
+                            }
+                        }
+                    }
+                    GsChoice::Custom => match &self.gs_custom_art {
+                        Some(art) => (None, art.clone()),
+                        None => {
+                            self.status =
+                                "Pick a custom image first.".to_string();
+                            return Task::none();
+                        }
+                    },
+                    GsChoice::Standard => unreachable!(),
+                };
+                self.gs_busy = true;
+                self.status =
+                    "Building the screens at 4096x4096 — this takes a few seconds."
+                        .to_string();
+                return Task::perform(
+                    async move {
+                        let (splash, blur) = gamescreens::build_pair(&art);
+                        let sha = gamescreens::sha256_hex(&splash);
+                        gamescreens::apply_pair(&shared, &root, &splash, &blur)
+                            .map(|backup| {
+                                (preset, backup.display().to_string(), sha)
+                            })
+                            .map_err(|e| format!("{:#}", e))
+                    },
+                    Message::GameScreensApplied,
+                );
+            }
+            Message::GameScreensApplied(result) => {
+                self.gs_busy = false;
+                match result {
+                    Ok((preset, backup, sha)) => {
+                        if let (Some(p), Some(data_dir)) =
+                            (preset, crate::paths::data_dir())
+                        {
+                            let mut hashes =
+                                gamescreens::GeneratedHashes::load(&data_dir);
+                            match p {
+                                GsPreset::Daylight => {
+                                    hashes.daylight_splash = Some(sha)
+                                }
+                                GsPreset::Dark => hashes.dark_splash = Some(sha),
+                            }
+                            let _ = hashes.save(&data_dir);
+                        }
+                        self.status = format!(
+                            "Game screens applied. The previous screens are captured in {}.",
+                            backup
+                        );
+                        self.gs_reload();
+                    }
+                    Err(e) => {
+                        self.status = format!("Game Screens: {}", e);
+                    }
+                }
+            }
+            Message::GameScreensRestoreBackup(path) => {
+                let (Some(shared), Some(root)) =
+                    (self.gs_shared.clone(), self.gs_root.clone())
+                else {
+                    return Task::none();
+                };
+                match gamescreens::capture_backup(&shared, &root)
+                    .and_then(|_| gamescreens::restore_backup(&shared, &path))
+                {
+                    Ok(()) => {
+                        self.status =
+                            "Backup restored; the screens it replaced were captured first."
+                                .to_string();
+                    }
+                    Err(e) => {
+                        self.status =
+                            format!("Could not restore that backup: {:#}", e);
+                    }
+                }
+                self.gs_reload();
             }
             Message::OpenKingModsPage(id) => {
                 match self.kingmods_page_url(&id) {
@@ -3370,6 +3709,9 @@ impl App {
                 if tab == Tab::Keybindings {
                     self.kb_reload();
                 }
+                if tab == Tab::GameScreens {
+                    self.gs_reload();
+                }
                 if tab == Tab::Log {
                     return self.begin_log_load();
                 }
@@ -3698,7 +4040,10 @@ impl App {
                     FolderTarget::Active => "Choose the game's mods folder",
                     FolderTarget::Archive => "Choose the library folder",
                     FolderTarget::Game => {
-                        "Choose the Farming Simulator install folder (holds game.xml)"
+                        "Choose the Farming Simulator profile folder (holds game.xml)"
+                    }
+                    FolderTarget::GameInstall => {
+                        "Choose the Farming Simulator install folder (holds the shared folder)"
                     }
                 };
                 return Task::perform(
@@ -3768,19 +4113,59 @@ impl App {
                                 self.console_on = game_files::console_enabled(&path);
                                 self.status = match self.console_on {
                                     Some(on) => format!(
-                                        "Game folder set: {}. Developer console is {}.",
+                                        "Profile folder set: {}. Developer console is {}.",
                                         path.display(),
                                         if on { "on" } else { "off" }
                                     ),
                                     None => format!(
-                                        "Game folder set: {}, but no game.xml console switch was found there.",
+                                        "Profile folder set: {}, but no game.xml console switch was found there.",
                                         path.display()
                                     ),
                                 };
                             }
                             Err(e) => {
                                 self.status =
-                                    format!("Could not save the game folder: {}", e)
+                                    format!("Could not save the profile folder: {}", e)
+                            }
+                        }
+                    }
+                    FolderTarget::GameInstall => {
+                        // The Game Screens install folder: the
+                        // pick must hold a shared folder (or be
+                        // the shared folder itself) before it is
+                        // saved — anything else is refused with
+                        // the pick named, and the Game Screens
+                        // page keeps the refusal on show.
+                        match gamescreens::validate_install_pick(&path) {
+                            Ok(install) => {
+                                match self
+                                    .mod_manager
+                                    .set_game_install_dir(install.clone())
+                                {
+                                    Ok(()) => {
+                                        self.game_install_dir_input =
+                                            install.display().to_string();
+                                        self.status = format!(
+                                            "Game install folder set: {}.",
+                                            install.display()
+                                        );
+                                        self.gs_reload();
+                                    }
+                                    Err(e) => {
+                                        self.status = format!(
+                                            "Could not save the game install folder: {}",
+                                            e
+                                        )
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let reason = e.reason();
+                                self.status = format!(
+                                    "Game install folder not set — {}",
+                                    reason
+                                );
+                                self.gs_pick_note = Some(reason);
                             }
                         }
                     }
@@ -6332,7 +6717,7 @@ impl App {
     }
 
     /// Settings (Round 2, owner 2026-10-22): the tabbed
-    /// page modeled on Silo's tabs — General / Mods folder
+    /// page modeled on Silo's tabs — General / Game Folders
     /// / Library / Accounts / Diagnostics / Maintenance /
     /// About — with collapsible menu-black boxes under the
     /// strip. Everything editable on every tab stages in
@@ -6359,7 +6744,7 @@ impl App {
         };
         let tabs = row![
             tab_button(SettingsTab::General, "General"),
-            tab_button(SettingsTab::ModsFolder, "Mods folder"),
+            tab_button(SettingsTab::ModsFolder, "Game Folders"),
             tab_button(SettingsTab::Library, "Library"),
             tab_button(SettingsTab::Accounts, "Accounts"),
             tab_button(SettingsTab::Diagnostics, "Diagnostics"),
@@ -6601,12 +6986,12 @@ impl App {
                 })
                 .into(),
                 (Some(_), None) => {
-                    text("Developer console: no game.xml console switch found in the game folder.")
+                    text("Developer console: no game.xml console switch found in the profile folder.")
                         .size(13)
                         .into()
                 }
                 (None, _) => {
-                    text("Developer console: set the game install folder (Mods folder tab) to manage the console switch in game.xml.")
+                    text("Developer console: set the profile folder (Game Folders tab) to manage the console switch in game.xml.")
                         .size(13)
                         .into()
                 }
@@ -6694,13 +7079,25 @@ impl App {
             launch,
             self.settings_placeholder("general-appearance", "General"),
             self.settings_placeholder("general-graphics", "Graphics"),
-            self.settings_placeholder("general-game-screens", "Game Screens"),
+            self.settings_box(
+                "general-game-screens",
+                "Game Screens",
+                vec![
+                    text("Menu and loading screens for FS25: the Farmer Jay presets, your own art, and timestamped backups of the originals.")
+                        .size(13)
+                        .into(),
+                    row![button(text("Open Game Screens page"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::TabSelected(Tab::GameScreens))]
+                    .into(),
+                ],
+            ),
         ]
         .spacing(10)
         .into()
     }
 
-    /// Mods folder: the game's two folders as display
+    /// Game Folders: the game's folders as display
     /// rows. The Developer Console no longer lives here —
     /// it is staged under General > Launch Configuration.
     fn settings_mods_folder_tab(&self) -> Element<'_, Message> {
@@ -6714,9 +7111,14 @@ impl App {
                     FolderTarget::Active,
                 ),
                 self.settings_path_row(
-                    "Game install folder (holds game.xml):",
+                    "Profile folder (holds game.xml):",
                     &self.game_dir_input,
                     FolderTarget::Game,
+                ),
+                self.settings_path_row(
+                    "Game install folder (holds the shared folder):",
+                    &self.game_install_dir_input,
+                    FolderTarget::GameInstall,
                 ),
             ],
         );
@@ -7336,6 +7738,7 @@ impl App {
     fn kb_reload(&mut self) {
         self.kb_capture = None;
         self.kb_reset_armed = false;
+        self.kb_purge = None;
         let profile = self.mod_manager.profile_dir();
         self.kb_profile = profile.clone();
         self.kb_backups = profile
@@ -7389,25 +7792,51 @@ impl App {
     /// The staged document's actions grouped for the
     /// page: Base Game first (actions no loaded mod
     /// claims), then one group per owning mod, A-Z.
-    /// Actions keep file order inside a group.
+    /// Actions keep file order inside a group. Unless
+    /// the Show archived mods toggle is on, archived
+    /// mods' actions are excluded before grouping (see
+    /// `keybindings::visible_actions`) — the document
+    /// itself always holds every block.
     fn kb_grouped_actions(&self) -> Vec<(String, Vec<KbAction>)> {
         let Some(doc) = &self.kb_doc else {
             return Vec::new();
         };
+        let all = doc.actions();
+        let owners = self.kb_owners(&all);
+        let visible =
+            keybindings::visible_actions(&all, &owners, self.kb_show_archived);
         let mut base: Vec<KbAction> = Vec::new();
         let mut by_mod: std::collections::BTreeMap<String, Vec<KbAction>> =
             std::collections::BTreeMap::new();
-        for action in doc.actions() {
-            match self.mod_manager.action_owner(&action.name) {
-                Some((title, _)) => {
-                    by_mod.entry(title.clone()).or_default().push(action)
-                }
+        for action in visible {
+            match owners.get(&action.name) {
+                Some(owner) => by_mod
+                    .entry(owner.title.clone())
+                    .or_default()
+                    .push(action),
                 None => base.push(action),
             }
         }
         let mut out = vec![("Base Game".to_string(), base)];
         out.extend(by_mod.into_iter());
         out
+    }
+
+    /// The ownership map for a set of actions, from the
+    /// manager's action -> owner join. Actions no loaded
+    /// mod claims are simply absent (Base Game).
+    fn kb_owners(
+        &self,
+        actions: &[KbAction],
+    ) -> HashMap<String, keybindings::ActionOwner> {
+        actions
+            .iter()
+            .filter_map(|a| {
+                self.mod_manager
+                    .action_owner(&a.name)
+                    .map(|o| (a.name.clone(), o.clone()))
+            })
+            .collect()
     }
 
     /// A KingMods-sourced mod's page URL: the update
@@ -7462,6 +7891,43 @@ impl App {
             .spacing(6)
             .into(),
         )
+    }
+
+    /// The Keybindings page's Purge box: the two-step
+    /// removal of archived mods' bindings. The first
+    /// press counts the candidates and reports them in
+    /// place; the second stages the removals into the
+    /// document — Save bindings (backup first) is still
+    /// the only way anything reaches disk, and Discard
+    /// abandons the purge like any other staged edit.
+    fn kb_purge_box(&self) -> Element<'_, Message> {
+        let mut col =
+            column![text("Purge inactive bindings").size(15)].spacing(7);
+        col = col.push(
+            text("Remove the bindings of archived mods — mods not loaded in game. Active mods, base game and unclaimed actions are never touched.")
+                .size(12)
+                .color(theme::TEXT_DIM),
+        );
+        let (label, armed) = match self.kb_purge {
+            Some((actions, mods)) => (
+                format!(
+                    "{} actions from {} archived mods — click again to stage purge",
+                    actions, mods
+                ),
+                true,
+            ),
+            None => ("Purge inactive bindings".to_string(), false),
+        };
+        col = col.push(
+            button(text(label))
+                .style(theme::nav_pill(armed))
+                .on_press(Message::KeybindingsPurgePressed),
+        );
+        container(col)
+            .width(Length::Fill)
+            .padding(11)
+            .style(wizard_section_box)
+            .into()
     }
 
     /// The Keybindings page's Backups box: the timestamped
@@ -7523,6 +7989,386 @@ impl App {
             .into()
     }
 
+    /// (Re)load the Game Screens page's live state: the
+    /// shared folder's splash, its hash identity, the
+    /// highlands file's presence, the backups — and the
+    /// pending preview for the current choice. An absent
+    /// or wrong install folder is an honest error state,
+    /// never a write.
+    fn gs_reload(&mut self) {
+        self.gs_restore_armed = false;
+        self.gs_error = None;
+        self.gs_live_canvas = None;
+        self.gs_live_band = None;
+        self.gs_identity = None;
+        self.gs_highlands = false;
+        self.gs_backups = Vec::new();
+        self.gs_install = None;
+        self.gs_needs_locate = false;
+        self.gs_pick_note = None;
+        self.gs_root =
+            crate::paths::data_dir().map(|d| gamescreens::backups_root(&d));
+        // The install folder is Game Screens' own setting —
+        // the game's true install folder, never the profile
+        // folder (game.xml) the app also keeps.
+        let install = match gamescreens::resolve_install_dir(
+            self.mod_manager.game_install_dir().as_deref(),
+        ) {
+            gamescreens::InstallResolution::Usable(dir) => dir,
+            gamescreens::InstallResolution::Unset => {
+                self.gs_needs_locate = true;
+                self.gs_error = Some(
+                    "No game install folder is set for Game Screens — it reads the game's screens from the folder the game is installed in, the one holding the shared folder. Locate it below, or set \"Game install folder\" in Settings > Game Folders. Nothing was written."
+                        .to_string(),
+                );
+                return;
+            }
+            gamescreens::InstallResolution::NoSharedFolder(dir) => {
+                self.gs_needs_locate = true;
+                self.gs_error = Some(format!(
+                    "The game install folder {} has no shared folder under it — Game Screens reads the game's screens from the install folder's shared folder. Locate the right folder below, or fix \"Game install folder\" in Settings > Game Folders. Nothing was written.",
+                    dir.display()
+                ));
+                return;
+            }
+        };
+        self.gs_install = Some(install.clone());
+        let shared = gamescreens::shared_dir(&install);
+        self.gs_shared = Some(shared.clone());
+        let splash_path = shared.join(gamescreens::SPLASH_NAME);
+        if !splash_path.is_file() {
+            self.gs_error = Some(format!(
+                "No {} in {} — the game creates its screens when it runs. Nothing was written.",
+                gamescreens::SPLASH_NAME,
+                shared.display()
+            ));
+            return;
+        }
+        self.gs_highlands = shared.join(gamescreens::HIGHLANDS_NAME).is_file();
+        let root = self.gs_root.clone().unwrap_or_default();
+        self.gs_backups = gamescreens::list_backups(&root);
+        let live_sha = std::fs::read(&splash_path)
+            .ok()
+            .map(|bytes| gamescreens::sha256_hex(&bytes));
+        if let Ok(bytes) = std::fs::read(&splash_path) {
+            if let Ok(img) = gamescreens::decode_dds(&bytes) {
+                let (w, h, rgba) = gamescreens::preview_rgba(&img, 320, 320);
+                self.gs_live_canvas = Some(ImageHandle::from_rgba(w, h, rgba));
+                let band = gamescreens::visible_band(&img);
+                let (w, h, rgba) = gamescreens::preview_rgba(&band, 512, 288);
+                self.gs_live_band = Some(ImageHandle::from_rgba(w, h, rgba));
+            }
+        }
+        let stock_sha = gamescreens::oldest_backup(&root)
+            .and_then(|dir| std::fs::read(dir.join(gamescreens::SPLASH_NAME)).ok())
+            .map(|bytes| gamescreens::sha256_hex(&bytes));
+        let generated = crate::paths::data_dir()
+            .map(|d| gamescreens::GeneratedHashes::load(&d))
+            .unwrap_or_default();
+        self.gs_identity = Some(gamescreens::identify(
+            live_sha.as_deref(),
+            stock_sha.as_deref(),
+            &generated,
+        ));
+        self.gs_refresh_pending();
+    }
+
+    /// Rebuild the pending preview (the exact composition
+    /// an Apply would write) for the current choice.
+    fn gs_refresh_pending(&mut self) {
+        self.gs_pending_canvas = None;
+        self.gs_pending_band = None;
+        let composed: Option<RgbImage> = match self.gs_choice {
+            GsChoice::Standard => {
+                let root = self.gs_root.clone().unwrap_or_default();
+                match gamescreens::oldest_backup(&root)
+                    .and_then(|dir| {
+                        std::fs::read(dir.join(gamescreens::SPLASH_NAME)).ok()
+                    })
+                    .and_then(|bytes| gamescreens::decode_dds(&bytes).ok())
+                {
+                    Some(img) => {
+                        self.gs_pending_note = "The stock screens, held in the oldest capture. Applying restores them (the current pair is captured first).".to_string();
+                        Some(img)
+                    }
+                    None => {
+                        self.gs_pending_note = "No stock capture yet — the first Apply of a preset or a custom image captures the current screens as the stock originals.".to_string();
+                        None
+                    }
+                }
+            }
+            GsChoice::Preset(p) => {
+                let bytes = match p {
+                    GsPreset::Daylight => DAYLIGHT_MASTER,
+                    GsPreset::Dark => DARK_MASTER,
+                };
+                match gamescreens::decode_source(bytes) {
+                    Ok(art) => {
+                        self.gs_pending_note = match p {
+                            GsPreset::Daylight => {
+                                "Farmer Jay Daylight — the wide pair, proven in game."
+                                    .to_string()
+                            }
+                            GsPreset::Dark => {
+                                "Farmer Jay Dark — the night pair, with the Playground shield and Albert Einstein."
+                                    .to_string()
+                            }
+                        };
+                        Some(gamescreens::compose(&art))
+                    }
+                    Err(e) => {
+                        self.gs_pending_note =
+                            format!("The bundled preset art could not be read: {:#}", e);
+                        None
+                    }
+                }
+            }
+            GsChoice::Custom => match &self.gs_custom_art {
+                Some(art) => {
+                    self.gs_pending_note = format!(
+                        "Your image: {}.",
+                        self.gs_custom_name.as_deref().unwrap_or("custom image")
+                    );
+                    Some(gamescreens::compose(art))
+                }
+                None => {
+                    self.gs_pending_note =
+                        "Pick an image — PNG, JPG, WebP, BMP or a DXT1 DDS. It is scaled to the full width and bottom-aligned, by the game's own rule."
+                            .to_string();
+                    None
+                }
+            },
+        };
+        if let Some(img) = composed {
+            let (w, h, rgba) = gamescreens::preview_rgba(&img, 288, 288);
+            self.gs_pending_canvas = Some(ImageHandle::from_rgba(w, h, rgba));
+            let band = gamescreens::visible_band(&img);
+            let (w, h, rgba) = gamescreens::preview_rgba(&band, 512, 288);
+            self.gs_pending_band = Some(ImageHandle::from_rgba(w, h, rgba));
+        }
+    }
+
+    /// The Game Screens page's Backups box: the timestamped
+    /// captures (newest first) with per-capture Restore.
+    fn gs_backups_box(&self) -> Element<'_, Message> {
+        let mut col = column![text("Backups").size(15)].spacing(7);
+        if self.gs_backups.is_empty() {
+            col = col.push(
+                text("No backups yet — one is captured automatically before every Apply or restore.")
+                    .size(12)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        for backup in &self.gs_backups {
+            col = col.push(
+                row![
+                    text(format!(
+                        "{} ({})",
+                        backup.stamp,
+                        backup.files.join(", ")
+                    ))
+                    .size(12)
+                    .width(Length::Fill),
+                    button(text("Restore"))
+                        .style(theme::nav_pill(false))
+                        .on_press(Message::GameScreensRestoreBackup(
+                            backup.dir.clone(),
+                        )),
+                ]
+                .spacing(8),
+            );
+        }
+        container(col)
+            .width(Length::Fill)
+            .padding(11)
+            .style(wizard_section_box)
+            .into()
+    }
+
+    /// The Game Screens page: the current screen and its
+    /// identity, the choice of what to write (stock, a
+    /// bundled preset, or a custom image) with the exact
+    /// composition previewed, and the backups. Nothing
+    /// writes except Apply and Restore, and both capture
+    /// the current files first.
+    fn gamescreens_view(&self) -> Element<'_, Message> {
+        let title = text("Game Screens").size(20);
+        if let Some(err) = &self.gs_error {
+            let mut col = column![title, text(err.clone()).size(13)].spacing(10);
+            if self.gs_needs_locate {
+                col = col.push(
+                    row![button(text("Locate game install folder…"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::BrowseFolder(
+                            FolderTarget::GameInstall,
+                        ))],
+                );
+                if let Some(note) = &self.gs_pick_note {
+                    col = col.push(
+                        text(format!("Last pick refused: {}", note))
+                            .size(12)
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+            }
+            return col.push(self.gs_backups_box()).into();
+        }
+        // Current screen.
+        let mut current = column![text("Current screen").size(15)].spacing(7);
+        if let Some(band) = &self.gs_live_band {
+            current = current.push(
+                iced::widget::image(band.clone()).width(Length::Fixed(512.0)),
+            );
+        } else {
+            current = current.push(
+                text("The current splash could not be previewed.")
+                    .size(12)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        let identity = self
+            .gs_identity
+            .map(|i| i.label())
+            .unwrap_or("Unknown");
+        current = current.push(
+            row![
+                text(format!("Active in Game: {}", identity)).size(13),
+                text(if self.gs_highlands {
+                    "splash_highlandsFishing.dds: present — Playground never writes this file."
+                } else {
+                    "splash_highlandsFishing.dds: not present."
+                })
+                .size(12)
+                .color(theme::TEXT_DIM),
+            ]
+            .spacing(12),
+        );
+        if let Some(install) = &self.gs_install {
+            current = current.push(
+                text(format!(
+                    "Game install folder: {}",
+                    install.display()
+                ))
+                .size(12)
+                .color(theme::TEXT_DIM),
+            );
+        }
+        if let Some(shared) = &self.gs_shared {
+            current = current.push(
+                row![button(text("Open shared folder"))
+                    .style(theme::nav_pill(false))
+                    .on_press(Message::OpenFolder(shared.clone()))],
+            );
+        }
+        let current_box = container(current)
+            .width(Length::Fill)
+            .padding(11)
+            .style(wizard_section_box);
+
+        // The choice + its preview.
+        let mut choose = column![text("Screens").size(15)].spacing(7);
+        choose = choose.push(
+            row![
+                button(text("FS25 Standard"))
+                    .style(theme::nav_pill(
+                        self.gs_choice == GsChoice::Standard,
+                    ))
+                    .on_press(Message::GameScreensStandardSelected),
+                button(text("Farmer Jay Daylight"))
+                    .style(theme::nav_pill(
+                        self.gs_choice == GsChoice::Preset(GsPreset::Daylight),
+                    ))
+                    .on_press(Message::GameScreensPresetSelected(
+                        GsPreset::Daylight,
+                    )),
+                button(text("Farmer Jay Dark"))
+                    .style(theme::nav_pill(
+                        self.gs_choice == GsChoice::Preset(GsPreset::Dark),
+                    ))
+                    .on_press(Message::GameScreensPresetSelected(
+                        GsPreset::Dark,
+                    )),
+                button(text("Custom image…"))
+                    .style(theme::nav_pill(self.gs_choice == GsChoice::Custom))
+                    .on_press(Message::GameScreensPickCustom),
+            ]
+            .spacing(8),
+        );
+        choose = choose.push(
+            text(self.gs_pending_note.clone())
+                .size(12)
+                .color(theme::TEXT_DIM),
+        );
+        if self.gs_pending_canvas.is_some() || self.gs_pending_band.is_some() {
+            let mut previews = row![].spacing(12);
+            if let Some(canvas) = &self.gs_pending_canvas {
+                previews = previews.push(
+                    column![
+                        iced::widget::image(canvas.clone())
+                            .width(Length::Fixed(216.0)),
+                        text("The full canvas — the game shows the bottom band.")
+                            .size(11)
+                            .color(theme::TEXT_DIM),
+                    ]
+                    .spacing(4),
+                );
+            }
+            if let Some(band) = &self.gs_pending_band {
+                previews = previews.push(
+                    column![
+                        iced::widget::image(band.clone())
+                            .width(Length::Fixed(384.0)),
+                        text("What the game shows.")
+                            .size(11)
+                            .color(theme::TEXT_DIM),
+                    ]
+                    .spacing(4),
+                );
+            }
+            choose = choose.push(previews);
+        }
+        let apply_label = match self.gs_choice {
+            GsChoice::Standard => {
+                if self.gs_restore_armed {
+                    "Click again to confirm"
+                } else {
+                    "Apply — restore stock screens"
+                }
+            }
+            _ => "Apply screens",
+        };
+        choose = choose.push(
+            row![
+                button(text(apply_label))
+                    .style(theme::nav_pill(true))
+                    .on_press_maybe(if self.gs_busy {
+                        None
+                    } else {
+                        Some(Message::GameScreensApply)
+                    }),
+                if self.gs_busy {
+                    text("Building…").size(12).color(theme::TEXT_DIM)
+                } else {
+                    text("").size(12)
+                },
+            ]
+            .spacing(10),
+        );
+        choose = choose.push(
+            text("Apply while the game is closed; it reads these at launch.")
+                .size(12)
+                .color(theme::TEXT_DIM),
+        );
+        let choose_box = container(choose)
+            .width(Length::Fill)
+            .padding(11)
+            .style(wizard_section_box);
+
+        column![title, current_box, choose_box, self.gs_backups_box()]
+            .spacing(10)
+            .into()
+    }
+
     /// The Keybindings page: device tabs over collapsible
     /// per-owner groups of action rows, staged editing
     /// with a save footer, and the Backups box. The model
@@ -7551,7 +8397,17 @@ impl App {
             .into();
         };
 
-        let actions = doc.actions();
+        // The analysis set: every action in the document,
+        // or — with Show archived mods off (the default) —
+        // the document minus archived mods' actions. The
+        // document itself always holds every block.
+        let all_actions = doc.actions();
+        let owners_full = self.kb_owners(&all_actions);
+        let actions = keybindings::visible_actions(
+            &all_actions,
+            &owners_full,
+            self.kb_show_archived,
+        );
         let devices = doc.devices();
         let device = self
             .kb_device
@@ -7575,30 +8431,51 @@ impl App {
             );
         }
 
-        // Findings on the selected device, and the banner
-        // over them.
+        // Findings on the selected device, tiered
+        // (v1.6.2): each Conflict finding is Hard (a mod
+        // fighting itself for a key), Shared (mod-touching)
+        // or Base (no mod involved), classified against
+        // the manager's action -> owner map.
         let findings = keybindings::analyze(&actions, &device);
-        let conflict_count = findings
+        let owners: HashMap<String, String> =
+            keybindings::owner_titles(&owners_full);
+        let tiers: Vec<Option<keybindings::FindingTier>> = findings
             .iter()
-            .filter(|f| f.kind == FindingKind::Conflict)
-            .count();
-        let warning_count = findings
-            .iter()
-            .filter(|f| f.kind == FindingKind::Warning)
-            .count();
-        let affected_mods: HashSet<&str> = findings
-            .iter()
-            .flat_map(|f| f.actions.iter())
-            .filter_map(|a| {
-                self.mod_manager
-                    .action_owner(a)
-                    .map(|(title, _)| title.as_str())
-            })
+            .map(|f| keybindings::classify(f, &owners))
             .collect();
-        let finding_actions: HashSet<&str> = findings
+        let counts = keybindings::tier_counts(&findings, &owners);
+        // Actions involved in a Hard finding on this
+        // device — the "Hard conflicts only" filter's set.
+        let hard_actions: HashSet<&str> = findings
             .iter()
-            .flat_map(|f| f.actions.iter().map(|s| s.as_str()))
+            .zip(tiers.iter())
+            .filter(|(_, t)| **t == Some(keybindings::FindingTier::Hard))
+            .flat_map(|(f, _)| f.actions.iter().map(|s| s.as_str()))
             .collect();
+        // Per-action row marks: the most severe finding an
+        // action is involved in on this device (Hard >
+        // Shared > Base > Warning), named in quiet text.
+        let mark_rank = |label: &str| match label {
+            "Hard conflict" => 3,
+            "Shared key" => 2,
+            "Base game overlap" => 1,
+            _ => 0,
+        };
+        let mut action_marks: HashMap<&str, &str> = HashMap::new();
+        for (f, t) in findings.iter().zip(tiers.iter()) {
+            let label = match t {
+                Some(keybindings::FindingTier::Hard) => "Hard conflict",
+                Some(keybindings::FindingTier::Shared) => "Shared key",
+                Some(keybindings::FindingTier::Base) => "Base game overlap",
+                None => "Warning",
+            };
+            for a in &f.actions {
+                let entry = action_marks.entry(a.as_str()).or_insert(label);
+                if mark_rank(label) > mark_rank(entry) {
+                    *entry = label;
+                }
+            }
+        }
 
         // Filters.
         let query = self.kb_search.trim().to_lowercase();
@@ -7608,7 +8485,7 @@ impl App {
             {
                 return false;
             }
-            if self.kb_conflicts_only && !finding_actions.contains(a.name.as_str()) {
+            if self.kb_conflicts_only && !hard_actions.contains(a.name.as_str()) {
                 return false;
             }
             if !query.is_empty() {
@@ -7632,44 +8509,47 @@ impl App {
             if visible.is_empty() {
                 continue;
             }
-            let group_conflicts = findings
+            let group_hard = findings
                 .iter()
-                .filter(|f| {
-                    f.actions
-                        .iter()
-                        .any(|a| group_actions.iter().any(|ga| &ga.name == a))
+                .zip(tiers.iter())
+                .filter(|(f, t)| {
+                    **t == Some(keybindings::FindingTier::Hard)
+                        && f.actions
+                            .iter()
+                            .any(|a| group_actions.iter().any(|ga| &ga.name == a))
                 })
                 .count();
             let collapsed = self.kb_collapsed.contains(&group);
-            let header = row![
+            let mut header = row![
                 button(text(if collapsed { "+" } else { "–" }).size(14))
                     .style(theme::nav_pill(false))
                     .on_press(Message::KeybindingsToggleGroup(group.clone())),
                 text(format!("{} ({})", group, group_actions.len())).size(15),
-                if group_conflicts > 0 {
-                    text(format!(
-                        "{} conflict{}",
-                        group_conflicts,
-                        if group_conflicts == 1 { "" } else { "s" }
-                    ))
-                    .size(12)
-                    .color(theme::TEXT_DIM)
+                if group_hard > 0 {
+                    text(format!("{} hard", group_hard))
+                        .size(12)
+                        .color(theme::TEXT_DIM)
                 } else {
                     text("").size(12)
                 },
                 Space::with_width(Length::Fill),
-                button(text("Auto-Resolve"))
-                    .style(theme::nav_pill(false))
-                    .on_press(Message::KeybindingsAutoResolve(group.clone())),
             ]
             .spacing(8);
+            // Auto-Resolve lives only where it can act:
+            // a group with a Hard finding on this device.
+            if group_hard > 0 {
+                header = header.push(
+                    button(text("Auto-Resolve"))
+                        .style(theme::nav_pill(false))
+                        .on_press(Message::KeybindingsAutoResolve(group.clone())),
+                );
+            }
             let mut box_col = column![header].spacing(7);
             if !collapsed {
                 for a in visible {
-                    let category = self
-                        .mod_manager
-                        .action_owner(&a.name)
-                        .and_then(|(_, c)| c.clone());
+                    let category = owners_full
+                        .get(&a.name)
+                        .and_then(|o| o.category.clone());
                     let mut name_col =
                         column![text(keybindings::humanize_action(&a.name)).size(13)]
                             .spacing(2);
@@ -7677,6 +8557,15 @@ impl App {
                         name_col = name_col.push(
                             text(category).size(11).color(theme::TEXT_DIM),
                         );
+                    }
+                    if let Some(mark) = action_marks.get(a.name.as_str()) {
+                        let color = if *mark == "Hard conflict" {
+                            iced::Color::from_rgb(0.62, 0.16, 0.13)
+                        } else {
+                            theme::TEXT_DIM
+                        };
+                        name_col = name_col
+                            .push(text(*mark).size(11).color(color));
                     }
                     let mut chips = row![].spacing(6);
                     let device_bindings: Vec<_> = a
@@ -7764,6 +8653,7 @@ impl App {
                     .style(wizard_section_box),
             );
         }
+        groups_col = groups_col.push(self.kb_purge_box());
         groups_col = groups_col.push(self.kb_backups_box());
 
         let top_bar = row![
@@ -7772,8 +8662,10 @@ impl App {
                 .width(260),
             checkbox("Unassigned only", self.kb_unassigned_only)
                 .on_toggle(Message::KeybindingsUnassignedOnlyToggled),
-            checkbox("Conflicts only", self.kb_conflicts_only)
+            checkbox("Hard conflicts only", self.kb_conflicts_only)
                 .on_toggle(Message::KeybindingsConflictsOnlyToggled),
+            checkbox("Show archived mods", self.kb_show_archived)
+                .on_toggle(Message::KeybindingsShowArchivedToggled),
             Space::with_width(Length::Fill),
             button(text("Expand all"))
                 .style(theme::nav_pill(false))
@@ -7785,13 +8677,10 @@ impl App {
         .spacing(10);
 
         let mut page = column![title, tabs].spacing(10);
-        if !findings.is_empty() {
-            page = page.push(text(format!(
-                "{} Keybinding Conflicts & {} Warnings Detected (Affecting {} Mods)",
-                conflict_count,
-                warning_count,
-                affected_mods.len()
-            )));
+        let (banner1, banner2) = keybindings::banner_lines(&counts);
+        page = page.push(text(banner1));
+        if let Some(line2) = banner2 {
+            page = page.push(text(line2).size(12).color(theme::TEXT_DIM));
         }
         page = page.push(top_bar);
         if !is_keyboard {
@@ -7918,6 +8807,7 @@ impl App {
             nav("Layout".to_string(), Tab::Layout),
             nav("Log Reader".to_string(), Tab::Log),
             nav("Keybindings".to_string(), Tab::Keybindings),
+            nav("Game Screens".to_string(), Tab::GameScreens),
             // Downloads (2026-10-22): the live count rides
             // the label only while something is in play —
             // queued or running — like Conflicts' count
@@ -7953,7 +8843,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.6.1  © 2026 Farmer Jay.")
+            text("V1.6.5  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -8471,6 +9361,12 @@ impl App {
                 Space::with_height(0).into(),
                 None,
                 self.keybindings_view(),
+                58.0,
+            ),
+            Tab::GameScreens => (
+                Space::with_height(0).into(),
+                None,
+                self.gamescreens_view(),
                 58.0,
             ),
             Tab::Downloads => (

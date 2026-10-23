@@ -1046,6 +1046,7 @@ mod tests {
                 favorites: vec![],
                 save_loadouts: HashMap::new(),
                 game_directory: None,
+                game_install_dir: None,
                 mod_links: HashMap::new(),
                 modhub_links: [(
                     "fs25_tripwire_probe".to_string(),

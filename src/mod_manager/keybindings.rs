@@ -20,7 +20,7 @@
 //! backup helpers are the only IO in the module.
 
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The file's name inside the profile folder.
@@ -148,6 +148,68 @@ impl BindingsFile {
         true
     }
 
+    /// Remove one action's whole `<actionBinding>` block,
+    /// together with its line's indent and one trailing
+    /// line ending, so the document closes up the way the
+    /// game itself would write it. Every other byte is
+    /// untouched. False when the action is not there.
+    pub fn remove_action_block(&mut self, action: &str) -> bool {
+        let actions = parse_actions(&self.text);
+        let Some(action) = actions.iter().find(|a| a.name == action) else {
+            return false;
+        };
+        let (mut start, mut end) = action.span;
+        // Take the line's indent with the block...
+        while start > 0 {
+            let c = self.text.as_bytes()[start - 1];
+            if c == b' ' || c == b'\t' {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        // ...and its line ending.
+        if self.text.as_bytes().get(end) == Some(&b'\r') {
+            end += 1;
+        }
+        if self.text.as_bytes().get(end) == Some(&b'\n') {
+            end += 1;
+        }
+        self.text.replace_range(start..end, "");
+        true
+    }
+
+    /// Stage the purge of inactive bindings (owner
+    /// ruling, 2026-10-22): remove the whole action block
+    /// of every action `purge_candidates` names against
+    /// `owners` — actions positively owned by an
+    /// archived-state mod, and nothing else (see
+    /// `is_purge_eligible`). This is a staged edit like
+    /// any other: nothing reaches disk until the page's
+    /// save flow runs, and Discard abandons it. Returns
+    /// how many action blocks were removed and how many
+    /// distinct mods they belonged to.
+    pub fn stage_purge(
+        &mut self,
+        owners: &HashMap<String, ActionOwner>,
+    ) -> PurgeSummary {
+        let names = purge_candidates(&self.actions(), owners);
+        let mut mods: HashSet<&str> = HashSet::new();
+        let mut removed = 0;
+        for name in &names {
+            if let Some(owner) = owners.get(name) {
+                mods.insert(owner.title.as_str());
+            }
+            if self.remove_action_block(name) {
+                removed += 1;
+            }
+        }
+        PurgeSummary {
+            actions: removed,
+            mods: mods.len(),
+        }
+    }
+
     /// Append a binding to the named action, in the file's
     /// own element shape: device / input / axisComponent
     /// "+" / neutralInput "0", index one past the action's
@@ -188,45 +250,70 @@ impl BindingsFile {
     }
 
     /// Per-group Auto-Resolve, staged on this document:
-    /// for every CONFLICT on `device`, the first action in
-    /// file order keeps the input, and the binding is
-    /// removed from every later conflicting action that
-    /// belongs to `group` (actions outside the group are
-    /// never touched by this group's pass). Warnings are
-    /// not resolved. Returns how many bindings were cleared.
-    pub fn auto_resolve(&mut self, device: &str, group: &HashSet<String>) -> usize {
+    /// clears are staged ONLY for HARD findings (the
+    /// v1.6.2 tiers — see `classify`). A Hard finding's
+    /// same-mod pair must live in `group` (the pair's
+    /// owner group); the pair's first action in file
+    /// order keeps the input, and the binding is removed
+    /// from the pair's later holders. Shared and Base
+    /// findings, and Warnings, are never auto-resolved.
+    /// Returns how many bindings were cleared.
+    pub fn auto_resolve(
+        &mut self,
+        device: &str,
+        group: &HashSet<String>,
+        owners: &HashMap<String, String>,
+    ) -> usize {
         let actions = self.actions();
         let findings = analyze(&actions, device);
         let mut cleared = 0usize;
-        for finding in findings.iter().filter(|f| f.kind == FindingKind::Conflict) {
-            // Holders of this input on this device, in
-            // file order; the first keeps it.
-            let holders: Vec<&KbAction> = actions
-                .iter()
-                .filter(|a| {
-                    a.bindings
-                        .iter()
-                        .any(|b| b.device == device && b.input == finding.input)
-                })
-                .collect();
-            for holder in holders.iter().skip(1) {
-                if !group.contains(&holder.name) {
+        for finding in findings
+            .iter()
+            .filter(|f| classify(f, owners) == Some(FindingTier::Hard))
+        {
+            // The owners holding two or more of this
+            // input's actions — each is a same-mod pair
+            // (or a larger same-mod pile-up).
+            let mut by_owner: HashMap<&str, Vec<&str>> = HashMap::new();
+            for action in &finding.actions {
+                if let Some(owner) = owners.get(action) {
+                    by_owner
+                        .entry(owner.as_str())
+                        .or_default()
+                        .push(action.as_str());
+                }
+            }
+            for holders in by_owner.values().filter(|h| h.len() > 1) {
+                // The pair must live in this group — a
+                // different group's pass never touches it.
+                if !holders.iter().all(|h| group.contains(*h)) {
                     continue;
                 }
-                // This action's bindings with the input,
-                // positions high-to-low so each removal
-                // leaves the others' positions valid.
-                let mut positions: Vec<usize> = holder
-                    .bindings
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| b.device == device && b.input == finding.input)
-                    .map(|(i, _)| i)
-                    .collect();
-                positions.sort_unstable_by(|a, b| b.cmp(a));
-                for pos in positions {
-                    if self.remove_binding(&holder.name, pos) {
-                        cleared += 1;
+                // First in file order keeps the input; the
+                // pair's later holders lose it. Each
+                // action's bindings go high-to-low so a
+                // removal leaves the others' positions
+                // valid.
+                for holder in holders.iter().skip(1) {
+                    let Some(action) =
+                        actions.iter().find(|a| &a.name == holder)
+                    else {
+                        continue;
+                    };
+                    let mut positions: Vec<usize> = action
+                        .bindings
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, b)| {
+                            b.device == device && b.input == finding.input
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    positions.sort_unstable_by(|a, b| b.cmp(a));
+                    for pos in positions {
+                        if self.remove_binding(holder, pos) {
+                            cleared += 1;
+                        }
                     }
                 }
             }
@@ -491,6 +578,242 @@ pub fn analyze(actions: &[KbAction], device: &str) -> Vec<Finding> {
         });
     }
     findings
+}
+
+// ---------------------------------------------------------------------
+// Finding tiers (v1.6.2)
+// ---------------------------------------------------------------------
+
+/// A Conflict finding's tier, by who owns the colliding
+/// actions (the manager's action -> owner map; an action
+/// with no owner is Base Game):
+/// - Hard: two or more colliding actions belong to the
+///   SAME mod — a mod fighting itself for a key.
+/// - Shared: not Hard, but at least one colliding action
+///   is mod-owned.
+/// - Base: no colliding action is mod-owned.
+/// The plain same-key count alarmed without informing —
+/// the game reuses keys across in-game situations the
+/// file does not record — so the page's banner tiers the
+/// truth instead (owner ruling, 2026-10-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingTier {
+    Hard,
+    Shared,
+    Base,
+}
+
+/// Classify one finding. `owners` maps an action name to
+/// its owning mod's title. Warnings are not tiered and
+/// yield None.
+pub fn classify(
+    finding: &Finding,
+    owners: &HashMap<String, String>,
+) -> Option<FindingTier> {
+    if finding.kind != FindingKind::Conflict {
+        return None;
+    }
+    let mut per_owner: HashMap<&str, usize> = HashMap::new();
+    let mut any_owned = false;
+    for action in &finding.actions {
+        if let Some(owner) = owners.get(action) {
+            any_owned = true;
+            *per_owner.entry(owner.as_str()).or_insert(0) += 1;
+        }
+    }
+    if per_owner.values().any(|&n| n > 1) {
+        Some(FindingTier::Hard)
+    } else if any_owned {
+        Some(FindingTier::Shared)
+    } else {
+        Some(FindingTier::Base)
+    }
+}
+
+/// One device's findings, counted by tier, plus the
+/// Warning count and how many distinct mods own an
+/// action in a Hard finding (the banner's K). Partition
+/// property: hard + shared + base == the device's
+/// Conflict findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TierCounts {
+    pub hard: usize,
+    pub shared: usize,
+    pub base: usize,
+    pub warnings: usize,
+    pub hard_mods: usize,
+}
+
+pub fn tier_counts(
+    findings: &[Finding],
+    owners: &HashMap<String, String>,
+) -> TierCounts {
+    let mut counts = TierCounts::default();
+    let mut hard_mods: HashSet<&str> = HashSet::new();
+    for finding in findings {
+        match classify(finding, owners) {
+            Some(FindingTier::Hard) => {
+                counts.hard += 1;
+                for action in &finding.actions {
+                    if let Some(owner) = owners.get(action) {
+                        hard_mods.insert(owner.as_str());
+                    }
+                }
+            }
+            Some(FindingTier::Shared) => counts.shared += 1,
+            Some(FindingTier::Base) => counts.base += 1,
+            None => counts.warnings += 1,
+        }
+    }
+    counts.hard_mods = hard_mods.len();
+    counts
+}
+
+/// What the Keybindings page's action -> owner join
+/// says about ONE action (built by the manager from the
+/// owning mod's record): the mod's title, the category
+/// its modDesc declared for the action (if any), and the
+/// mod's state. Actions no loaded mod claims have no
+/// ActionOwner at all — they group under Base Game.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionOwner {
+    pub title: String,
+    pub category: Option<String>,
+    pub state: KbOwnerState,
+}
+
+/// The owning mod's state, in the vocabulary the page's
+/// active/archive distinction needs. `Other` covers the
+/// Mod record's remaining states (Conflict, Error): the
+/// mod is neither cleanly loaded nor cleanly shelved, so
+/// its actions stay visible and are never purgeable —
+/// only a positively Archived mod is ever set aside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KbOwnerState {
+    Active,
+    Archived,
+    Other,
+}
+
+/// The title-only projection of the ownership map — the
+/// shape `classify`, `tier_counts` and `auto_resolve`
+/// consume.
+pub fn owner_titles(
+    owners: &HashMap<String, ActionOwner>,
+) -> HashMap<String, String> {
+    owners
+        .iter()
+        .map(|(action, owner)| (action.clone(), owner.title.clone()))
+        .collect()
+}
+
+/// The actions the page groups and analyzes over. With
+/// `show_archived` on this is every action (the v1.6.2
+/// behavior). With it off, actions owned by an
+/// archived-state mod are excluded ENTIRELY — not
+/// reclassified as Base Game, not merely hidden from the
+/// group list: an unloaded mod's binding cannot fire in
+/// game, so it has no business in the findings, the tier
+/// counts or the banner (owner ruling, 2026-10-22).
+/// Base-game, unknown-owner, active-owned and
+/// other-state actions always pass. This is a view over
+/// the document: the document itself is untouched, and a
+/// no-edit save still round-trips byte-for-byte,
+/// archived blocks included.
+pub fn visible_actions(
+    actions: &[KbAction],
+    owners: &HashMap<String, ActionOwner>,
+    show_archived: bool,
+) -> Vec<KbAction> {
+    if show_archived {
+        return actions.to_vec();
+    }
+    actions
+        .iter()
+        .filter(|action| {
+            !matches!(
+                owners.get(&action.name),
+                Some(owner) if owner.state == KbOwnerState::Archived
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// The purge's eligibility rule, the ONLY predicate its
+/// code path consults: an action is purgeable exactly
+/// when a loaded mod positively owns it AND that mod's
+/// state is Archived. Active-owned, other-state,
+/// base-game and unknown-owner actions are structurally
+/// unreachable — there is no second path in.
+pub fn is_purge_eligible(
+    action: &str,
+    owners: &HashMap<String, ActionOwner>,
+) -> bool {
+    matches!(
+        owners.get(action),
+        Some(owner) if owner.state == KbOwnerState::Archived
+    )
+}
+
+/// The actions a purge would remove, in file order.
+pub fn purge_candidates(
+    actions: &[KbAction],
+    owners: &HashMap<String, ActionOwner>,
+) -> Vec<String> {
+    actions
+        .iter()
+        .filter(|action| is_purge_eligible(&action.name, owners))
+        .map(|action| action.name.clone())
+        .collect()
+}
+
+/// A purge's size, as the page reports it before staging:
+/// how many action blocks, from how many distinct mods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PurgeSummary {
+    pub actions: usize,
+    pub mods: usize,
+}
+
+pub fn purge_summary(
+    actions: &[KbAction],
+    owners: &HashMap<String, ActionOwner>,
+) -> PurgeSummary {
+    let names = purge_candidates(actions, owners);
+    let mods: HashSet<&str> = names
+        .iter()
+        .filter_map(|name| owners.get(name))
+        .map(|owner| owner.title.as_str())
+        .collect();
+    PurgeSummary {
+        actions: names.len(),
+        mods: mods.len(),
+    }
+}
+
+/// The banner's two lines: the Hard headline (or its
+/// calm variant when a device has none) and, when any of
+/// its parts is nonzero, the quiet second line with the
+/// Shared / Base / Warning counts.
+pub fn banner_lines(counts: &TierCounts) -> (String, Option<String>) {
+    let line1 = if counts.hard > 0 {
+        format!(
+            "{} Hard Keybinding Conflicts Detected (Affecting {} Mods)",
+            counts.hard, counts.hard_mods
+        )
+    } else {
+        "No hard keybinding conflicts on this device.".to_string()
+    };
+    let line2 = if counts.shared + counts.base + counts.warnings > 0 {
+        Some(format!(
+            "{} Shared Keys Involving Mods · {} Base Game Overlaps · {} Warnings",
+            counts.shared, counts.base, counts.warnings
+        ))
+    } else {
+        None
+    };
+    (line1, line2)
 }
 
 // ---------------------------------------------------------------------
@@ -941,14 +1264,213 @@ mod tests {
         assert_eq!(actions.len(), 7);
     }
 
+    /// An owners map from (action, mod title) pairs.
+    fn owners_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(a, o)| (a.to_string(), o.to_string()))
+            .collect()
+    }
+
+    fn finding(input: &str, kind: FindingKind, actions: &[&str]) -> Finding {
+        Finding {
+            input: input.to_string(),
+            kind,
+            actions: actions.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
     #[test]
-    fn auto_resolve_keeps_the_first_and_clears_the_group() {
-        // The group holds only LIGHTS: HORN (outside the
-        // group, first in file order) keeps KEY_x and
-        // LIGHTS loses it.
+    fn tier_classification_matrix() {
+        let owners = owners_of(&[
+            ("A_ONE", "Mod Alpha"),
+            ("A_TWO", "Mod Alpha"),
+            ("B_ONE", "Mod Beta"),
+            ("C_ONE", "Mod Gamma"),
+        ]);
+        // Two actions of the SAME mod on one key: Hard.
+        assert_eq!(
+            classify(
+                &finding("KEY_a", FindingKind::Conflict, &["A_ONE", "A_TWO"]),
+                &owners
+            ),
+            Some(FindingTier::Hard)
+        );
+        // The pair rule does not care what the input is —
+        // an axis-compound input with a same-mod pair is
+        // Hard all the same.
+        assert_eq!(
+            classify(
+                &finding(
+                    "MOUSE_BUTTON_MIDDLE AXIS_X+",
+                    FindingKind::Conflict,
+                    &["A_ONE", "A_TWO"]
+                ),
+                &owners
+            ),
+            Some(FindingTier::Hard)
+        );
+        // A mod action against a base action: Shared.
+        assert_eq!(
+            classify(
+                &finding("KEY_b", FindingKind::Conflict, &["B_ONE", "BASE_ONE"]),
+                &owners
+            ),
+            Some(FindingTier::Shared)
+        );
+        // Two mods, one action each: Shared, never Hard.
+        assert_eq!(
+            classify(
+                &finding("KEY_c", FindingKind::Conflict, &["B_ONE", "C_ONE"]),
+                &owners
+            ),
+            Some(FindingTier::Shared)
+        );
+        // No mod involved at all: Base.
+        assert_eq!(
+            classify(
+                &finding(
+                    "KEY_d",
+                    FindingKind::Conflict,
+                    &["BASE_ONE", "BASE_TWO"]
+                ),
+                &owners
+            ),
+            Some(FindingTier::Base)
+        );
+        // Warnings are not tiered.
+        assert_eq!(
+            classify(
+                &finding("KEY_e", FindingKind::Warning, &["A_ONE", "A_TWO"]),
+                &owners
+            ),
+            None
+        );
+    }
+
+    /// A second SYNTHETIC fixture, shaped like the
+    /// owner's file (duplicated declaration, root attrs,
+    /// several devices), carrying exactly one finding of
+    /// each tier plus two warnings on the keyboard.
+    const TIER_FIXTURE: &str = r#"<?xml version="1.0" encoding="utf-8" standalone="no" ?>
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<inputBinding version="24" bindingVersion="1" mouseSensitivityScaleX="1.000000" mouseSensitivityScaleY="1.000000">
+    <actionBinding action="A_ONE">
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_a" axisComponent="+" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="A_TWO">
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_a" axisComponent="+" neutralInput="0" index="1"></binding>
+        <binding device="0_XINPUT_GAMEPAD" input="BUTTON_1" axisComponent="+" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="B_ONE">
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_b" axisComponent="+" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="BASE_ONE">
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_b" axisComponent="+" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="C_ONE">
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_c" axisComponent="+" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="D_ONE">
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_c" axisComponent="+" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="BASE_TWO">
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_d" axisComponent="+" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="BASE_THREE">
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_d" axisComponent="+" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="A_THREE">
+        <binding device="KB_MOUSE_DEFAULT" input="AXIS_9" axisComponent="-" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="A_FOUR">
+        <binding device="KB_MOUSE_DEFAULT" input="AXIS_9" axisComponent="+" neutralInput="0" index="1"></binding>
+    </actionBinding>
+    <actionBinding action="A_FIVE">
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_e" axisComponent="+" neutralInput="0" index="1"></binding>
+        <binding device="KB_MOUSE_DEFAULT" input="KEY_e" axisComponent="+" neutralInput="0" index="2"></binding>
+    </actionBinding>
+</inputBinding>
+"#;
+
+    #[test]
+    fn tier_counts_partition_a_mixed_fixture() {
+        let owners = owners_of(&[
+            ("A_ONE", "Mod Alpha"),
+            ("A_TWO", "Mod Alpha"),
+            ("A_THREE", "Mod Alpha"),
+            ("A_FOUR", "Mod Alpha"),
+            ("A_FIVE", "Mod Alpha"),
+            ("B_ONE", "Mod Beta"),
+            ("C_ONE", "Mod Gamma"),
+            ("D_ONE", "Mod Delta"),
+        ]);
+        let doc = BindingsFile::parse(TIER_FIXTURE.to_string());
+        let actions = doc.actions();
+        let findings = analyze(&actions, "KB_MOUSE_DEFAULT");
+        let counts = tier_counts(&findings, &owners);
+        assert_eq!(counts.hard, 1);
+        assert_eq!(counts.shared, 2);
+        assert_eq!(counts.base, 1);
+        assert_eq!(counts.warnings, 2);
+        assert_eq!(counts.hard_mods, 1);
+        // The partition property: the tiers account for
+        // every Conflict finding exactly once.
+        let conflicts = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::Conflict)
+            .count();
+        assert_eq!(counts.hard + counts.shared + counts.base, conflicts);
+        // The gamepad has no findings in this fixture,
+        // so its tiers are an empty partition.
+        let pad = analyze(&actions, "0_XINPUT_GAMEPAD");
+        assert_eq!(tier_counts(&pad, &owners), TierCounts::default());
+        // And the banner over the keyboard counts.
+        let (line1, line2) = banner_lines(&counts);
+        assert_eq!(
+            line1,
+            "1 Hard Keybinding Conflicts Detected (Affecting 1 Mods)"
+        );
+        assert_eq!(
+            line2.as_deref(),
+            Some("2 Shared Keys Involving Mods · 1 Base Game Overlaps · 2 Warnings")
+        );
+    }
+
+    #[test]
+    fn banner_lines_calm_variant_and_empty_second_line() {
+        // No Hard findings: the calm headline, and the
+        // second line still reports what is there.
+        let (line1, line2) = banner_lines(&TierCounts {
+            hard: 0,
+            shared: 1,
+            base: 0,
+            warnings: 0,
+            hard_mods: 0,
+        });
+        assert_eq!(line1, "No hard keybinding conflicts on this device.");
+        assert_eq!(
+            line2.as_deref(),
+            Some("1 Shared Keys Involving Mods · 0 Base Game Overlaps · 0 Warnings")
+        );
+        // A completely clean device: no second line.
+        let (line1, line2) = banner_lines(&TierCounts::default());
+        assert_eq!(line1, "No hard keybinding conflicts on this device.");
+        assert_eq!(line2, None);
+    }
+
+    #[test]
+    fn auto_resolve_clears_only_hard_same_mod_pairs() {
+        let group: HashSet<String> = ["HORN".to_string(), "LIGHTS".to_string()]
+            .into_iter()
+            .collect();
+        // HORN and LIGHTS belong to the SAME mod: KEY_x
+        // is a Hard finding and the group is its owner
+        // group. The first in file order (HORN) keeps it,
+        // the pair's later holder (LIGHTS) is cleared.
+        let owners = owners_of(&[("HORN", "Horn Mod"), ("LIGHTS", "Horn Mod")]);
         let mut doc = BindingsFile::parse(FIXTURE.to_string());
-        let group: HashSet<String> = ["LIGHTS".to_string()].into_iter().collect();
-        let cleared = doc.auto_resolve("KB_MOUSE_DEFAULT", &group);
+        let cleared = doc.auto_resolve("KB_MOUSE_DEFAULT", &group, &owners);
         assert_eq!(cleared, 1);
         let actions = doc.actions();
         let lights = actions.iter().find(|a| a.name == "LIGHTS").unwrap();
@@ -958,20 +1480,38 @@ mod tests {
             .all(|b| !(b.device == "KB_MOUSE_DEFAULT" && b.input == "KEY_x")));
         // The wheel binding on LIGHTS was not touched.
         assert_eq!(lights.bindings.len(), 1);
-
-        // The group holds both: the first in file order
-        // (HORN) keeps it, LIGHTS is cleared — same count.
-        let mut doc = BindingsFile::parse(FIXTURE.to_string());
-        let group: HashSet<String> = ["HORN".to_string(), "LIGHTS".to_string()]
-            .into_iter()
-            .collect();
-        assert_eq!(doc.auto_resolve("KB_MOUSE_DEFAULT", &group), 1);
-        let actions = doc.actions();
         let horn = actions.iter().find(|a| a.name == "HORN").unwrap();
         assert_eq!(horn.bindings.len(), 1);
         // Warnings are never auto-resolved.
         let steer = actions.iter().find(|a| a.name == "STEER_LEFT").unwrap();
         assert_eq!(steer.bindings.len(), 1);
+
+        // The same two actions under DIFFERENT mods make
+        // KEY_x a Shared finding — nothing is cleared.
+        let owners = owners_of(&[("HORN", "Horn Mod"), ("LIGHTS", "Lights Mod")]);
+        let mut doc = BindingsFile::parse(FIXTURE.to_string());
+        assert_eq!(doc.auto_resolve("KB_MOUSE_DEFAULT", &group, &owners), 0);
+
+        // No owners at all: KEY_x is a Base finding —
+        // nothing is cleared either.
+        let mut doc = BindingsFile::parse(FIXTURE.to_string());
+        assert_eq!(
+            doc.auto_resolve("KB_MOUSE_DEFAULT", &group, &HashMap::new()),
+            0
+        );
+
+        // The pair's owner group is some OTHER group: a
+        // pass over a group that does not hold the whole
+        // pair (here: the Base Game group's actions)
+        // leaves the Hard finding alone.
+        let owners = owners_of(&[("HORN", "Horn Mod"), ("LIGHTS", "Horn Mod")]);
+        let other_group: HashSet<String> =
+            ["MOVE_FORWARD".to_string()].into_iter().collect();
+        let mut doc = BindingsFile::parse(FIXTURE.to_string());
+        assert_eq!(
+            doc.auto_resolve("KB_MOUSE_DEFAULT", &other_group, &owners),
+            0
+        );
     }
 
     #[test]
@@ -1038,5 +1578,203 @@ mod tests {
             fs_input_for_key(&Key::Named(Named::CapsLock), Location::Standard, none),
             None
         );
+    }
+
+    /// Ownership WITH states over the TIER_FIXTURE:
+    /// Mod Alpha active, Mod Beta archived, Mod Gamma
+    /// active, Mod Delta archived; the BASE_* actions are
+    /// unclaimed.
+    fn state_owners() -> HashMap<String, ActionOwner> {
+        let mk = |title: &str, state: KbOwnerState| ActionOwner {
+            title: title.to_string(),
+            category: None,
+            state,
+        };
+        [
+            ("A_ONE", mk("Mod Alpha", KbOwnerState::Active)),
+            ("A_TWO", mk("Mod Alpha", KbOwnerState::Active)),
+            ("A_THREE", mk("Mod Alpha", KbOwnerState::Active)),
+            ("A_FOUR", mk("Mod Alpha", KbOwnerState::Active)),
+            ("A_FIVE", mk("Mod Alpha", KbOwnerState::Active)),
+            ("B_ONE", mk("Mod Beta", KbOwnerState::Archived)),
+            ("C_ONE", mk("Mod Gamma", KbOwnerState::Active)),
+            ("D_ONE", mk("Mod Delta", KbOwnerState::Archived)),
+        ]
+        .into_iter()
+        .map(|(name, owner)| (name.to_string(), owner))
+        .collect()
+    }
+
+    #[test]
+    fn active_only_filter_recomputes_findings_and_banner() {
+        let owners = state_owners();
+        let doc = BindingsFile::parse(TIER_FIXTURE.to_string());
+        let all = doc.actions();
+
+        // Toggle off: the archived mods' actions are out
+        // of the analysis set entirely — not reclassified,
+        // not just hidden.
+        let visible = visible_actions(&all, &owners, false);
+        let names: Vec<&str> =
+            visible.iter().map(|a| a.name.as_str()).collect();
+        assert!(!names.contains(&"B_ONE"));
+        assert!(!names.contains(&"D_ONE"));
+        assert!(names.contains(&"A_ONE"));
+        assert!(names.contains(&"BASE_ONE"));
+        assert_eq!(visible.len(), all.len() - 2);
+        // The document itself is untouched by the view.
+        assert_eq!(doc.text(), TIER_FIXTURE);
+
+        // Findings over the visible set: KEY_b keeps only
+        // its base holder (no finding at all), KEY_c only
+        // its active holder; the Hard pair, the Base pair
+        // and both warnings survive exactly as they were.
+        let findings = analyze(&visible, "KB_MOUSE_DEFAULT");
+        let counts = tier_counts(&findings, &owner_titles(&owners));
+        assert_eq!(counts.hard, 1);
+        assert_eq!(counts.shared, 0);
+        assert_eq!(counts.base, 1);
+        assert_eq!(counts.warnings, 2);
+        assert_eq!(counts.hard_mods, 1);
+        // The partition still closes over what remains.
+        let conflicts = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::Conflict)
+            .count();
+        assert_eq!(counts.hard + counts.shared + counts.base, conflicts);
+        let (_, line2) = banner_lines(&counts);
+        assert_eq!(
+            line2.as_deref(),
+            Some("0 Shared Keys Involving Mods · 1 Base Game Overlaps · 2 Warnings")
+        );
+    }
+
+    #[test]
+    fn show_archived_on_matches_the_unfiltered_page() {
+        let owners = state_owners();
+        let doc = BindingsFile::parse(TIER_FIXTURE.to_string());
+        let all = doc.actions();
+        // Parity with v1.6.2: with the toggle on the
+        // visible set IS the document's action set, and
+        // the counts are the ones the tier partition test
+        // pins for this fixture.
+        let visible = visible_actions(&all, &owners, true);
+        assert_eq!(visible, all);
+        let findings = analyze(&visible, "KB_MOUSE_DEFAULT");
+        let counts = tier_counts(&findings, &owner_titles(&owners));
+        assert_eq!(counts.hard, 1);
+        assert_eq!(counts.shared, 2);
+        assert_eq!(counts.base, 1);
+        assert_eq!(counts.warnings, 2);
+        assert_eq!(counts.hard_mods, 1);
+    }
+
+    #[test]
+    fn purge_eligibility_is_archived_state_only() {
+        let owners = state_owners();
+        // Archived-owned: eligible.
+        assert!(is_purge_eligible("B_ONE", &owners));
+        assert!(is_purge_eligible("D_ONE", &owners));
+        // Active-owned: never.
+        assert!(!is_purge_eligible("A_ONE", &owners));
+        assert!(!is_purge_eligible("C_ONE", &owners));
+        // Unknown-owner (incl. base game): never.
+        assert!(!is_purge_eligible("BASE_ONE", &owners));
+        assert!(!is_purge_eligible("NOT_IN_THE_FILE", &owners));
+        // Other-state owned: never.
+        let mut owners = owners;
+        owners.insert(
+            "X_ONE".to_string(),
+            ActionOwner {
+                title: "Mod Xray".to_string(),
+                category: None,
+                state: KbOwnerState::Other,
+            },
+        );
+        assert!(!is_purge_eligible("X_ONE", &owners));
+        // With no archived owners at all, a purge stages
+        // nothing and changes no byte.
+        let no_archived: HashMap<String, ActionOwner> = owners
+            .into_iter()
+            .filter(|(_, o)| o.state != KbOwnerState::Archived)
+            .collect();
+        let mut doc = BindingsFile::parse(TIER_FIXTURE.to_string());
+        assert_eq!(doc.stage_purge(&no_archived), PurgeSummary::default());
+        assert_eq!(doc.text(), TIER_FIXTURE);
+    }
+
+    #[test]
+    fn purge_takes_only_archived_owned_blocks_byte_clean() {
+        let owners = state_owners();
+        let mut doc = BindingsFile::parse(TIER_FIXTURE.to_string());
+        // The count the first press reports in place.
+        assert_eq!(
+            purge_summary(&doc.actions(), &owners),
+            PurgeSummary {
+                actions: 2,
+                mods: 2
+            }
+        );
+        assert_eq!(
+            purge_candidates(&doc.actions(), &owners),
+            vec!["B_ONE".to_string(), "D_ONE".to_string()]
+        );
+
+        let staged = doc.stage_purge(&owners);
+        assert_eq!(
+            staged,
+            PurgeSummary {
+                actions: 2,
+                mods: 2
+            }
+        );
+
+        // Byte-exact expectation: the fixture with the
+        // B_ONE and D_ONE blocks (each with its line) cut,
+        // and every other byte where it was.
+        let b_block = "    <actionBinding action=\"B_ONE\">\n        <binding device=\"KB_MOUSE_DEFAULT\" input=\"KEY_b\" axisComponent=\"+\" neutralInput=\"0\" index=\"1\"></binding>\n    </actionBinding>\n";
+        let d_block = "    <actionBinding action=\"D_ONE\">\n        <binding device=\"KB_MOUSE_DEFAULT\" input=\"KEY_c\" axisComponent=\"+\" neutralInput=\"0\" index=\"1\"></binding>\n    </actionBinding>\n";
+        let expected = TIER_FIXTURE.replace(b_block, "").replace(d_block, "");
+        assert_eq!(doc.text(), expected);
+
+        // Active-owned, base and unknown actions survive;
+        // the purged ones are out of the document.
+        let names: Vec<String> =
+            doc.actions().into_iter().map(|a| a.name).collect();
+        for kept in [
+            "A_ONE",
+            "A_TWO",
+            "A_THREE",
+            "A_FOUR",
+            "A_FIVE",
+            "C_ONE",
+            "BASE_ONE",
+            "BASE_TWO",
+            "BASE_THREE",
+        ] {
+            assert!(
+                names.iter().any(|n| n == kept),
+                "{kept} must survive the purge"
+            );
+        }
+        assert!(!names.iter().any(|n| n == "B_ONE"));
+        assert!(!names.iter().any(|n| n == "D_ONE"));
+
+        // A second purge on the staged document finds
+        // nothing left to take and changes nothing.
+        assert_eq!(doc.stage_purge(&owners), PurgeSummary::default());
+        assert_eq!(doc.text(), expected);
+    }
+
+    #[test]
+    fn remove_action_block_cuts_one_block_and_reports_misses() {
+        let mut doc = BindingsFile::parse(FIXTURE.to_string());
+        assert!(doc.remove_action_block("HORN"));
+        let horn_block = "    <actionBinding action=\"HORN\">\n        <binding device=\"KB_MOUSE_DEFAULT\" input=\"KEY_x\" axisComponent=\"+\" neutralInput=\"0\" index=\"1\"></binding>\n    </actionBinding>\n";
+        assert_eq!(doc.text(), FIXTURE.replace(horn_block, ""));
+        assert_eq!(doc.actions().len(), 6);
+        // Already gone, or never there: a clean miss.
+        assert!(!doc.remove_action_block("HORN"));
+        assert!(!doc.remove_action_block("NEVER_THERE"));
     }
 }
