@@ -710,6 +710,13 @@ pub enum Message {
     /// Layout page: arm, then (second press) roll the
     /// recorded migration back in the background.
     LayoutRollback,
+    /// Layout page, Reclaim section: take the read-only
+    /// census of reclaimable space (backups beyond the
+    /// newest, exact duplicate copies).
+    ReclaimMeasure,
+    /// Layout page, Reclaim section: arm, then (second
+    /// press) run the reclaim the census describes.
+    ReclaimRun,
     /// One event from a Layout background job.
     LayoutEvent(LayoutEvent),
     WindowResized(iced::Size),

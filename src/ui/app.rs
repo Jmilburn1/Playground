@@ -848,6 +848,11 @@ pub struct App {
     /// the second executes.
     layout_arm_apply: bool,
     layout_arm_rollback: bool,
+    /// The Reclaim section's census (Layout page), its
+    /// arm-to-confirm flag, and its last run's result.
+    reclaim: Option<crate::mod_manager::reclaim::ReclaimCensus>,
+    reclaim_arm: bool,
+    reclaim_outcome: Option<String>,
     /// The in-flight Layout job and its op counts
     /// (apply only — rollback reports no counts).
     layout_running: Option<LayoutRun>,
@@ -1057,6 +1062,9 @@ impl App {
             layout_preview: None,
             layout_arm_apply: false,
             layout_arm_rollback: false,
+            reclaim: None,
+            reclaim_arm: false,
+            reclaim_outcome: None,
             layout_running: None,
             layout_done: 0,
             layout_total: 0,
@@ -2536,6 +2544,28 @@ impl App {
                 self.wizard_arm_apply = false;
                 self.refresh_save_slots();
             }
+            Message::ReclaimMeasure => {
+                // Read-only, like Build plan: census the
+                // two pools and show the counts. A fresh
+                // measure always disarms a pending run.
+                self.reclaim_arm = false;
+                self.reclaim_outcome = None;
+                self.reclaim = Some(self.build_reclaim_census());
+            }
+            Message::ReclaimRun => {
+                if self.layout_running.is_some() {
+                    return Task::none();
+                }
+                if !self.reclaim_arm {
+                    // First press arms only — the button's
+                    // label restates the census counts, so
+                    // the approval is for THIS census's work.
+                    self.reclaim_arm = true;
+                    return Task::none();
+                }
+                self.reclaim_arm = false;
+                self.execute_reclaim();
+            }
             Message::LayoutBuildPlan => {
                 if self.layout_running.is_some() {
                     self.status =
@@ -3759,6 +3789,7 @@ impl App {
                     self.refresh_layout_standing();
                     self.layout_arm_apply = false;
                     self.layout_arm_rollback = false;
+                    self.reclaim_arm = false;
                 }
                 self.current_tab = tab;
                 if tab == Tab::Keybindings {
@@ -7816,6 +7847,107 @@ impl App {
             }
         }
 
+        // ---- Reclaim disk space -------------------------
+        col = col.push(text("Reclaim disk space").size(15));
+        col = col.push(
+            text("Two pools: backups — every backup family the app keeps is pruned to its newest entry — and exact duplicate mods (same file name, same version), reduced to one copy. Measuring is read-only; nothing is deleted until the armed Reclaim button is pressed.")
+                .size(12)
+                .width(Length::Fill),
+        );
+        match &self.reclaim {
+            None => {
+                let mut b = button(text("Measure reclaimable space")).style(theme::nav_pill(true));
+                if !busy && !self.loading {
+                    b = b.on_press(Message::ReclaimMeasure);
+                }
+                col = col.push(b);
+            }
+            Some(census) => {
+                for family in &census.families {
+                    let prunable = family.prunable().len();
+                    let line = if prunable == 0 {
+                        format!(
+                            "{}: {} — nothing older to prune.",
+                            family.label,
+                            if family.entries.len() == 1 {
+                                "1 backup kept".to_string()
+                            } else {
+                                format!("{} backups kept", family.entries.len())
+                            }
+                        )
+                    } else {
+                        let mut line = format!(
+                            "{}: {} old copie(s) beyond the newest — {} prunable.",
+                            family.label,
+                            prunable,
+                            format_size(family.prunable_bytes())
+                        );
+                        if family.entries.len() - 1 - prunable > 0 {
+                            line.push_str(" The recorded rollback backup is kept too.");
+                        }
+                        line
+                    };
+                    col = col.push(text(line).size(13).width(Length::Fill));
+                }
+                let dup_copies = census.duplicate_copies();
+                let dup_line = if dup_copies == 0 {
+                    "Duplicate mods: none — every file name and version has exactly one copy."
+                        .to_string()
+                } else {
+                    format!(
+                        "Duplicate mods: {} extra copie(s) across {} set(s) — {}.",
+                        dup_copies,
+                        census.dup_sets.len(),
+                        format_size(census.duplicate_bytes())
+                    )
+                };
+                col = col.push(text(dup_line).size(13).width(Length::Fill));
+                if census.is_empty() {
+                    col = col.push(text("Nothing to reclaim.").size(13));
+                } else {
+                    col = col.push(
+                        text(format!(
+                            "What Reclaim will do — read it before you approve: permanently delete {} old backup(s) ({}) and {} duplicate mod copie(s) ({}). The newest backup in every family stays, and one copy of every duplicate stays — the Active copy where there is one. This cannot be undone from inside Playground.",
+                            census.prunable_backups(),
+                            format_size(census.prunable_backup_bytes()),
+                            dup_copies,
+                            format_size(census.duplicate_bytes())
+                        ))
+                        .size(13)
+                        .width(Length::Fill),
+                    );
+                    let reclaim_btn = if self.reclaim_arm {
+                        button(centered_label(
+                            text(format!(
+                                "Click again to reclaim: {} backup(s), {} copie(s) — {}",
+                                census.prunable_backups(),
+                                dup_copies,
+                                format_size(census.total_bytes())
+                            ))
+                            .size(14),
+                        ))
+                        .width(Length::Fill)
+                        .style(theme::danger_pill())
+                        .on_press(Message::ReclaimRun)
+                    } else {
+                        button(centered_label(text("Reclaim this space").size(14)))
+                            .width(Length::Fill)
+                            .style(theme::nav_pill(false))
+                            .on_press(Message::ReclaimRun)
+                    };
+                    col = col.push(reclaim_btn);
+                }
+                let mut again = button(text("Re-measure")).style(theme::nav_pill(true));
+                if !busy && !self.loading {
+                    again = again.on_press(Message::ReclaimMeasure);
+                }
+                col = col.push(again);
+            }
+        }
+        if let Some(outcome) = &self.reclaim_outcome {
+            col = col.push(text(outcome.clone()).size(13).width(Length::Fill));
+        }
+
         // ---- The last run's result -----------------------
         if let Some(outcome) = &self.layout_outcome {
             col = col.push(text(outcome.clone()).size(13).width(Length::Fill));
@@ -7833,6 +7965,128 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// The Reclaim census over the app's two pools
+    /// (owner ruling, 2026-10-23): backups beyond each
+    /// family's newest, and exact duplicate copies. The
+    /// recorded migration's backup is protected wherever
+    /// it sits in its family.
+    fn build_reclaim_census(&self) -> crate::mod_manager::reclaim::ReclaimCensus {
+        use crate::mod_manager::reclaim;
+        let profile = self.mod_manager.profile_dir();
+        let protected = match &self.layout_standing {
+            Some(Some(state)) => Some(state.backup_root.clone()),
+            _ => None,
+        };
+        let families = reclaim::census_backups(
+            profile.as_deref(),
+            crate::paths::data_dir().as_deref(),
+            self.mod_manager.get_active_dir(),
+            protected.as_deref(),
+        );
+        let mods = self.mod_manager.get_mods();
+        let dup_sets = reclaim::census_duplicates(mods, self.mod_manager.get_archive_dir());
+        reclaim::ReclaimCensus {
+            families,
+            dup_sets,
+        }
+    }
+
+    /// Execute the armed reclaim: prune the families on
+    /// the filesystem, remove the duplicate copies
+    /// through the manager (so the library database,
+    /// the icons and the conflicts all stay true), and
+    /// write the run's record to the logs folder.
+    fn execute_reclaim(&mut self) {
+        use crate::mod_manager::reclaim;
+        let Some(census) = self.reclaim.clone() else {
+            return;
+        };
+        let mut log: Vec<String> = vec![format!(
+            "Playground reclaim — {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        )];
+        let mut errors: Vec<String> = Vec::new();
+        let mut backups_removed = 0usize;
+        let mut backup_bytes = 0u64;
+        for family in &census.families {
+            let outcome = reclaim::prune_family(family);
+            backups_removed += outcome.removed;
+            backup_bytes += outcome.bytes;
+            log.push(format!(
+                "[backups] {}: removed {}, freed {}",
+                family.label,
+                outcome.removed,
+                format_size(outcome.bytes)
+            ));
+            for e in &outcome.errors {
+                log.push(format!("[backups] error: {}", e));
+            }
+            errors.extend(outcome.errors);
+        }
+        let mut dups_removed = 0usize;
+        let mut dup_bytes = 0u64;
+        for set in &census.dup_sets {
+            for (id, path, size) in &set.remove {
+                match self.mod_manager.remove_mod(id) {
+                    Ok(()) => {
+                        dups_removed += 1;
+                        dup_bytes += size;
+                        self.icons.remove(id);
+                        if self.selected_mod.as_deref() == Some(id.as_str()) {
+                            self.selected_mod = None;
+                        }
+                        log.push(format!(
+                            "[duplicate] removed {} (kept {})",
+                            path.display(),
+                            set.keep_path.display()
+                        ));
+                    }
+                    Err(e) => {
+                        let msg = format!("{}: {}", path.display(), e);
+                        log.push(format!("[duplicate] error: {}", msg));
+                        errors.push(msg);
+                    }
+                }
+            }
+        }
+        if dups_removed > 0 {
+            self.recompute_conflicts();
+        }
+        let total = backup_bytes + dup_bytes;
+        log.push(format!(
+            "[total] {} backup(s), {} duplicate copie(s), {} freed, {} error(s)",
+            backups_removed,
+            dups_removed,
+            format_size(total),
+            errors.len()
+        ));
+        if let Some(dir) = crate::paths::data_dir() {
+            let logs = dir.join("logs");
+            let _ = std::fs::create_dir_all(&logs);
+            let name = format!(
+                "reclaim-{}.log",
+                chrono::Local::now().format("%Y%m%d-%H%M%S")
+            );
+            let _ = std::fs::write(logs.join(name), log.join("\n"));
+        }
+        let mut outcome = format!(
+            "Reclaimed {}: deleted {} old backup(s) and {} duplicate copie(s).",
+            format_size(total),
+            backups_removed,
+            dups_removed
+        );
+        if !errors.is_empty() {
+            outcome.push_str(&format!(
+                " {} could not be deleted — see the newest reclaim log in the logs folder.",
+                errors.len()
+            ));
+        }
+        self.status = outcome.clone();
+        self.reclaim_outcome = Some(outcome);
+        // Re-measure so the section tells the new truth.
+        self.reclaim = Some(self.build_reclaim_census());
     }
 
     /// (Re)load the Keybindings page's staged document
@@ -8993,7 +9247,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.6.7  © 2026 Farmer Jay.")
+            text("V1.6.8  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),

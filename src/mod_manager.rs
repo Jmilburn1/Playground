@@ -12,6 +12,7 @@ pub mod savegame;
 pub mod game_files;
 pub mod keybindings;
 pub mod gamescreens;
+pub mod reclaim;
 
 use crate::config::Config;
 
