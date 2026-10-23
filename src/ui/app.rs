@@ -8211,7 +8211,9 @@ impl App {
                     );
                 }
             }
-            return col.push(self.gs_backups_box()).into();
+            return page_scroll(col.push(self.gs_backups_box()))
+                .height(Length::Fill)
+                .into();
         }
         // Current screen.
         let mut current = column![text("Current screen").size(15)].spacing(7);
@@ -8364,9 +8366,17 @@ impl App {
             .padding(11)
             .style(wizard_section_box);
 
-        column![title, current_box, choose_box, self.gs_backups_box()]
-            .spacing(10)
-            .into()
+        // Wrapped in page_scroll like every other page:
+        // this page shipped (v1.6.3) as a bare column, so
+        // at shorter window heights its tail — the Backups
+        // box — slid under the status slab with no
+        // scrollbar to reach it (John, live, 2026-10-23).
+        page_scroll(
+            column![title, current_box, choose_box, self.gs_backups_box()]
+                .spacing(10),
+        )
+        .height(Length::Fill)
+        .into()
     }
 
     /// The Keybindings page: device tabs over collapsible
@@ -8609,10 +8619,46 @@ impl App {
                             } else {
                                 keybindings::humanize_input(&binding.input)
                             };
-                            let mut chip =
-                                button(text(label).size(12)).style(
-                                    theme::nav_pill(capturing),
-                                );
+                            // A binding whose every token has a
+                            // keycap wears the caps; anything
+                            // else (axes, gamepad tokens, names
+                            // with no cap drawn) keeps the text
+                            // chip.
+                            let caps = if capturing {
+                                None
+                            } else {
+                                crate::ui::keycaps::binding_caps(&binding.input)
+                            };
+                            let mut chip = match caps {
+                                Some(caps) => {
+                                    let mut caps_row = row![]
+                                        .spacing(3)
+                                        .align_y(iced::Alignment::Center);
+                                    for (i, cap) in caps.iter().enumerate() {
+                                        if i > 0 {
+                                            caps_row = caps_row.push(
+                                                text("+")
+                                                    .size(11)
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                        }
+                                        caps_row = caps_row.push(
+                                            iced::widget::image(
+                                                cap.handle.clone(),
+                                            )
+                                            .width(Length::Fixed(
+                                                22.0 * cap.units.min(3.0),
+                                            ))
+                                            .height(Length::Fixed(22.0))
+                                            .content_fit(iced::ContentFit::Fill),
+                                        );
+                                    }
+                                    button(caps_row)
+                                        .style(theme::nav_pill(capturing))
+                                }
+                                None => button(text(label).size(12))
+                                    .style(theme::nav_pill(capturing)),
+                            };
                             if is_keyboard {
                                 chip = chip.on_press(
                                     Message::KeybindingsCaptureStart(
@@ -8843,7 +8889,7 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.6.5  © 2026 Farmer Jay.")
+            text("V1.6.6  © 2026 Farmer Jay.")
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),

@@ -11,6 +11,7 @@ pub mod saves;
 pub mod savegame;
 pub mod game_files;
 pub mod keybindings;
+pub mod gamescreens;
 
 use crate::config::Config;
 
