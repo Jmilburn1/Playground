@@ -121,6 +121,12 @@ pub struct Settings {
     /// log.txt lines the Log Reader keeps for display.
     #[serde(default = "default_log_lines_cap")]
     pub log_lines_cap: usize,
+    /// The UI theme id (themes, 2026-10-23): one of
+    /// ui::theme::THEMES' ids; "gunmetal" is the default
+    /// the app wears out of the box. Picked on the
+    /// Settings page, applied live — no restart.
+    #[serde(default = "default_ui_theme")]
+    pub ui_theme: String,
     /// Settings Round 2 (General): the Launch Configuration
     /// — the game-start settings Playground keeps and the
     /// command they compose. Playground never runs the
@@ -147,6 +153,11 @@ fn default_browse_default_view() -> String {
 /// Serde default for Settings::fill_log_keep.
 fn default_fill_log_keep() -> usize {
     10
+}
+
+/// Serde default for Settings::ui_theme.
+fn default_ui_theme() -> String {
+    "gunmetal".to_string()
 }
 
 /// Serde default for Settings::log_lines_cap.
@@ -364,6 +375,7 @@ impl Config {
                 fill_log_keep: 10,
                 log_errors_only_default: false,
                 log_lines_cap: 3000,
+                ui_theme: default_ui_theme(),
                 launch: LaunchConfig::default(),
             },
         }

@@ -999,6 +999,17 @@ impl ModManager {
         self.config.save()
     }
 
+    /// The stored UI theme id (themes, 2026-10-23).
+    pub fn ui_theme(&self) -> &str {
+        &self.config.settings.ui_theme
+    }
+
+    /// Remember the UI theme id; persists to the config.
+    pub fn set_ui_theme(&mut self, id: &str) -> Result<()> {
+        self.config.settings.ui_theme = id.to_string();
+        self.config.save()
+    }
+
     pub fn add_directory(&mut self, path: PathBuf) -> Result<()> {
         if !path.exists() {
             std::fs::create_dir_all(&path)?;
@@ -1842,6 +1853,7 @@ mod tests {
                 fill_log_keep: 10,
                 log_errors_only_default: false,
                 log_lines_cap: 3000,
+                ui_theme: "gunmetal".to_string(),
                 launch: crate::config::LaunchConfig::default(),
             },
         };
@@ -1908,6 +1920,7 @@ mod tests {
                 fill_log_keep: 10,
                 log_errors_only_default: false,
                 log_lines_cap: 3000,
+                ui_theme: "gunmetal".to_string(),
                 launch: crate::config::LaunchConfig::default(),
             },
         }

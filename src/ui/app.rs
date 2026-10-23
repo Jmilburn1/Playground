@@ -213,7 +213,7 @@ fn fmt_money(v: i64) -> String {
 /// wizard's sections and summary blocks.
 fn wizard_panel(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(iced::Background::Color(theme::PANEL)),
+        background: Some(iced::Background::Color(theme::panel())),
         border: iced::Border {
             color: iced::Color::TRANSPARENT,
             width: 0.0,
@@ -227,7 +227,7 @@ fn wizard_panel(_theme: &Theme) -> container::Style {
 /// the near-black base, so it reads as a well in the panel.
 fn wizard_inset(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(iced::Background::Color(theme::BASE)),
+        background: Some(iced::Background::Color(theme::base())),
         border: iced::Border {
             color: iced::Color::TRANSPARENT,
             width: 0.0,
@@ -246,7 +246,7 @@ fn wizard_inset(_theme: &Theme) -> container::Style {
 /// which this ruling does not reach.
 fn wizard_section_box(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(iced::Background::Color(theme::BASE)),
+        background: Some(iced::Background::Color(theme::base())),
         border: iced::Border {
             color: iced::Color::TRANSPARENT,
             width: 0.0,
@@ -261,7 +261,7 @@ fn wizard_section<'a>(
     title: &'a str,
     body: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let mut col = column![text(title).size(15).color(theme::TEXT)].spacing(7);
+    let mut col = column![text(title).size(15).color(theme::text())].spacing(7);
     for el in body {
         col = col.push(el);
     }
@@ -291,7 +291,7 @@ fn wizard_opt_row<'a>(
 /// column so the controls line up down the page.
 fn wizard_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
     row![
-        text(label).size(13).color(theme::TEXT).width(200),
+        text(label).size(13).color(theme::text()).width(200),
         control,
     ]
     .spacing(10)
@@ -303,8 +303,8 @@ fn wizard_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, 
 /// that would invent it (owner ruling, 2026-10-21).
 fn wizard_absent<'a>(label: &'a str) -> Element<'a, Message> {
     row![
-        text(label).size(13).color(theme::TEXT_DIM).width(200),
-        text("Not in this save yet").size(12).color(theme::TEXT_DIM),
+        text(label).size(13).color(theme::text_dim()).width(200),
+        text("Not in this save yet").size(12).color(theme::text_dim()),
     ]
     .spacing(10)
     .into()
@@ -648,6 +648,24 @@ pub struct App {
     shown_counts: HashMap<&'static str, (f32, usize)>,
     eased_bars: HashMap<String, f32>,
     hovered_card: Option<String>,
+    /// Feel pass part 2 (2026-10-23): the status line's
+    /// fade state — the last status the animation clock
+    /// has seen, and when the current one arrived.
+    status_seen: String,
+    status_changed_at: std::time::Instant,
+    /// When the details panel / the Show: menu last
+    /// opened — their settle offsets decay from these.
+    details_opened_at: std::time::Instant,
+    menu_opened_at: std::time::Instant,
+    /// Smooth scrolling (feel pass part 2): the grid's
+    /// eased offset. grid_offset stays the target the
+    /// scrollable reports; grid_shown is what renders,
+    /// gliding toward the target while the clock issues
+    /// the matching scroll_to. grid_self_scroll marks
+    /// the echo of our own scroll_to so it is never
+    /// mistaken for the user's own scroll.
+    grid_shown: f32,
+    grid_self_scroll: bool,
     conflicts: Vec<Conflict>,
     icons: HashMap<String, ImageHandle>,
     active_dir_input: String,
@@ -919,6 +937,10 @@ pub struct App {
 
 impl App {
     pub fn new(mod_manager: ModManager) -> Self {
+        // Wear the stored theme from the first frame
+        // (themes, 2026-10-23): an unknown id leaves the
+        // Gunmetal default standing.
+        theme::set_theme(mod_manager.ui_theme());
         let active_dir_input = mod_manager.get_active_dir().display().to_string();
         let archive_dir_input = mod_manager.get_archive_dir().display().to_string();
         let game_dir_input = mod_manager
@@ -982,6 +1004,12 @@ impl App {
             shown_counts: HashMap::new(),
             eased_bars: HashMap::new(),
             hovered_card: None,
+            status_seen: String::new(),
+            status_changed_at: std::time::Instant::now(),
+            details_opened_at: std::time::Instant::now(),
+            menu_opened_at: std::time::Instant::now(),
+            grid_shown: 0.0,
+            grid_self_scroll: false,
             conflicts: Vec::new(),
             icons: HashMap::new(),
             active_dir_input,
@@ -3804,6 +3832,8 @@ impl App {
                 self.show_menu_open = false;
                 self.search_query = query;
                 self.grid_offset = 0.0;
+                self.grid_shown = 0.0;
+                self.grid_self_scroll = false;
                 return iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("grid"),
                     iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
@@ -3815,6 +3845,8 @@ impl App {
                 self.view_filter = view;
                 self.favorites_only = false;
                 self.grid_offset = 0.0;
+                self.grid_shown = 0.0;
+                self.grid_self_scroll = false;
                 return iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("grid"),
                     iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
@@ -3858,6 +3890,8 @@ impl App {
                 self.show_menu_open = false;
                 self.view_filter = view;
                 self.grid_offset = 0.0;
+                self.grid_shown = 0.0;
+                self.grid_self_scroll = false;
                 return iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("grid"),
                     iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
@@ -3885,6 +3919,12 @@ impl App {
                             .modhub_link(&stem)
                             .map(|s| s.to_string())
                             .unwrap_or_default();
+                    }
+                    if self.selected_mod.as_deref() != Some(id.as_str()) {
+                        // A fresh panel settles in (feel
+                        // pass part 2).
+                        self.details_opened_at = std::time::Instant::now();
+                        self.kick_anim();
                     }
                     self.selected_mod = Some(id);
                 }
@@ -3993,6 +4033,14 @@ impl App {
                 // The feel pass's shared clock: settle
                 // every live animation a step.
                 let now = std::time::Instant::now();
+                // Status fade-in (part 2): a status the
+                // clock has not seen yet arrived since the
+                // last tick — stamp it, and its alpha ramps
+                // from the stamp in the status row.
+                if self.status != self.status_seen {
+                    self.status_seen = self.status.clone();
+                    self.status_changed_at = now;
+                }
                 self.switch_anims
                     .retain(|_, a| now.duration_since(a.started) < SWITCH_ANIM_DUR);
                 // Rolling counts travel a third of the
@@ -4033,14 +4081,45 @@ impl App {
                 }
                 self.eased_bars
                     .retain(|k, _| k == "layout" || live_keys.contains(k));
+                // Smooth scrolling (part 2): the rendered
+                // offset glides a step toward the target
+                // the scrollable reported, and the
+                // scrollable is moved to match — its echo
+                // comes back flagged, never a new target.
+                let mut grid_scroll_task = None;
+                let grid_diff = self.grid_offset - self.grid_shown;
+                if grid_diff.abs() > 0.5 {
+                    self.grid_shown += grid_diff * 0.35;
+                    if (self.grid_offset - self.grid_shown).abs() <= 0.5 {
+                        self.grid_shown = self.grid_offset;
+                    }
+                    self.grid_self_scroll = true;
+                    grid_scroll_task = Some(iced::widget::scrollable::scroll_to(
+                        iced::widget::scrollable::Id::new("grid"),
+                        iced::widget::scrollable::AbsoluteOffset {
+                            x: 0.0,
+                            y: self.grid_shown,
+                        },
+                    ));
+                }
                 // The clock lives while anything travels
                 // or a job runs (the pulse needs it too).
                 if traveling
                     || !self.switch_anims.is_empty()
                     || self.layout_running.is_some()
                     || self.downloads.live_count() > 0
+                    || grid_scroll_task.is_some()
+                    || self.status_changed_at.elapsed()
+                        < std::time::Duration::from_millis(220)
+                    || self.details_opened_at.elapsed()
+                        < std::time::Duration::from_millis(160)
+                    || self.menu_opened_at.elapsed()
+                        < std::time::Duration::from_millis(160)
                 {
                     self.anim_until = now + ANIM_TAIL;
+                }
+                if let Some(task) = grid_scroll_task {
+                    return task;
                 }
             }
             Message::CardHover(id) => {
@@ -4077,6 +4156,27 @@ impl App {
                 };
                 if let Some(source) = entries.get_mut(index) {
                     source.enabled = enabled;
+                }
+            }
+            Message::ThemeSelected(id) => {
+                // Themes apply live and persist at once
+                // (themes, 2026-10-23) — deliberately NOT
+                // staged behind the page's Save settings:
+                // a theme you cannot see while choosing is
+                // no choice at all.
+                if theme::set_theme(&id) {
+                    let name = theme::current_theme().name;
+                    match self.mod_manager.set_ui_theme(&id) {
+                        Ok(()) => {
+                            self.status = format!("Theme: {} — applied and saved.", name)
+                        }
+                        Err(e) => {
+                            self.status = format!(
+                                "Theme: {} — applied, but saving it failed: {}",
+                                name, e
+                            )
+                        }
+                    }
                 }
             }
             Message::SettingsTabSelected(tab) => {
@@ -4529,11 +4629,55 @@ impl App {
                 }
             }
             Message::ToggleShowMenu => {
-                self.show_menu_open = !self.show_menu_open
+                self.show_menu_open = !self.show_menu_open;
+                if self.show_menu_open {
+                    // A fresh menu settles in (feel pass
+                    // part 2).
+                    self.menu_opened_at = std::time::Instant::now();
+                    self.kick_anim();
+                }
             }
             Message::GridScrolled(viewport) => {
-                self.grid_offset = viewport.absolute_offset().y;
+                let y = viewport.absolute_offset().y;
                 self.grid_view_h = viewport.bounds().height;
+                if self.grid_self_scroll {
+                    // The echo of the clock's own scroll_to:
+                    // it confirms where the eased rendering
+                    // already is, and must not move the
+                    // target (smooth scrolling, part 2).
+                    self.grid_self_scroll = false;
+                    self.grid_shown = y;
+                } else {
+                    self.grid_offset = y;
+                    let diff = self.grid_offset - self.grid_shown;
+                    // A jump of most of the viewport — a
+                    // scrollbar haul, a page leap — snaps;
+                    // easing it would fight the hand on the
+                    // bar. Ordinary wheel travel glides: the
+                    // first eased step is issued right here,
+                    // before the next frame can paint the
+                    // un-eased position the wheel reported.
+                    let snap = (self.grid_view_h * 0.75).max(CARD_H + GRID_SPACING);
+                    if diff.abs() > snap {
+                        self.grid_shown = self.grid_offset;
+                    } else if diff.abs() > 0.5 {
+                        self.grid_shown += diff * 0.35;
+                        if (self.grid_offset - self.grid_shown).abs() <= 0.5 {
+                            self.grid_shown = self.grid_offset;
+                        }
+                        self.grid_self_scroll = true;
+                        self.kick_anim();
+                        return iced::widget::scrollable::scroll_to(
+                            iced::widget::scrollable::Id::new("grid"),
+                            iced::widget::scrollable::AbsoluteOffset {
+                                x: 0.0,
+                                y: self.grid_shown,
+                            },
+                        );
+                    } else {
+                        self.grid_shown = self.grid_offset;
+                    }
+                }
             }
         }
 
@@ -4693,16 +4837,10 @@ impl App {
             // ui::theme, not the old flat grey.
             .style(theme::dropdown_field()),
             text_input("Search mods...", &self.search_query)
+                .style(theme::input_field())
                 .on_input(Message::SearchChanged)
                 .padding(8)
                 .width(300)
-                .style(|theme, status| {
-                    let mut s = text_input::default(theme, status);
-                    s.border.radius = 8.0.into();
-                    s.border.width = 1.0;
-                    s.border.color = iced::Color::from_rgb(0.35, 0.36, 0.40);
-                    s
-                }),
         ]
         .spacing(8);
         let pane_open = self
@@ -4791,7 +4929,12 @@ impl App {
                 (self.window_size.height - 216.0).max(CARD_H)
             };
             const BUFFER_ROWS: usize = 3;
-            let first_row = ((self.grid_offset / pitch).floor() as usize)
+            // The window renders from the EASED offset
+            // (smooth scrolling, part 2); the scrollable
+            // itself is stepped to the same place by the
+            // animation clock, so window and scrollbar
+            // agree frame by frame.
+            let first_row = ((self.grid_shown / pitch).floor() as usize)
                 .saturating_sub(BUFFER_ROWS)
                 .min(rows_total);
             let visible_rows = (view_h / pitch).ceil() as usize + 1;
@@ -4889,17 +5032,23 @@ impl App {
                     options_col.into()
                 };
             Some(
-                row![
-                    Space::with_width(52),
-                    container(menu_inner).padding(4).style(|_| container::Style {
-                        background: Some(iced::Background::Color(theme::BASE)),
-                        border: iced::Border {
-                            color: iced::Color::from_rgb(0.35, 0.36, 0.40),
-                            width: 1.0,
-                            radius: 4.0.into(),
-                        },
-                        ..Default::default()
-                    }),
+                column![
+                    // The settle (feel pass part 2): the
+                    // menu opens a few pixels low and eases
+                    // up into place over ~160ms.
+                    Space::with_height(self.settle_offset(self.menu_opened_at)),
+                    row![
+                        Space::with_width(52),
+                        container(menu_inner).padding(4).style(|_| container::Style {
+                            background: Some(iced::Background::Color(theme::base())),
+                            border: iced::Border {
+                                color: iced::Color::from_rgb(0.35, 0.36, 0.40),
+                                width: 1.0,
+                                radius: 4.0.into(),
+                            },
+                            ..Default::default()
+                        }),
+                    ],
                 ]
                 .into(),
             )
@@ -4957,6 +5106,10 @@ impl App {
         .on_press(Message::CloseDetails);
 
         let mut col = column![
+            // The settle (feel pass part 2): the panel's
+            // contents open a few pixels low and ease up
+            // into place over ~160ms.
+            Space::with_height(self.settle_offset(self.details_opened_at)),
             row![close_btn, text(&m.name).size(20)]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
@@ -5254,11 +5407,17 @@ impl App {
         } else {
             "Remove mod"
         };
+        // Hold polish (feel pass part 2): as the hold
+        // fills, the control squeezes — its label steps
+        // down a point, its sides step in, and the red
+        // brightens toward the hover shade — so the
+        // press reads as pressure, not just a timer.
+        let hold_p = self.remove_hold_progress(&m.id);
         let remove_control = mouse_area(
             container(
                 column![
-                    centered_label(text(remove_label).size(14)),
-                    progress_bar(0.0..=1.0, self.remove_hold_progress(&m.id))
+                    centered_label(text(remove_label).size(14.0 - hold_p)),
+                    progress_bar(0.0..=1.0, hold_p)
                         .height(4)
                         .style(theme::hold_bar),
                 ]
@@ -5267,11 +5426,11 @@ impl App {
             .width(Length::Fill)
             .padding(iced::Padding {
                 top: 8.0,
-                right: 12.0,
+                right: 12.0 + 5.0 * hold_p,
                 bottom: 8.0,
-                left: 12.0,
+                left: 12.0 + 5.0 * hold_p,
             })
-            .style(theme::danger_box),
+            .style(theme::danger_box_hold(hold_p)),
         )
         .on_press(Message::RemoveHoldStarted(m.id.clone()))
         .on_release(Message::RemoveHoldReleased)
@@ -5301,6 +5460,7 @@ impl App {
         col = col.push(
             row![
                 text_input("owner/repo or repo URL", &self.link_input)
+                    .style(theme::input_field())
                     .on_input(Message::LinkInputChanged)
                     .size(13),
                 button(text(if linked.is_some() { "Save link" } else { "Link" }).size(13))
@@ -5313,6 +5473,7 @@ impl App {
         col = col.push(
             row![
                 text_input("ModHub page URL or mod id", &self.modhub_input)
+                    .style(theme::input_field())
                     .on_input(Message::ModHubInputChanged)
                     .size(13),
                 button(text(if mh_linked.is_some() { "Save link" } else { "Link" }).size(13))
@@ -5345,10 +5506,10 @@ impl App {
                     // pale ice as the panel's text color —
                     // mirrors theme::sidebar_container, with
                     // the text color that style leaves unset.
-                    background: Some(iced::Background::Color(theme::BASE)),
-                    text_color: Some(theme::TEXT),
+                    background: Some(iced::Background::Color(theme::base())),
+                    text_color: Some(theme::text()),
                     border: iced::Border {
-                        color: theme::PANEL,
+                        color: theme::panel(),
                         width: 1.0,
                         radius: 8.0.into(),
                     },
@@ -5377,7 +5538,7 @@ impl App {
         // conflicts afterwards. Other conflict types get a simple
         // card each.
         let card_style = |_: &Theme| container::Style {
-            background: Some(iced::Background::Color(theme::BASE)),
+            background: Some(iced::Background::Color(theme::base())),
             border: iced::Border {
                 color: iced::Color::from_rgb(0.30, 0.31, 0.34),
                 width: 1.0,
@@ -5510,18 +5671,23 @@ impl App {
                 // always lands on the widget that saw the
                 // press.
                 let btn_content: Element<'_, Message> = if self.remove_holding(&m.id) {
+                    // The same squeeze as the panel's
+                    // control (hold polish, part 2): the
+                    // pill narrows and brightens as the
+                    // hold fills.
+                    let hold_p = self.remove_hold_progress(&m.id);
                     container(
                         column![
-                            text("Keep holding…").size(11),
-                            progress_bar(0.0..=1.0, self.remove_hold_progress(&m.id))
+                            text("Keep holding…").size(11.0 - 0.5 * hold_p),
+                            progress_bar(0.0..=1.0, hold_p)
                                 .height(3)
                                 .style(theme::hold_bar),
                         ]
                         .spacing(3),
                     )
-                    .width(110)
-                    .padding(6)
-                    .style(theme::danger_box)
+                    .width(110.0 - 6.0 * hold_p)
+                    .padding(6.0 + 2.0 * hold_p)
+                    .style(theme::danger_box_hold(hold_p))
                     .into()
                 } else {
                     let bar = container(text("")).width(12).height(3).style(|_| {
@@ -5680,10 +5846,10 @@ impl App {
             );
         }
         column![
-            text("Configure Save Game").size(20).color(theme::TEXT),
+            text("Configure Save Game").size(20).color(theme::text()),
             text("Link an existing FS25 save with your mod loadout and settings")
                 .size(13)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
             crumbs,
         ]
         .spacing(6)
@@ -5722,7 +5888,7 @@ impl App {
         let mut col = column![
             text("Pick the save to configure. Configure Save works on saves the game has already written: bounce into the map, save, come back out — then adjust settings, money, and mods here before you go back in.")
                 .size(13)
-                .color(theme::TEXT_DIM)
+                .color(theme::text_dim())
                 .width(Length::Fill),
         ]
         .spacing(10);
@@ -5730,7 +5896,7 @@ impl App {
             col = col.push(
                 text("No save slots found in the game profile folder.")
                     .size(13)
-                    .color(theme::TEXT),
+                    .color(theme::text()),
             );
         }
         for slot in &self.save_slots_cache {
@@ -5742,7 +5908,7 @@ impl App {
                 Some(name) => format!("Savegame {} — {}", slot.slot, name),
                 None => format!("Savegame {}", slot.slot),
             };
-            lines = lines.push(text(title).size(14).color(theme::TEXT));
+            lines = lines.push(text(title).size(14).color(theme::text()));
             lines = lines.push(
                 text(format!(
                     "{} · {} mods recorded · played {} · {}",
@@ -5754,7 +5920,7 @@ impl App {
                         .unwrap_or_else(|| "?".to_string()),
                 ))
                 .size(12)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
             );
             let loadout = self.mod_manager.save_loadout(&slot.dir_name);
             lines = lines.push(
@@ -5764,23 +5930,23 @@ impl App {
                     format!("Loadout: {} mods", loadout.len())
                 })
                 .size(12)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
             );
             let card_btn = button(lines)
                 .width(Length::Fill)
                 .padding(10)
                 .style(move |_theme, _status| iced::widget::button::Style {
-                    background: Some(iced::Background::Color(theme::PANEL)),
+                    background: Some(iced::Background::Color(theme::panel())),
                     border: iced::Border {
                         color: if selected {
-                            theme::ACCENT
+                            theme::accent()
                         } else {
-                            theme::BASE
+                            theme::base()
                         },
                         width: if selected { 2.0 } else { 1.0 },
                         radius: 8.0.into(),
                     },
-                    text_color: theme::TEXT,
+                    text_color: theme::text(),
                     ..Default::default()
                 })
                 .on_press(Message::SelectSaveSlot(slot.dir_name.clone()));
@@ -5791,7 +5957,7 @@ impl App {
         } else {
             text("Pick a save to continue.")
                 .size(12)
-                .color(theme::TEXT_DIM)
+                .color(theme::text_dim())
                 .into()
         };
         column![page_scroll(col).height(Length::Fill), next]
@@ -5831,6 +5997,7 @@ impl App {
             "Save Name",
             s.savegame_name.is_some(),
             text_input("Save name", s.savegame_name.as_deref().unwrap_or(""))
+                .style(theme::input_field())
                 .on_input(Message::WizardNameChanged)
                 .padding(8)
                 .into(),
@@ -5919,10 +6086,11 @@ impl App {
             column![
                 row![
                     text_input("Cash", &self.wizard_cash)
+                        .style(theme::input_field())
                         .on_input(Message::WizardCashChanged)
                         .padding(8)
                         .width(220),
-                    text(money_now("cash")).size(12).color(theme::TEXT_DIM),
+                    text(money_now("cash")).size(12).color(theme::text_dim()),
                 ]
                 .spacing(8),
                 cash_chips,
@@ -5949,10 +6117,11 @@ impl App {
             column![
                 row![
                     text_input("Loan", &self.wizard_loan)
+                        .style(theme::input_field())
                         .on_input(Message::WizardLoanChanged)
                         .padding(8)
                         .width(220),
-                    text(money_now("loan")).size(12).color(theme::TEXT_DIM),
+                    text(money_now("loan")).size(12).color(theme::text_dim()),
                 ]
                 .spacing(8),
                 loan_chips,
@@ -6010,7 +6179,7 @@ impl App {
                     }
                 ))
                 .size(13)
-                .color(theme::TEXT),
+                .color(theme::text()),
             ]
             .spacing(10)
             .into(),
@@ -6069,10 +6238,10 @@ impl App {
             row![
                 text(s.disaster_destruction_state.clone().unwrap_or_default())
                     .size(13)
-                    .color(theme::TEXT),
+                    .color(theme::text()),
                 text("Shown as stored — its other values aren't verified yet.")
                     .size(11)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             ]
             .spacing(8)
             .into(),
@@ -6089,10 +6258,10 @@ impl App {
                     s.dirt_interval.unwrap_or(0)
                 ))
                 .size(13)
-                .color(theme::TEXT),
+                .color(theme::text()),
                 text("Its Off/Slow/Normal/Fast labels aren't verified yet.")
                     .size(11)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             ]
             .spacing(8)
             .into(),
@@ -6183,10 +6352,10 @@ impl App {
                 row![
                     text(format!("Stored value: {}", value.unwrap_or(0)))
                         .size(13)
-                        .color(theme::TEXT),
+                        .color(theme::text()),
                     text("Its Farm/Buy labels aren't verified yet.")
                         .size(11)
-                        .color(theme::TEXT_DIM),
+                        .color(theme::text_dim()),
                 ]
                 .spacing(8)
                 .into(),
@@ -6198,7 +6367,7 @@ impl App {
         ad.push(
             text("If AutoDrive is installed, please provide AutoDrive_Config to overwrite route configuration.")
                 .size(12)
-                .color(theme::TEXT_DIM)
+                .color(theme::text_dim())
                 .width(Length::Fill)
                 .into(),
         );
@@ -6207,7 +6376,7 @@ impl App {
             None => "No file chosen".to_string(),
         };
         let mut box_row = row![
-            container(text(picked_label).size(12).color(theme::TEXT))
+            container(text(picked_label).size(12).color(theme::text()))
                 .width(Length::Fill)
                 .padding(8)
                 .style(wizard_inset),
@@ -6231,7 +6400,7 @@ impl App {
                 "This save has no AutoDrive_config.xml yet — the picked file will be added."
             })
             .size(12)
-            .color(theme::TEXT_DIM)
+            .color(theme::text_dim())
             .into(),
         );
 
@@ -6283,36 +6452,36 @@ impl App {
                 .style(wizard_inset)
                 .into(),
         };
-        let mut info = column![text(e.name.clone()).size(13).color(theme::TEXT)]
+        let mut info = column![text(e.name.clone()).size(13).color(theme::text())]
             .spacing(2);
         if let Some(author) = &e.author {
-            info = info.push(text(author.clone()).size(11).color(theme::TEXT_DIM));
+            info = info.push(text(author.clone()).size(11).color(theme::text_dim()));
         }
         info = info.push(
             text(format!("v{}", e.version))
                 .size(11)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
         );
         let mut badges = row![].spacing(4);
         if e.required {
             badges = badges.push(wizard_pill(
                 "REQ MOD".to_string(),
-                theme::ACCENT,
-                theme::TEXT,
+                theme::accent(),
+                theme::text(),
             ));
         }
         if let Some(cat) = &e.category {
             badges = badges.push(wizard_pill(
                 cat.clone(),
-                theme::BASE,
-                theme::TEXT_DIM,
+                theme::base(),
+                theme::text_dim(),
             ));
         }
         if selected {
             badges = badges.push(wizard_pill(
                 "Selected".to_string(),
-                theme::ACCENT,
-                theme::TEXT,
+                theme::accent(),
+                theme::text(),
             ));
         }
         let content = column![row![icon, info].spacing(8), badges].spacing(6);
@@ -6320,12 +6489,12 @@ impl App {
             .width(252)
             .padding(8)
             .style(move |_| container::Style {
-                background: Some(iced::Background::Color(theme::BASE)),
+                background: Some(iced::Background::Color(theme::base())),
                 border: iced::Border {
                     color: if selected {
-                        theme::ACCENT
+                        theme::accent()
                     } else {
-                        theme::BASE
+                        theme::base()
                     },
                     width: if selected { 2.0 } else { 1.0 },
                     radius: 8.0.into(),
@@ -6350,7 +6519,7 @@ impl App {
             col = col.push(
                 text(self.wizard_seed_note.clone())
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .width(Length::Fill),
             );
         }
@@ -6363,10 +6532,10 @@ impl App {
                             self.wizard_missing.len()
                         ))
                         .size(13)
-                        .color(theme::TEXT),
+                        .color(theme::text()),
                         text(self.wizard_missing.join(", "))
                             .size(12)
-                            .color(theme::TEXT_DIM),
+                            .color(theme::text_dim()),
                     ]
                     .spacing(3),
                 )
@@ -6391,12 +6560,13 @@ impl App {
                     self.saves_draft.len()
                 ))
                 .size(13)
-                .color(theme::TEXT),
+                .color(theme::text()),
             ]
             .spacing(8),
         );
         col = col.push(
             text_input("Filter mods by name…", &self.saves_filter)
+                .style(theme::input_field())
                 .on_input(Message::SavesFilterChanged)
                 .padding(8),
         );
@@ -6440,7 +6610,7 @@ impl App {
                 col = col.push(
                     text("Nothing in this group matches the filter.")
                         .size(12)
-                        .color(theme::TEXT_DIM),
+                        .color(theme::text_dim()),
                 );
                 continue;
             }
@@ -6465,7 +6635,7 @@ impl App {
                         visible.len()
                     ))
                     .size(12)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
                 );
             }
         }
@@ -6484,7 +6654,7 @@ impl App {
     /// owner ruling, 2026-10-21), and the inline
     /// validation that blocks applying.
     fn wizard_review_view(&self) -> Element<'_, Message> {
-        let mut col = column![text("Ready to Apply").size(17).color(theme::TEXT)]
+        let mut col = column![text("Ready to Apply").size(17).color(theme::text())]
             .spacing(10);
         let slot = self
             .save_slots_cache
@@ -6561,11 +6731,11 @@ impl App {
             let lines = savegame::describe_changes(o, s);
             if lines.is_empty() {
                 changes.push(
-                    text("Settings: no changes.").size(12).color(theme::TEXT_DIM).into(),
+                    text("Settings: no changes.").size(12).color(theme::text_dim()).into(),
                 );
             }
             for line in lines {
-                changes.push(text(line).size(12).color(theme::TEXT).into());
+                changes.push(text(line).size(12).color(theme::text()).into());
             }
         }
         if let Some(fin) = &self.wizard_finances {
@@ -6579,7 +6749,7 @@ impl App {
                         fmt_money(new_money.unwrap())
                     ))
                     .size(12)
-                    .color(theme::TEXT)
+                    .color(theme::text())
                     .into(),
                 );
             }
@@ -6591,7 +6761,7 @@ impl App {
                         fmt_money(new_loan.unwrap())
                     ))
                     .size(12)
-                    .color(theme::TEXT)
+                    .color(theme::text())
                     .into(),
                 );
             }
@@ -6606,7 +6776,7 @@ impl App {
                         .unwrap_or_default()
                 ))
                 .size(12)
-                .color(theme::TEXT)
+                .color(theme::text())
                 .into(),
             );
         }
@@ -6616,7 +6786,7 @@ impl App {
                 self.saves_draft.len()
             ))
             .size(12)
-            .color(theme::TEXT)
+            .color(theme::text())
             .into(),
         );
         if !self.wizard_missing.is_empty() {
@@ -6627,7 +6797,7 @@ impl App {
                     self.wizard_missing.join(", ")
                 ))
                 .size(12)
-                .color(theme::TEXT_DIM)
+                .color(theme::text_dim())
                 .into(),
             );
         }
@@ -6644,7 +6814,7 @@ impl App {
                 slot_name
             ))
             .size(12)
-            .color(theme::TEXT_DIM)
+            .color(theme::text_dim())
             .width(Length::Fill),
         );
         let problems = self.wizard_validation();
@@ -6678,21 +6848,21 @@ impl App {
     /// what may have failed, kept apart so a failure never
     /// reads as a success.
     fn wizard_results_view(&self) -> Element<'_, Message> {
-        let mut col = column![text("Results").size(17).color(theme::TEXT)]
+        let mut col = column![text("Results").size(17).color(theme::text())]
             .spacing(10);
         if self.wizard_done.is_empty() && self.wizard_failed.is_empty() {
             col = col.push(
                 text("Nothing has been applied yet.")
                     .size(13)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             );
         }
         if !self.wizard_done.is_empty() {
             let mut list =
-                column![text("What succeeded").size(14).color(theme::TEXT)]
+                column![text("What succeeded").size(14).color(theme::text())]
                     .spacing(3);
             for line in &self.wizard_done {
-                list = list.push(text(line.clone()).size(12).color(theme::TEXT));
+                list = list.push(text(line.clone()).size(12).color(theme::text()));
             }
             col = col.push(
                 container(list)
@@ -6707,7 +6877,7 @@ impl App {
             ]
             .spacing(3);
             for line in &self.wizard_failed {
-                list = list.push(text(line.clone()).size(12).color(theme::TEXT));
+                list = list.push(text(line.clone()).size(12).color(theme::text()));
             }
             col = col.push(
                 container(list)
@@ -6717,7 +6887,7 @@ impl App {
             );
         } else if !self.wizard_done.is_empty() {
             col = col.push(
-                text("Nothing failed.").size(13).color(theme::TEXT),
+                text("Nothing failed.").size(13).color(theme::text()),
             );
         }
         col = col.push(
@@ -7166,7 +7336,7 @@ impl App {
                 .into(),
                 text("Runs the update check once when Playground starts. The Rescan button always runs it too.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
                 row![
                     checkbox(
@@ -7182,12 +7352,12 @@ impl App {
                 .into(),
                 text("When on, a newer published Playground is offered at start-up. Check now runs the same check right away.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
                 text(fill_line).size(13).into(),
                 text("The scheduled catalog fill (update.exe) runs daily at 06:00, 14:00 and 22:00.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
@@ -7208,6 +7378,69 @@ impl App {
         cats.sort();
         cats.dedup();
         view_options.extend(cats.into_iter().map(BrowseView::Category));
+        // Theme picker (themes, 2026-10-23; owner: "we
+        // will need toggles in Settings for this"): one
+        // row per theme — swatches from the CANDIDATE
+        // palette, its name, its tag. Picking applies
+        // live and saves at once (see ThemeSelected).
+        let current_theme_id = theme::current_theme().id;
+        let mut theme_rows: Vec<Element<'_, Message>> = vec![
+            text("Applies the moment you pick — no save, no restart. The Remove/Rescan red never changes: it is a meaning, not a fashion.")
+                .size(12)
+                .color(theme::text_dim())
+                .into(),
+        ];
+        for def in theme::THEMES {
+            let p = def.palette;
+            let swatch = |c: iced::Color| {
+                container(text(""))
+                    .width(16)
+                    .height(16)
+                    .style(move |_| container::Style {
+                        background: Some(iced::Background::Color(c)),
+                        border: iced::Border {
+                            color: theme::text_dim(),
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        },
+                        ..container::Style::default()
+                    })
+            };
+            let mut label = row![
+                swatch(p.base),
+                swatch(p.panel),
+                swatch(p.accent),
+                swatch(p.text),
+                text(def.name).size(13),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            match def.id {
+                "gunmetal" => {
+                    label = label.push(
+                        text("(default)")
+                            .size(11)
+                            .color(theme::text_dim()),
+                    );
+                }
+                "wildflower" | "lavender-dusk" => {
+                    label = label.push(
+                        text("(for women)")
+                            .size(11)
+                            .color(theme::text_dim()),
+                    );
+                }
+                _ => {}
+            }
+            theme_rows.push(
+                button(label)
+                    .style(theme::nav_pill(current_theme_id == def.id))
+                    .on_press(Message::ThemeSelected(def.id.to_string()))
+                    .into(),
+            );
+        }
+        let theme_box = self.settings_box("general-theme", "Theme", theme_rows);
+
         let behavior = self.settings_box(
             "general-behavior",
             "Behavior",
@@ -7227,7 +7460,7 @@ impl App {
                     .into(),
                 text("Both apply from the next launch; saving never moves the window or the view in this one.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
@@ -7282,6 +7515,7 @@ impl App {
                         .size(13)
                         .width(300),
                     text_input("", &self.settings_launch_slot_input)
+                        .style(theme::input_field())
                         .on_input(Message::SettingsLaunchSlotChanged)
                         .padding(8)
                         .width(90),
@@ -7320,7 +7554,7 @@ impl App {
                 .into(),
                 text("Launch command preview:").size(13).into(),
                 row![
-                    text(preview).size(13).color(theme::TEXT_DIM),
+                    text(preview).size(13).color(theme::text_dim()),
                     button(text("Copy flags for Steam"))
                         .style(theme::nav_pill(true))
                         .on_press(Message::CopyLaunchFlags),
@@ -7329,12 +7563,13 @@ impl App {
                 .into(),
                 text("Playground never runs this command. The flags are yours to paste into Steam's Launch Options for FS25 (right-click the game, Properties, General, Launch Options). The Developer Console acts through game.xml when the page saves.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
 
         column![
+            theme_box,
             updates,
             behavior,
             launch,
@@ -7416,7 +7651,7 @@ impl App {
                 .into(),
                 text("Organizing and rollback live on the Layout page; this is its standing count.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
@@ -7434,11 +7669,12 @@ impl App {
             .into(),
             text("When off, conflicts are not computed and the Conflicts page shows none.")
                 .size(12)
-                .color(theme::TEXT_DIM)
+                .color(theme::text_dim())
                 .into(),
             row![
                 text("Parallel scans (1–16):").size(13).width(220),
                 text_input("4", &self.settings_parallel_input)
+                    .style(theme::input_field())
                     .on_input(Message::SettingsParallelScansChanged)
                     .padding(8)
                     .width(90),
@@ -7450,6 +7686,7 @@ impl App {
                     .size(13)
                     .width(220),
                 text_input("24", &self.settings_cache_ttl_input)
+                    .style(theme::input_field())
                     .on_input(Message::SettingsCacheTtlChanged)
                     .padding(8)
                     .width(90),
@@ -7458,19 +7695,20 @@ impl App {
             .into(),
             text("The cache lifetime covers the downloaded ModHub catalog and the decoded icon cache.")
                 .size(12)
-                .color(theme::TEXT_DIM)
+                .color(theme::text_dim())
                 .into(),
             text("Catalog URL (the published ModHub catalog):")
                 .size(13)
                 .into(),
             text_input("Catalog URL", &self.settings_catalog_url_input)
+                .style(theme::input_field())
                 .on_input(Message::SettingsCatalogUrlChanged)
                 .padding(8)
                 .width(Length::Fill)
                 .into(),
             text("Leave the catalog URL empty to turn catalog fetching off — a catalog already downloaded is still used from its cache.")
                 .size(12)
-                .color(theme::TEXT_DIM)
+                .color(theme::text_dim())
                 .into(),
             text("Mod sources:").size(13).into(),
         ];
@@ -7491,7 +7729,7 @@ impl App {
                 &self.settings_sources.kingmods,
             ),
         ] {
-            source_rows.push(text(heading).size(13).color(theme::TEXT_DIM).into());
+            source_rows.push(text(heading).size(13).color(theme::text_dim()).into());
             if entries.is_empty() {
                 source_rows.push(
                     text("No sources configured.").size(12).into(),
@@ -7507,7 +7745,7 @@ impl App {
                             .width(220),
                         text(source.url.clone())
                             .size(12)
-                            .color(theme::TEXT_DIM),
+                            .color(theme::text_dim()),
                     ]
                     .spacing(8)
                     .into(),
@@ -7517,7 +7755,7 @@ impl App {
         source_rows.push(
             text("Source names and URLs are shown as configured; only their on/off switches are editable here.")
                 .size(12)
-                .color(theme::TEXT_DIM)
+                .color(theme::text_dim())
                 .into(),
         );
         let catalog = self.settings_box(
@@ -7538,7 +7776,7 @@ impl App {
                 .into(),
                 text("When a download or import finishes and the library layout is active, the mod is filed into its category folder and linked into the game folder. With no layout in place, finished mods simply stay where they landed.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
@@ -7564,7 +7802,7 @@ impl App {
                 .into(),
                 text("Read-only this round: there are no connect or disconnect controls yet.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
@@ -7602,7 +7840,7 @@ impl App {
                 .into(),
                 text("Paths in this summary have your user folder name masked — it is text you may paste somewhere public.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
@@ -7619,6 +7857,7 @@ impl App {
                 row![
                     text("Log lines kept (the last N):").size(13).width(220),
                     text_input("3000", &self.settings_log_lines_cap_input)
+                        .style(theme::input_field())
                         .on_input(Message::SettingsLogLinesCapChanged)
                         .padding(8)
                         .width(90),
@@ -7627,7 +7866,7 @@ impl App {
                 .into(),
                 text("Applied when the Log Reader next reads the log.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
@@ -7662,7 +7901,7 @@ impl App {
                 .into(),
                 text("When on, the Downloads page's finished and failed rows are stored in the data folder and come back at the next launch. When off, history lasts for the session only; a stored history is left untouched, just not loaded.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
@@ -7681,6 +7920,7 @@ impl App {
                 row![
                     text("Fill logs to keep:").size(13).width(220),
                     text_input("10", &self.settings_fill_log_keep_input)
+                        .style(theme::input_field())
                         .on_input(Message::SettingsFillLogKeepChanged)
                         .padding(8)
                         .width(90),
@@ -7689,7 +7929,7 @@ impl App {
                 .into(),
                 text("Each scheduled fill writes fill-<date>-<time>.log there: its start time, the per-source results, the updates found, and any error. Older logs are pruned to the keep count.")
                     .size(12)
-                    .color(theme::TEXT_DIM)
+                    .color(theme::text_dim())
                     .into(),
             ],
         );
@@ -8210,6 +8450,22 @@ impl App {
         0.5 - 0.35 * (secs * std::f32::consts::TAU / 1.8).cos()
     }
 
+    /// How far a just-opened surface still has to
+    /// settle (feel pass part 2): 6px at the open,
+    /// easing out to nothing over ~160ms.
+    fn settle_offset(&self, opened_at: std::time::Instant) -> f32 {
+        let raw = (opened_at.elapsed().as_secs_f32() / 0.16).min(1.0);
+        6.0 * (1.0 - raw) * (1.0 - raw)
+    }
+
+    /// The status line's fade-in alpha (feel pass
+    /// part 2): a new status fades in over ~220ms and
+    /// never starts from fully invisible.
+    fn status_alpha(&self) -> f32 {
+        let raw = (self.status_changed_at.elapsed().as_secs_f32() / 0.22).min(1.0);
+        0.15 + 0.85 * raw
+    }
+
     /// The Reclaim census over the app's two pools
     /// (owner ruling, 2026-10-23): backups beyond each
     /// family's newest, and exact duplicate copies. The
@@ -8507,7 +8763,7 @@ impl App {
         col = col.push(
             text("Remove the bindings of archived mods — mods not loaded in game. Active mods, base game and unclaimed actions are never touched.")
                 .size(12)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
         );
         let (label, armed) = match self.kb_purge {
             Some((actions, mods)) => (
@@ -8540,7 +8796,7 @@ impl App {
             col = col.push(
                 text("No backups yet — one is taken automatically before every save.")
                     .size(12)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             );
         }
         for (path, size) in &self.kb_backups {
@@ -8757,7 +9013,7 @@ impl App {
             col = col.push(
                 text("No backups yet — one is captured automatically before every Apply or restore.")
                     .size(12)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             );
         }
         for backup in &self.gs_backups {
@@ -8808,7 +9064,7 @@ impl App {
                     col = col.push(
                         text(format!("Last pick refused: {}", note))
                             .size(12)
-                            .color(theme::TEXT_DIM),
+                            .color(theme::text_dim()),
                     );
                 }
             }
@@ -8826,7 +9082,7 @@ impl App {
             current = current.push(
                 text("The current splash could not be previewed.")
                     .size(12)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             );
         }
         let identity = self
@@ -8842,7 +9098,7 @@ impl App {
                     "splash_highlandsFishing.dds: not present."
                 })
                 .size(12)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
             ]
             .spacing(12),
         );
@@ -8853,7 +9109,7 @@ impl App {
                     install.display()
                 ))
                 .size(12)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
             );
         }
         if let Some(shared) = &self.gs_shared {
@@ -8900,7 +9156,7 @@ impl App {
         choose = choose.push(
             text(self.gs_pending_note.clone())
                 .size(12)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
         );
         if self.gs_pending_canvas.is_some() || self.gs_pending_band.is_some() {
             let mut previews = row![].spacing(12);
@@ -8911,7 +9167,7 @@ impl App {
                             .width(Length::Fixed(216.0)),
                         text("The full canvas — the game shows the bottom band.")
                             .size(11)
-                            .color(theme::TEXT_DIM),
+                            .color(theme::text_dim()),
                     ]
                     .spacing(4),
                 );
@@ -8923,7 +9179,7 @@ impl App {
                             .width(Length::Fixed(384.0)),
                         text("What the game shows.")
                             .size(11)
-                            .color(theme::TEXT_DIM),
+                            .color(theme::text_dim()),
                     ]
                     .spacing(4),
                 );
@@ -8950,7 +9206,7 @@ impl App {
                         Some(Message::GameScreensApply)
                     }),
                 if self.gs_busy {
-                    text("Building…").size(12).color(theme::TEXT_DIM)
+                    text("Building…").size(12).color(theme::text_dim())
                 } else {
                     text("").size(12)
                 },
@@ -8960,7 +9216,7 @@ impl App {
         choose = choose.push(
             text("Apply while the game is closed; it reads these at launch.")
                 .size(12)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
         );
         let choose_box = container(choose)
             .width(Length::Fill)
@@ -9139,7 +9395,7 @@ impl App {
                 if group_hard > 0 {
                     text(format!("{} hard", group_hard))
                         .size(12)
-                        .color(theme::TEXT_DIM)
+                        .color(theme::text_dim())
                 } else {
                     text("").size(12)
                 },
@@ -9166,14 +9422,14 @@ impl App {
                             .spacing(2);
                     if let Some(category) = category {
                         name_col = name_col.push(
-                            text(category).size(11).color(theme::TEXT_DIM),
+                            text(category).size(11).color(theme::text_dim()),
                         );
                     }
                     if let Some(mark) = action_marks.get(a.name.as_str()) {
                         let color = if *mark == "Hard conflict" {
                             iced::Color::from_rgb(0.62, 0.16, 0.13)
                         } else {
-                            theme::TEXT_DIM
+                            theme::text_dim()
                         };
                         name_col = name_col
                             .push(text(*mark).size(11).color(color));
@@ -9205,7 +9461,7 @@ impl App {
                             );
                         } else {
                             chips = chips.push(
-                                text("Unassigned").size(12).color(theme::TEXT_DIM),
+                                text("Unassigned").size(12).color(theme::text_dim()),
                             );
                         }
                     } else {
@@ -9240,7 +9496,7 @@ impl App {
                                             caps_row = caps_row.push(
                                                 text("+")
                                                     .size(11)
-                                                    .color(theme::TEXT_DIM),
+                                                    .color(theme::text_dim()),
                                             );
                                         }
                                         caps_row = caps_row.push(
@@ -9305,6 +9561,7 @@ impl App {
 
         let top_bar = row![
             text_input("Search actions or mods", &self.kb_search)
+                .style(theme::input_field())
                 .on_input(Message::KeybindingsSearchChanged)
                 .width(260),
             checkbox("Unassigned only", self.kb_unassigned_only)
@@ -9327,14 +9584,14 @@ impl App {
         let (banner1, banner2) = keybindings::banner_lines(&counts);
         page = page.push(text(banner1));
         if let Some(line2) = banner2 {
-            page = page.push(text(line2).size(12).color(theme::TEXT_DIM));
+            page = page.push(text(line2).size(12).color(theme::text_dim()));
         }
         page = page.push(top_bar);
         if !is_keyboard {
             page = page.push(
                 text("Key capture is keyboard-only for now — on this device you can view and clear bindings.")
                     .size(12)
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             );
         }
         page = page.push(
@@ -9832,12 +10089,12 @@ impl App {
         let readout = column![
             text(format!("Playground v{}", env!("CARGO_PKG_VERSION")))
                 .size(15)
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
             progress_bar(0.0..=1.0, value)
                 .width(260)
                 .height(14)
                 .style(theme::splash_bar),
-            text(counts).size(16).color(theme::TEXT),
+            text(counts).size(16).color(theme::text()),
         ]
         .spacing(10)
         .align_x(iced::Alignment::Center);
@@ -9913,7 +10170,7 @@ impl App {
         }
         let notice = container(
             row![
-                text(label).size(13).color(theme::TEXT),
+                text(label).size(13).color(theme::text()),
                 Space::with_width(Length::Fill),
                 actions,
             ]
@@ -9927,7 +10184,7 @@ impl App {
         })
         .width(Length::Fill)
         .style(|_| container::Style {
-            background: Some(iced::Background::Color(theme::ACCENT)),
+            background: Some(iced::Background::Color(theme::accent())),
             ..container::Style::default()
         });
         // The visible slab keeps PAGE_MARGIN on its right
@@ -10048,7 +10305,12 @@ impl App {
         };
 
         let status = row![
-            text(&self.status).size(13),
+            text(&self.status)
+                .size(13)
+                .color(iced::Color {
+                    a: self.status_alpha(),
+                    ..theme::text()
+                }),
             Space::with_width(Length::Fill),
             text(format!("Favorites: {}", self.mod_manager.favorites_count())).size(13),
         ];
@@ -10156,8 +10418,15 @@ impl App {
         }
         // The feel pass's shared clock (2026-10-23):
         // subscribed only while an animation is live or
-        // settling — the app carries no idle timer.
-        if std::time::Instant::now() < self.anim_until || !self.switch_anims.is_empty() {
+        // settling — the app carries no idle timer. A
+        // status the clock has not seen yet, or one still
+        // fading in, also keeps it subscribed (part 2).
+        if std::time::Instant::now() < self.anim_until
+            || !self.switch_anims.is_empty()
+            || self.status != self.status_seen
+            || self.status_changed_at.elapsed() < std::time::Duration::from_millis(220)
+            || (self.grid_offset - self.grid_shown).abs() > 0.5
+        {
             subs.push(iced::time::every(ANIM_TICK).map(|_| Message::AnimTick));
         }
         // Key capture (Keybindings page): a keyboard
@@ -10621,7 +10890,7 @@ pub fn run(mod_manager: ModManager) -> anyhow::Result<()> {
             if app.booting {
                 theme::splash_theme()
             } else {
-                Theme::Dark
+                theme::app_theme()
             }
         })
         .window(iced::window::Settings {

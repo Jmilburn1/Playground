@@ -625,6 +625,11 @@ pub enum Message {
     /// catalog URL field and one source's enabled toggle,
     /// staged the same way.
     SettingsCatalogUrlChanged(String),
+    /// Settings page, General > Theme: a theme was
+    /// picked (themes, 2026-10-23). Applies live and
+    /// persists at once — it does not ride the page's
+    /// Save settings.
+    ThemeSelected(String),
     SettingsSourceToggled(SourceList, usize, bool),
     BrowseFolder(FolderTarget),
     FolderPicked(FolderTarget, Option<PathBuf>),
@@ -1039,7 +1044,7 @@ pub fn mod_card<'a>(
     .height(26)
     .padding(0)
     .style(|_, _| button::Style {
-        background: Some(iced::Background::Color(theme::PANEL)),
+        background: Some(iced::Background::Color(theme::panel())),
         border: iced::Border {
             radius: 13.0.into(),
             ..iced::Border::default()
@@ -1249,13 +1254,13 @@ pub fn mod_card<'a>(
                 } else if lifted {
                     Color::from_rgb(0.11, 0.13, 0.15)
                 } else {
-                    theme::BASE
+                    theme::base()
                 })),
                 border: iced::Border {
                     color: if is_selected {
                         Color::from_rgb(0.82, 0.83, 0.87)
                     } else if lifted {
-                        theme::ACCENT
+                        theme::accent()
                     } else if is_favorite {
                         Color::from_rgb(0.58, 0.59, 0.63)
                     } else {
@@ -1266,7 +1271,7 @@ pub fn mod_card<'a>(
                 },
                 shadow: if lifted {
                     iced::Shadow {
-                        color: Color { a: 0.5, ..theme::BASE },
+                        color: Color { a: 0.5, ..theme::base() },
                         offset: iced::Vector::new(0.0, 3.0),
                         blur_radius: 10.0,
                     }
@@ -1374,12 +1379,10 @@ impl<Message> iced::widget::canvas::Program<Message> for SwitchIcon {
             b: a.b + (b.b - a.b) * t,
             a: 1.0,
         };
-        // theme::ACCENT (#3E5F6E) lit, theme::PANEL's dimmer
-        // sibling grey at rest — blended by the glide.
-        let track_color = blend(
-            Color::from_rgb(0.30, 0.31, 0.34),
-            Color::from_rgb(0x3E as f32 / 255.0, 0x5F as f32 / 255.0, 0x6E as f32 / 255.0),
-        );
+        // The CURRENT theme's accent lit, a neutral dim
+        // grey at rest — blended by the glide (the switch
+        // follows the theme like everything else).
+        let track_color = blend(Color::from_rgb(0.30, 0.31, 0.34), theme::accent());
         let track = Path::rounded_rectangle(
             iced::Point::new(0.0, 0.0),
             iced::Size::new(w, h),
@@ -1388,11 +1391,8 @@ impl<Message> iced::widget::canvas::Program<Message> for SwitchIcon {
         frame.fill(&track, track_color);
         let knob_r = h / 2.0 - 2.5;
         let knob_center = iced::Point::new(h / 2.0 + t * (w - h), h / 2.0);
-        // theme::TEXT (#DFE9ED) lit, TEXT_DIM (#ACC3D0) at rest.
-        let knob_color = blend(
-            Color::from_rgb(0xAC as f32 / 255.0, 0xC3 as f32 / 255.0, 0xD0 as f32 / 255.0),
-            Color::from_rgb(0xDF as f32 / 255.0, 0xE9 as f32 / 255.0, 0xED as f32 / 255.0),
-        );
+        // The theme's full text lit, its dim text at rest.
+        let knob_color = blend(theme::text_dim(), theme::text());
         let knob = Path::circle(knob_center, knob_r);
         frame.fill(&knob, knob_color);
         vec![frame.into_geometry()]

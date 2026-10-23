@@ -1428,6 +1428,7 @@ mod tests {
                 fill_log_keep: 10,
                 log_errors_only_default: false,
                 log_lines_cap: 3000,
+                ui_theme: "gunmetal".to_string(),
                 launch: crate::config::LaunchConfig::default(),
             },
         };
