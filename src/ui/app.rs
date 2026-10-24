@@ -8215,7 +8215,11 @@ impl App {
                 "Scheduled fill: the Windows task \"Playground Update Fill\" is not registered."
             }
             None => {
-                "Scheduled fill: registration could not be checked here."
+                if cfg!(windows) {
+                    "Scheduled fill: registration could not be checked here."
+                } else {
+                    "Scheduled fill: no built-in schedule on this platform yet — the fill also runs at launch and on Rescan."
+                }
             }
         };
         let updates = self.settings_box(
@@ -8249,7 +8253,11 @@ impl App {
                     .color(theme::text_dim())
                     .into(),
                 text(fill_line).size(13).into(),
-                text("The scheduled catalog fill (update.exe) runs daily at 06:00, 14:00 and 22:00.")
+                text(if cfg!(windows) {
+                    "The scheduled catalog fill (update.exe) runs daily at 06:00, 14:00 and 22:00."
+                } else {
+                    "On Linux the fill helper is named update. There is no built-in schedule yet — run it from cron or a systemd timer if you want it automatic."
+                })
                     .size(12)
                     .color(theme::text_dim())
                     .into(),

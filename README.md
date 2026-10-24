@@ -17,12 +17,25 @@ for mod updates in the background.
 
 ## Download (no build needed)
 
-Grab the pre-compiled Windows build from the
-[Releases](https://github.com/Jmilburn1/Playground/releases) page:
+Grab the pre-compiled build for your platform from the
+[Releases](https://github.com/Jmilburn1/Playground/releases) page.
+
+**Windows:**
 
 1. Download `Playground-Windows.zip` from the latest release.
 2. Unzip it anywhere.
 3. Double-click `playground.exe`.
+
+**Linux:**
+
+1. Download `Playground-Linux.zip` from the latest release.
+2. Unzip it anywhere.
+3. Run `./install.sh` — it installs Playground for your user
+   only (no root): the binaries land in `~/.local/bin` and a
+   "Playground" entry appears in your applications menu.
+4. The game itself runs through Steam/Proton; Playground is
+   native and finds the FS25 profile inside the Proton prefix
+   on its own.
 
 No Rust, no compiler, no terminal — and nothing to install. The exe is
 portable: run it from the unzipped folder, a USB stick, wherever.
@@ -95,7 +108,7 @@ download instead of failing silently.
 - A fuller Settings page
 - Radio Stations — manage the game's streaming radio, with a
   companion mod for in-game use
-- Linux release
+- Linux release — every release ships Playground-Windows.zip and Playground-Linux.zip side by side (see Downloads).
 - Game Switching — FS13 / FS15 / FS17 / FS19 / FS22 profiles
   alongside FS25
 

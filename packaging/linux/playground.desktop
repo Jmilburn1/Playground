@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Playground
+Comment=Farming Simulator 25 mod manager
+Exec=playground
+Icon=playground
+Terminal=false
+Categories=Game;Utility;
+Keywords=farming;simulator;mods;mod manager;
+StartupWMClass=playground

@@ -1,6 +1,6 @@
 [package]
 name = "playground"
-version = "1.7.1"
+version = "1.7.2"
 edition = "2021"
 
 # The GUI binary ships as `playground` (playground.exe on

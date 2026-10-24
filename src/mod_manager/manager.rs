@@ -1719,6 +1719,15 @@ impl ModManager {
                 return Some(profile);
             }
         }
+        // Linux (owner, 2026-10-24): the game runs through
+        // Proton, so the profile lives inside the Steam
+        // compatdata prefix for FS25 (AppID 2300320,
+        // verified against SteamDB) — probe both Steam
+        // roots when the plain Documents path misses.
+        #[cfg(target_os = "linux")]
+        if let Some(profile) = proton_profile_dir() {
+            return Some(profile);
+        }
         let active = &self.active_dir;
         if active
             .file_name()
@@ -2892,4 +2901,39 @@ mod tests {
 
         std::fs::remove_dir_all(&base).ok();
     }
+}
+
+/// The FS25 profile folder inside a Steam Proton prefix
+/// (Linux only): <steam root>/steamapps/compatdata/
+/// 2300320/pfx/drive_c/users/steamuser/<Documents|My
+/// Documents>/My Games/FarmingSimulator2025, for each of
+/// the two Steam roots in use (~/.steam/steam and
+/// ~/.local/share/Steam). First one that exists wins.
+#[cfg(target_os = "linux")]
+fn proton_profile_dir() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let roots = [
+        home.join(".steam").join("steam"),
+        home.join(".local").join("share").join("Steam"),
+    ];
+    for root in roots {
+        let prefix = root
+            .join("steamapps")
+            .join("compatdata")
+            .join("2300320")
+            .join("pfx")
+            .join("drive_c")
+            .join("users")
+            .join("steamuser");
+        for docs in ["Documents", "My Documents"] {
+            let profile = prefix
+                .join(docs)
+                .join("My Games")
+                .join("FarmingSimulator2025");
+            if profile.is_dir() {
+                return Some(profile);
+            }
+        }
+    }
+    None
 }

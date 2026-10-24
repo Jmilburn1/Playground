@@ -69,8 +69,14 @@ pub const RELEASE_API_URL_DEFAULT: &str =
 pub const RELEASE_API_ENV: &str = "PLAYGROUND_RELEASE_API_URL";
 
 /// The release asset the self-update installs — the one
-/// asset .github/workflows/release.yml attaches.
+/// asset .github/workflows/release.yml attaches for this
+/// platform (Linux release, owner 2026-10-24). The swap
+/// machinery already accepts both platforms' binary
+/// spellings, so this name is the whole difference.
+#[cfg(windows)]
 pub const ASSET_NAME: &str = "Playground-Windows.zip";
+#[cfg(not(windows))]
+pub const ASSET_NAME: &str = "Playground-Linux.zip";
 
 /// The app binary's file stem (".exe" on Windows only).
 pub const GUI_EXE_STEM: &str = "playground";
@@ -858,13 +864,17 @@ mod tests {
 
     #[test]
     fn release_json_parses_to_the_installable_asset() {
-        let release = parse_release(RELEASE_JSON).unwrap().unwrap();
+        // The fixture names the Windows asset; judge the
+        // platform's own asset name so the test means the
+        // same thing on both platforms.
+        let body = RELEASE_JSON.replace("Playground-Windows.zip", ASSET_NAME);
+        let release = parse_release(&body).unwrap().unwrap();
         assert_eq!(release.tag, "v1.5.0");
         assert_eq!(release.version, "1.5.0");
         assert_eq!(release.asset.name, ASSET_NAME);
         assert_eq!(
             release.asset.url,
-            "https://example.invalid/Playground-Windows.zip"
+            format!("https://example.invalid/{}", ASSET_NAME)
         );
         assert_eq!(release.asset.size, 107861);
         assert_eq!(
