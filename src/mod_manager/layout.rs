@@ -788,10 +788,10 @@ mod tests {
 
     #[test]
     fn category_is_the_cards_first_bucket() {
-        // detect_categories sorts the buckets; the card
-        // pill shows categories.first(). "Vehicles" sorts
-        // after "Tractors", and the engine takes the
-        // stored first element exactly as the card does.
+        // The stored first element is the category (owner
+        // ruling, 2026-10-23: first-listed wins) — the card
+        // pill shows categories.first(), and the engine
+        // takes that same first element as the home.
         let m = test_mod("/lib/x.zip", &["Tractors", "Vehicles"], 1, "1.0.0.0", false);
         assert_eq!(layout_category(&m), "Tractors");
     }

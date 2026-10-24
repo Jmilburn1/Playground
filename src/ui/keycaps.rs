@@ -148,6 +148,43 @@ fn cap_map() -> &'static HashMap<&'static str, Cap> {
         m.insert("mouse_wheel_right", cap!("key_mouse_wheel_right.png", 1.0));
         m.insert("mouse_button_4", cap!("key_mouse_button_4.png", 1.0));
         m.insert("mouse_button_5", cap!("key_mouse_button_5.png", 1.0));
+        // Gamepad / wheel buttons and axes (K2, cosmetic
+        // round, 2026-10-23): numbered round caps and wide
+        // axis caps, drawn by the same generator in the
+        // same dress. The number is the token's own — no
+        // invented platform letters.
+        m.insert("pad_1", cap!("key_pad_1.png", 1.0));
+        m.insert("pad_2", cap!("key_pad_2.png", 1.0));
+        m.insert("pad_3", cap!("key_pad_3.png", 1.0));
+        m.insert("pad_4", cap!("key_pad_4.png", 1.0));
+        m.insert("pad_5", cap!("key_pad_5.png", 1.0));
+        m.insert("pad_6", cap!("key_pad_6.png", 1.0));
+        m.insert("pad_7", cap!("key_pad_7.png", 1.0));
+        m.insert("pad_8", cap!("key_pad_8.png", 1.0));
+        m.insert("pad_9", cap!("key_pad_9.png", 1.0));
+        m.insert("pad_10", cap!("key_pad_10.png", 1.0));
+        m.insert("pad_11", cap!("key_pad_11.png", 1.0));
+        m.insert("pad_12", cap!("key_pad_12.png", 1.0));
+        m.insert("pad_13", cap!("key_pad_13.png", 1.0));
+        m.insert("pad_14", cap!("key_pad_14.png", 1.0));
+        m.insert("pad_15", cap!("key_pad_15.png", 1.0));
+        m.insert("pad_16", cap!("key_pad_16.png", 1.0));
+        m.insert("pad_17", cap!("key_pad_17.png", 1.0));
+        m.insert("pad_18", cap!("key_pad_18.png", 1.0));
+        m.insert("pad_19", cap!("key_pad_19.png", 1.0));
+        m.insert("pad_20", cap!("key_pad_20.png", 1.0));
+        m.insert("pad_21", cap!("key_pad_21.png", 1.0));
+        m.insert("pad_22", cap!("key_pad_22.png", 1.0));
+        m.insert("pad_23", cap!("key_pad_23.png", 1.0));
+        m.insert("pad_24", cap!("key_pad_24.png", 1.0));
+        m.insert("axis_1", cap!("key_axis_1.png", 1.5));
+        m.insert("axis_2", cap!("key_axis_2.png", 1.5));
+        m.insert("axis_3", cap!("key_axis_3.png", 1.5));
+        m.insert("axis_4", cap!("key_axis_4.png", 1.5));
+        m.insert("axis_5", cap!("key_axis_5.png", 1.5));
+        m.insert("axis_6", cap!("key_axis_6.png", 1.5));
+        m.insert("axis_7", cap!("key_axis_7.png", 1.5));
+        m.insert("axis_8", cap!("key_axis_8.png", 1.5));
         m
     })
 }
@@ -208,6 +245,20 @@ fn token_cap(token: &str) -> Option<Cap> {
         cap_name(rest)?
     } else if let Some(rest) = token.strip_prefix("MOUSE_") {
         mouse_cap_name(rest)?
+    } else if let Some(rest) = token.strip_prefix("BUTTON_") {
+        // A bare BUTTON_n lives on a gamepad or a wheel —
+        // the numbered round cap serves both.
+        let n: u32 = rest.parse().ok()?;
+        if !(1..=24).contains(&n) {
+            return None;
+        }
+        format!("pad_{}", n)
+    } else if let Some(rest) = token.strip_prefix("AXIS_") {
+        let n: u32 = rest.parse().ok()?;
+        if !(1..=8).contains(&n) {
+            return None;
+        }
+        format!("axis_{}", n)
     } else {
         return None;
     };
@@ -286,13 +337,22 @@ mod tests {
     fn non_keyboard_inputs_have_no_caps() {
         for input in [
             "AXIS_X",
-            "BUTTON_1",
+            "BUTTON_25", // past the drawn set
             "",
             "MOUSE_BUTTON_9", // a mouse token with no cap drawn
             "KEY_lshift AXIS_X+", // one unmapped token sinks the row
         ] {
             assert!(binding_caps(input).is_none(), "{input:?} should not");
         }
+    }
+
+    #[test]
+    fn gamepad_and_axis_inputs_resolve() {
+        for input in ["BUTTON_1", "BUTTON_5", "BUTTON_24", "AXIS_1", "AXIS_8"] {
+            assert!(binding_caps(input).is_some(), "{input} should have a cap");
+        }
+        let caps = binding_caps("AXIS_3").expect("axis has a cap");
+        assert_eq!(caps[0].units, 1.5);
     }
 
     #[test]

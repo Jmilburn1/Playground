@@ -204,6 +204,18 @@ pub const DANGER: Color = Color {
     a: 1.0,
 };
 
+/// #2E7D32 — the Save green (cosmetic round, John,
+/// 2026-10-23): the Settings page's Save button wears
+/// it, on the right of the footer. Like DANGER it is a
+/// MEANING color (save / confirm), not a palette
+/// member, so it holds its shade in every theme.
+pub const SAVE_GREEN: Color = Color {
+    r: 0x2E as f32 / 255.0,
+    g: 0x7D as f32 / 255.0,
+    b: 0x32 as f32 / 255.0,
+    a: 1.0,
+};
+
 /// Blend two colors (`t` of the way from `a` to `b`).
 /// The only way new shades enter this module.
 fn mix(a: Color, b: Color, t: f32) -> Color {
@@ -337,6 +349,27 @@ pub fn danger_pill() -> impl Fn(&Theme, button::Status) -> button::Style {
             button::Status::Hovered => mix(DANGER, p.text_dim, 0.25),
             button::Status::Pressed => mix(DANGER, p.base, 0.25),
             _ => DANGER,
+        };
+        button::Style {
+            background: Some(Background::Color(fill)),
+            text_color: p.text,
+            border: pill_border(),
+            shadow: pill_shadow(matches!(status, button::Status::Pressed)),
+        }
+    }
+}
+
+/// The Save settings pill (cosmetic round, John,
+/// 2026-10-23): SAVE_GREEN at rest, lightening on
+/// hover, settling toward the base when pressed —
+/// danger_pill's rhythm in the confirm color.
+pub fn save_pill() -> impl Fn(&Theme, button::Status) -> button::Style {
+    let p = pal();
+    move |_theme, status| {
+        let fill = match status {
+            button::Status::Hovered => mix(SAVE_GREEN, p.text_dim, 0.25),
+            button::Status::Pressed => mix(SAVE_GREEN, p.base, 0.25),
+            _ => SAVE_GREEN,
         };
         button::Style {
             background: Some(Background::Color(fill)),

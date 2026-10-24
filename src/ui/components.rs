@@ -640,8 +640,6 @@ pub enum Message {
     LinkInputChanged(String),
     SaveModLink(String),
     /// Update checks (ModHub): the details panel's ModHub field.
-    ModHubInputChanged(String),
-    SaveModHubLink(String),
     /// The catalog arrived (or not) for a detection pass:
     /// stem -> mod_id pairs the catalog could answer
     /// instantly, before any live searching happens.
@@ -750,6 +748,7 @@ pub enum Message {
     RestoreVerifySize(iced::Size),
     GridScrolled(iced::widget::scrollable::Viewport),
     ToggleShowMenu,
+    CloseShowMenu,
     /// App self-update: the launch check answered. Some
     /// carries the newer release; None covers up-to-date,
     /// offline, refused and every other quiet outcome —
@@ -963,26 +962,6 @@ fn initials(name: &str) -> String {
         .collect()
 }
 
-/// Muted accent color per category, Hub-pill style: the same
-/// category always hashes to the same color from this palette.
-fn category_color(name: &str) -> Color {
-    const PALETTE: [(f32, f32, f32); 10] = [
-        (0.13, 0.42, 0.45), // teal
-        (0.55, 0.42, 0.13), // gold
-        (0.38, 0.28, 0.55), // purple
-        (0.62, 0.33, 0.13), // rust orange
-        (0.25, 0.42, 0.25), // forest
-        (0.25, 0.35, 0.55), // steel blue
-        (0.50, 0.22, 0.30), // burgundy
-        (0.35, 0.45, 0.15), // olive
-        (0.45, 0.25, 0.45), // plum
-        (0.30, 0.33, 0.38), // slate
-    ];
-    let hash: usize = name.bytes().map(|b| b as usize).sum();
-    let (r, g, b) = PALETTE[hash % PALETTE.len()];
-    Color::from_rgb(r, g, b)
-}
-
 /// One mod card for the browse grid (Hub-style, John's round-4 spec):
 /// the mod icon fills the TOP of the card with the category as a
 /// colored pill overlaid top-left, and a dark bottom panel carries
@@ -1053,29 +1032,13 @@ pub fn mod_card<'a>(
     })
     .on_press(Message::CardToggleFavorite(mod_data.id.clone()));
 
-    let mut overlay_row = row![].spacing(6);
-    if let Some(category) = mod_data.categories.first() {
-        let pill = container(
-            text(category.clone())
-                .size(11)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .color(Color::from_rgb(0.95, 0.95, 0.97)),
-        )
-        .padding([2, 7])
-        .style({
-            let color = category_color(category);
-            move |_| container::Style {
-                background: Some(iced::Background::Color(color)),
-                border: iced::Border {
-                    radius: 9.0.into(),
-                    ..iced::Border::default()
-                },
-                ..container::Style::default()
-            }
-        });
-        overlay_row = overlay_row.push(pill);
-    }
-    overlay_row = overlay_row
+    // The category pill no longer sits in the image's
+    // top corner (cosmetic round M10, John, 2026-10-23):
+    // it moved down beside the Active/Archive pill (see
+    // the pill row below), so the overlay keeps only the
+    // star badge.
+    let overlay_row = row![].spacing(6);
+    let overlay_row = overlay_row
         .push(iced::widget::Space::with_width(Length::Fill))
         .push(star_badge);
     let overlay: Element<'a, Message> = container(overlay_row)
@@ -1149,6 +1112,20 @@ pub fn mod_card<'a>(
     // (seen live as colored dashes).
     let mut pill_items: Vec<Element<'a, Message>> =
         vec![pill(format!("{:?}", mod_data.state), state_bg).into()];
+    // The category pill, down from the image's top
+    // corner (M10) and wearing the THEME now, not a
+    // per-category color (M9, John, 2026-10-23: "less
+    // category oriented") — the accent the selected nav
+    // pill wears, with the theme's text on it. The
+    // category name stays on the pill as text; only the
+    // colors changed source. Danger red is untouched:
+    // it keeps its own color, always.
+    if let Some(category) = mod_data.categories.first() {
+        pill_items.insert(
+            0,
+            pill(category.clone(), theme::accent()).into(),
+        );
+    }
     if is_favorite {
         pill_items.push(
             pill("Favorite".to_string(), Color::from_rgb(0.32, 0.33, 0.37)).into(),

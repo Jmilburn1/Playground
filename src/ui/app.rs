@@ -86,6 +86,29 @@ const RESTORE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 /// Hold-to-delete (feel pass, 2026-10-23): how long a
 /// routine Remove control must be held before the delete
 /// fires, and the hold clock's tick while one is live.
+/// Every collapsible Settings section's id (ST15,
+/// cosmetic round): entering the Settings page seeds
+/// the collapsed set with all of them, so the page
+/// always arrives fully closed.
+const SETTINGS_SECTION_IDS: &[&str] = &[
+    "general-theme",
+    "general-updates",
+    "general-behavior",
+    "general-launch",
+    "general-graphics",
+    "folders-paths",
+    "library-autofill",
+    "library-catalog",
+    "library-layout",
+    "library-folder",
+    "accounts-github",
+    "diagnostics-summary",
+    "diagnostics-log-reader",
+    "maintenance-reread",
+    "maintenance-downloads",
+    "maintenance-fill-log",
+];
+
 const REMOVE_HOLD_TIME: std::time::Duration = std::time::Duration::from_millis(700);
 const REMOVE_HOLD_TICK: std::time::Duration = std::time::Duration::from_millis(25);
 /// The feel pass's animation constants (2026-10-23):
@@ -859,7 +882,6 @@ pub struct App {
     /// removes its id from the set when it writes a state.
     db_applied: HashSet<String>,
     link_input: String,
-    modhub_input: String,
     /// Chunked ModHub detection pass state: remaining
     /// (stem, file name, title) jobs and running tallies.
     /// Set by a user-pressed Rescan (sidebar or Settings):
@@ -1096,7 +1118,7 @@ impl App {
             gs_live_band: None,
             gs_identity: None,
             gs_highlands: false,
-            gs_choice: GsChoice::Preset(GsPreset::Daylight),
+            gs_choice: GsChoice::Preset(GsPreset::Dark),
             gs_pending_canvas: None,
             gs_pending_band: None,
             gs_pending_note: String::new(),
@@ -1111,7 +1133,6 @@ impl App {
             db_summary: update_db::DbSummary::default(),
             db_applied: HashSet::new(),
             link_input: String::new(),
-            modhub_input: String::new(),
             detect_after_scan: false,
             detect_jobs: Vec::new(),
             detect_total: 0,
@@ -1777,7 +1798,7 @@ impl App {
                             Some(UpdateState::Available(_))
                         ),
                         BrowseView::Category(c) => {
-                            m.categories.iter().any(|x| x == c)
+                            m.categories.first().map_or(false, |x| x == c)
                         }
                     })
             })
@@ -2805,37 +2826,6 @@ impl App {
                     }
                 }
             }
-            Message::ModHubInputChanged(value) => self.modhub_input = value,
-            Message::SaveModHubLink(id) => {
-                if let Some(m) = self.mod_manager.get_mod(&id).cloned() {
-                    let stem = ModManager::mod_stem(&m.path);
-                    let input = self.modhub_input.trim().to_string();
-                    if input.is_empty() {
-                        match self.mod_manager.set_modhub_link(&stem, None) {
-                            Ok(()) => {
-                                self.status =
-                                    format!("ModHub link removed for {}.", m.name);
-                            }
-                            Err(e) => self.status = format!("Saving the link failed: {}", e),
-                        }
-                    } else if let Some(mod_id) = crate::sources::mod_hub::normalize_modhub(&input) {
-                        match self.mod_manager.set_modhub_link(&stem, Some(mod_id.clone())) {
-                            Ok(()) => {
-                                self.modhub_input = mod_id.clone();
-                                self.status = format!(
-                                    "{} linked to ModHub mod {}.",
-                                    m.name, mod_id
-                                );
-                            }
-                            Err(e) => self.status = format!("Saving the link failed: {}", e),
-                        }
-                    } else {
-                        self.status =
-                            "That doesn't look like a ModHub link — paste the mod's ModHub page URL or its numeric id."
-                                .to_string();
-                    }
-                }
-            }
             Message::CheckUpdate(id) => {
                 if let Some(m) = self.mod_manager.get_mod(&id).cloned() {
                     let stem = ModManager::mod_stem(&m.path);
@@ -3852,8 +3842,20 @@ impl App {
                     iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
                 );
             }
+            Message::CloseShowMenu => {
+                self.show_menu_open = false;
+            }
             Message::TabSelected(tab) => {
                 self.show_menu_open = false;
+                if tab == Tab::Settings {
+                    // Every section starts collapsed on
+                    // entry (John, 2026-10-23): sections
+                    // arrive closed, instead of open waiting
+                    // to be collapsed. Open-state never
+                    // carries over from a previous visit.
+                    self.settings_collapsed =
+                        SETTINGS_SECTION_IDS.iter().map(|id| id.to_string()).collect();
+                }
                 if tab == Tab::Saves {
                     self.refresh_save_slots();
                 }
@@ -3912,11 +3914,6 @@ impl App {
                         self.link_input = self
                             .mod_manager
                             .mod_link(&stem)
-                            .map(|s| s.to_string())
-                            .unwrap_or_default();
-                        self.modhub_input = self
-                            .mod_manager
-                            .modhub_link(&stem)
                             .map(|s| s.to_string())
                             .unwrap_or_default();
                     }
@@ -4717,7 +4714,7 @@ impl App {
             .mod_manager
             .get_mods()
             .into_iter()
-            .flat_map(|m| m.categories.iter().cloned())
+            .filter_map(|m| m.categories.first().cloned())
             .collect();
         cats.sort();
         cats.dedup();
@@ -4733,7 +4730,7 @@ impl App {
             tally_states(all_mods.iter().map(|m| m.state.clone()));
         let maps_count = all_mods
             .iter()
-            .filter(|m| m.categories.iter().any(|c| c == "Maps"))
+            .filter(|m| m.categories.first().map_or(false, |c| c == "Maps"))
             .count();
         let tile = |value: String, label: &str| {
             container(
@@ -4836,7 +4833,7 @@ impl App {
             // now (John, 2026-10-21) — the accent from
             // ui::theme, not the old flat grey.
             .style(theme::dropdown_field()),
-            text_input("Search mods...", &self.search_query)
+            text_input("Search Mods / Author", &self.search_query)
                 .style(theme::input_field())
                 .on_input(Message::SearchChanged)
                 .padding(8)
@@ -5018,7 +5015,7 @@ impl App {
             for opt in view_options {
                 let selected = opt == self.view_filter;
                 options_col = options_col.push(
-                    button(centered_label(text(format!("{}", opt))))
+                    button(text(format!("{}", opt)))
                         .width(200)
                         .padding([6, 10])
                         .on_press(Message::BrowseViewChanged(opt))
@@ -5032,7 +5029,16 @@ impl App {
                     options_col.into()
                 };
             Some(
-                column![
+                stack![
+                    button(Space::with_width(0))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(|_, _| button::Style {
+                            background: None,
+                            ..button::Style::default()
+                        })
+                        .on_press(Message::CloseShowMenu),
+                    column![
                     // The settle (feel pass part 2): the
                     // menu opens a few pixels low and eases
                     // up into place over ~160ms.
@@ -5049,6 +5055,7 @@ impl App {
                             ..Default::default()
                         }),
                     ],
+                    ]
                 ]
                 .into(),
             )
@@ -5413,25 +5420,43 @@ impl App {
         // brightens toward the hover shade — so the
         // press reads as pressure, not just a timer.
         let hold_p = self.remove_hold_progress(&m.id);
-        let remove_control = mouse_area(
-            container(
-                column![
-                    centered_label(text(remove_label).size(14.0 - hold_p)),
-                    progress_bar(0.0..=1.0, hold_p)
-                        .height(4)
-                        .style(theme::hold_bar),
-                ]
-                .spacing(5),
-            )
-            .width(Length::Fill)
-            .padding(iced::Padding {
-                top: 8.0,
-                right: 12.0 + 5.0 * hold_p,
-                bottom: 8.0,
-                left: 12.0 + 5.0 * hold_p,
-            })
-            .style(theme::danger_box_hold(hold_p)),
-        )
+        // Resting height matches the Favorite/Move pills
+        // (cosmetic round D1, John, 2026-10-23): the hold
+        // bar no longer stacks under the label — while a
+        // hold is live it overlays the control's bottom
+        // edge, so the progress shows without the control
+        // standing thicker than its neighbours at rest.
+        let remove_base = container(centered_label(
+            text(remove_label).size(14.0 - hold_p),
+        ))
+        .width(Length::Fill)
+        .padding(iced::Padding {
+            top: 5.0,
+            right: 12.0 + 5.0 * hold_p,
+            bottom: 5.0,
+            left: 12.0 + 5.0 * hold_p,
+        })
+        .style(theme::danger_box_hold(hold_p));
+        let remove_body: Element<'_, Message> = if hold_p > 0.0 {
+            stack![
+                remove_base,
+                container(
+                    column![
+                        Space::with_height(Length::Fill),
+                        progress_bar(0.0..=1.0, hold_p)
+                            .height(4)
+                            .style(theme::hold_bar),
+                    ]
+                    .width(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill),
+            ]
+            .into()
+        } else {
+            remove_base.into()
+        };
+        let remove_control = mouse_area(remove_body)
         .on_press(Message::RemoveHoldStarted(m.id.clone()))
         .on_release(Message::RemoveHoldReleased)
         .on_exit(Message::RemoveHoldReleased)
@@ -5469,19 +5494,6 @@ impl App {
             ]
             .spacing(6),
         );
-        col = col.push(text("Updates (ModHub):").size(13));
-        col = col.push(
-            row![
-                text_input("ModHub page URL or mod id", &self.modhub_input)
-                    .style(theme::input_field())
-                    .on_input(Message::ModHubInputChanged)
-                    .size(13),
-                button(text(if mh_linked.is_some() { "Save link" } else { "Link" }).size(13))
-                    .style(theme::nav_pill(true))
-                    .on_press(Message::SaveModHubLink(m.id.clone())),
-            ]
-            .spacing(6),
-        );
         if linked.is_none()
             && mh_linked.is_none()
             && !matches!(
@@ -5494,6 +5506,10 @@ impl App {
             );
         }
 
+        // The flyout's bottom margin (cosmetic round D3,
+        // John, 2026-10-23): the content used to run flush
+        // to the panel's bottom edge.
+        col = col.push(Space::with_height(10));
         Some(
             container(scrollable(col))
                 .width(DETAILS_W)
@@ -5892,66 +5908,167 @@ impl App {
                 .width(Length::Fill),
         ]
         .spacing(10);
-        if self.save_slots_cache.is_empty() {
-            col = col.push(
-                text("No save slots found in the game profile folder.")
-                    .size(13)
-                    .color(theme::text()),
-            );
-        }
-        for slot in &self.save_slots_cache {
-            let selected =
-                self.saves_selected.as_deref() == Some(slot.dir_name.as_str());
-            let mut lines: iced::widget::Column<'_, Message, iced::Theme, iced::Renderer> =
-                column![].spacing(2);
-            let title = match &slot.name {
-                Some(name) => format!("Savegame {} — {}", slot.slot, name),
-                None => format!("Savegame {}", slot.slot),
-            };
-            lines = lines.push(text(title).size(14).color(theme::text()));
-            lines = lines.push(
-                text(format!(
-                    "{} · {} mods recorded · played {} · {}",
-                    slot.map.as_deref().unwrap_or("unknown map"),
-                    slot.mod_count,
-                    slot.play_time_display().as_deref().unwrap_or("?"),
-                    slot.money
-                        .map(fmt_money)
-                        .unwrap_or_else(|| "?".to_string()),
-                ))
-                .size(12)
-                .color(theme::text_dim()),
-            );
-            let loadout = self.mod_manager.save_loadout(&slot.dir_name);
-            lines = lines.push(
-                text(if loadout.is_empty() {
-                    "No loadout saved".to_string()
-                } else {
-                    format!("Loadout: {} mods", loadout.len())
+        // C1 (cosmetic round, John, 2026-10-23): ALL 20
+        // slots as a 4-across grid — occupied slots show
+        // their save, empty slots show as empty ("no
+        // save"), muted and non-selectable, never omitted.
+        // C1-plus: an occupied card carries its save's MAP
+        // ICON when the save's map resolves to a library
+        // map mod (its extracted icon); a neutral plate
+        // covers a map that can't be resolved.
+        let map_icon_for = |slot: &crate::mod_manager::saves::SaveSlot| {
+            let want = slot
+                .map
+                .as_deref()?
+                .to_lowercase()
+                .replace(|c: char| !c.is_alphanumeric(), "");
+            if want.len() < 4 {
+                return None;
+            }
+            self.mod_manager
+                .get_mods()
+                .into_iter()
+                .filter(|m| {
+                    m.categories.first().map_or(false, |c| c == "Maps")
                 })
-                .size(12)
-                .color(theme::text_dim()),
-            );
-            let card_btn = button(lines)
-                .width(Length::Fill)
-                .padding(10)
-                .style(move |_theme, _status| iced::widget::button::Style {
-                    background: Some(iced::Background::Color(theme::panel())),
-                    border: iced::Border {
-                        color: if selected {
-                            theme::accent()
-                        } else {
-                            theme::base()
+                .find(|m| {
+                    let have = m
+                        .name
+                        .to_lowercase()
+                        .replace(|c: char| !c.is_alphanumeric(), "");
+                    have.contains(&want) || want.contains(&have)
+                })
+                .and_then(|m| self.icons.get(&m.id).cloned())
+        };
+        let mut grid = column![].spacing(8);
+        for row_start in (1..=20usize).step_by(4) {
+            let mut r = row![].spacing(8);
+            for n in row_start..row_start + 4 {
+                let found = self
+                    .save_slots_cache
+                    .iter()
+                    .find(|slot| slot.slot == n);
+                let cell: Element<'_, Message> = match found {
+                    Some(slot) => {
+                        let selected = self.saves_selected.as_deref()
+                            == Some(slot.dir_name.as_str());
+                        let title = match &slot.name {
+                            Some(name) => {
+                                format!("Savegame {} — {}", slot.slot, name)
+                            }
+                            None => format!("Savegame {}", slot.slot),
+                        };
+                        let icon: Element<'_, Message> =
+                            match map_icon_for(slot) {
+                                Some(handle) => iced::widget::image(handle)
+                                    .width(Length::Fixed(44.0))
+                                    .height(Length::Fixed(44.0))
+                                    .content_fit(iced::ContentFit::Cover)
+                                    .into(),
+                                None => container(
+                                    text("MAP").size(10).color(theme::text_dim()),
+                                )
+                                .width(Length::Fixed(44.0))
+                                .height(Length::Fixed(44.0))
+                                .center_x(44.0)
+                                .center_y(44.0)
+                                .style(|_| container::Style {
+                                    background: Some(iced::Background::Color(
+                                        theme::base(),
+                                    )),
+                                    border: iced::Border {
+                                        radius: 6.0.into(),
+                                        ..iced::Border::default()
+                                    },
+                                    ..container::Style::default()
+                                })
+                                .into(),
+                            };
+                        let loadout =
+                            self.mod_manager.save_loadout(&slot.dir_name);
+                        let lines = column![
+                            text(title).size(13).color(theme::text()),
+                            text(format!(
+                                "{} · {} mods · {} · {}",
+                                slot.map.as_deref().unwrap_or("unknown map"),
+                                slot.mod_count,
+                                slot.play_time_display()
+                                    .as_deref()
+                                    .unwrap_or("?"),
+                                slot.money
+                                    .map(fmt_money)
+                                    .unwrap_or_else(|| "?".to_string()),
+                            ))
+                            .size(11)
+                            .color(theme::text_dim()),
+                            text(if loadout.is_empty() {
+                                "No loadout saved".to_string()
+                            } else {
+                                format!("Loadout: {} mods", loadout.len())
+                            })
+                            .size(11)
+                            .color(theme::text_dim()),
+                        ]
+                        .spacing(2);
+                        button(
+                            row![icon, lines]
+                                .spacing(8)
+                                .align_y(iced::Alignment::Center),
+                        )
+                        .width(Length::FillPortion(1))
+                        .padding(9)
+                        .style(move |_theme, _status| {
+                            iced::widget::button::Style {
+                                background: Some(iced::Background::Color(
+                                    theme::panel(),
+                                )),
+                                border: iced::Border {
+                                    color: if selected {
+                                        theme::accent()
+                                    } else {
+                                        theme::base()
+                                    },
+                                    width: if selected { 2.0 } else { 1.0 },
+                                    radius: 8.0.into(),
+                                },
+                                text_color: theme::text(),
+                                ..Default::default()
+                            }
+                        })
+                        .on_press(Message::SelectSaveSlot(
+                            slot.dir_name.clone(),
+                        ))
+                        .into()
+                    }
+                    None => container(
+                        column![
+                            text(format!("Savegame {}", n))
+                                .size(13)
+                                .color(theme::text_dim()),
+                            text("no save")
+                                .size(11)
+                                .color(theme::text_dim()),
+                        ]
+                        .spacing(2),
+                    )
+                    .width(Length::FillPortion(1))
+                    .padding(9)
+                    .style(|_| container::Style {
+                        background: Some(iced::Background::Color(theme::base())),
+                        border: iced::Border {
+                            color: theme::panel(),
+                            width: 1.0,
+                            radius: 8.0.into(),
                         },
-                        width: if selected { 2.0 } else { 1.0 },
-                        radius: 8.0.into(),
-                    },
-                    text_color: theme::text(),
-                    ..Default::default()
-                })
-                .on_press(Message::SelectSaveSlot(slot.dir_name.clone()));
-            col = col.push(card_btn);
+                        ..container::Style::default()
+                    })
+                    .into(),
+                };
+                r = r.push(cell);
+            }
+            grid = grid.push(r);
         }
+        col = col.push(grid);
         let next: Element<'_, Message> = if self.saves_selected.is_some() {
             self.wizard_step_buttons(None, Some((1, "Next: Settings")))
         } else {
@@ -7158,16 +7275,6 @@ impl App {
     /// text and no dead controls. The scroll keeps the
     /// Settings standard (page_scroll_pad 20).
     fn settings_view(&self) -> Element<'_, Message> {
-        let total = self.mod_manager.get_mods().len();
-        let active = self
-            .mod_manager
-            .get_mods_by_state(ModState::Active)
-            .len();
-        let archived = self
-            .mod_manager
-            .get_mods_by_state(ModState::Archived)
-            .len();
-
         let tab_button = |tab: SettingsTab, label: &str| {
             button(text(label.to_string()))
                 .style(theme::nav_pill(self.settings_tab == tab))
@@ -7202,24 +7309,18 @@ impl App {
                 .width(Length::Fill),
             // The footer row lives outside the scrollable
             // and shows on every tab: the one save for the
-            // whole page, the library counts, and the
-            // standing Rescan. The same right pad aligns
+            // whole page, alone now (cosmetic round, John,
+            // 2026-10-23) — the counts were redundant with
+            // the sidebar rows and the Browse tiles (ST18),
+            // Rescan moved into the Game Folders folders
+            // area (ST16), and Save wears the save green on
+            // the right (ST17). The same right pad aligns
             // its edge with the boxes'.
             row![
-                button(text("Save settings"))
-                    .style(theme::nav_pill(true))
-                    .on_press(Message::SaveDirectories),
-                text(format!(
-                    "Mods: {} total — {} active, {} archived · Favorites: {}",
-                    total,
-                    active,
-                    archived,
-                    self.mod_manager.favorites_count()
-                )),
                 Space::with_width(Length::Fill),
-                button(text("Rescan folders"))
-                    .style(theme::danger_pill())
-                    .on_press(Message::Scan),
+                button(text("Save settings"))
+                    .style(theme::save_pill())
+                    .on_press(Message::SaveDirectories),
             ]
             .spacing(8)
             .padding(iced::Padding {
@@ -7315,53 +7416,6 @@ impl App {
     /// General: start-up behaviour, the Launch
     /// Configuration, and the placeholder boxes.
     fn settings_general_tab(&self) -> Element<'_, Message> {
-        let fill_line = match self.fill_task_registered {
-            Some(true) => "Scheduled fill: the Windows task \"Playground Update Fill\" is registered.",
-            Some(false) => {
-                "Scheduled fill: the Windows task \"Playground Update Fill\" is not registered."
-            }
-            None => {
-                "Scheduled fill: registration could not be checked here."
-            }
-        };
-        let updates = self.settings_box(
-            "general-updates",
-            "Updates",
-            vec![
-                checkbox(
-                    "Check for updates at start-up",
-                    self.settings_startup_check,
-                )
-                .on_toggle(Message::SettingsStartupCheckToggled)
-                .into(),
-                text("Runs the update check once when Playground starts. The Rescan button always runs it too.")
-                    .size(12)
-                    .color(theme::text_dim())
-                    .into(),
-                row![
-                    checkbox(
-                        "Playground self-update",
-                        self.settings_self_update,
-                    )
-                    .on_toggle(Message::SettingsSelfUpdateToggled),
-                    button(text("Check now"))
-                        .style(theme::nav_pill(true))
-                        .on_press(Message::CheckAppUpdateNow),
-                ]
-                .spacing(8)
-                .into(),
-                text("When on, a newer published Playground is offered at start-up. Check now runs the same check right away.")
-                    .size(12)
-                    .color(theme::text_dim())
-                    .into(),
-                text(fill_line).size(13).into(),
-                text("The scheduled catalog fill (update.exe) runs daily at 06:00, 14:00 and 22:00.")
-                    .size(12)
-                    .color(theme::text_dim())
-                    .into(),
-            ],
-        );
-
         let mut view_options = vec![
             BrowseView::All,
             BrowseView::Active,
@@ -7373,7 +7427,7 @@ impl App {
             .mod_manager
             .get_mods()
             .into_iter()
-            .flat_map(|m| m.categories.iter().cloned())
+            .filter_map(|m| m.categories.first().cloned())
             .collect();
         cats.sort();
         cats.dedup();
@@ -7384,62 +7438,98 @@ impl App {
         // palette, its name, its tag. Picking applies
         // live and saves at once (see ThemeSelected).
         let current_theme_id = theme::current_theme().id;
-        let mut theme_rows: Vec<Element<'_, Message>> = vec![
-            text("Applies the moment you pick — no save, no restart. The Remove/Rescan red never changes: it is a meaning, not a fashion.")
-                .size(12)
-                .color(theme::text_dim())
-                .into(),
-        ];
+        // ST1 (cosmetic round, John, 2026-10-23): the five
+        // themes as preview CARDS on ONE row — each card a
+        // miniature of its own theme (base ground, panel
+        // block, accent bar, its own text), the way the
+        // palette board showed them when he picked the
+        // five. Click applies live; the active card wears
+        // its own accent as a heavier border.
+        let mut cards = row![].spacing(8);
         for def in theme::THEMES {
             let p = def.palette;
-            let swatch = |c: iced::Color| {
-                container(text(""))
-                    .width(16)
-                    .height(16)
+            let selected = current_theme_id == def.id;
+            let preview = container(
+                column![
+                    container(
+                        column![
+                            container(text(""))
+                                .width(Length::Fill)
+                                .height(6)
+                                .style(move |_| container::Style {
+                                    background: Some(iced::Background::Color(p.accent)),
+                                    ..container::Style::default()
+                                }),
+                            text("Aa").size(15).color(p.text),
+                            text("Text").size(10).color(p.text_dim),
+                        ]
+                        .spacing(3)
+                        .padding(6),
+                    )
+                    .width(Length::Fill)
                     .style(move |_| container::Style {
-                        background: Some(iced::Background::Color(c)),
+                        background: Some(iced::Background::Color(p.panel)),
                         border: iced::Border {
-                            color: theme::text_dim(),
-                            width: 1.0,
-                            radius: 4.0.into(),
+                            radius: 5.0.into(),
+                            ..iced::Border::default()
                         },
                         ..container::Style::default()
-                    })
+                    }),
+                ]
+                .spacing(4),
+            )
+            .width(Length::Fill)
+            .padding(6)
+            .style(move |_| container::Style {
+                background: Some(iced::Background::Color(p.base)),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    ..iced::Border::default()
+                },
+                ..container::Style::default()
+            });
+            let tag = match def.id {
+                "gunmetal" => " (default)",
+                "wildflower" | "lavender-dusk" => " (for women)",
+                _ => "",
             };
-            let mut label = row![
-                swatch(p.base),
-                swatch(p.panel),
-                swatch(p.accent),
-                swatch(p.text),
-                text(def.name).size(13),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
-            match def.id {
-                "gunmetal" => {
-                    label = label.push(
-                        text("(default)")
-                            .size(11)
-                            .color(theme::text_dim()),
-                    );
-                }
-                "wildflower" | "lavender-dusk" => {
-                    label = label.push(
-                        text("(for women)")
-                            .size(11)
-                            .color(theme::text_dim()),
-                    );
-                }
-                _ => {}
-            }
-            theme_rows.push(
-                button(label)
-                    .style(theme::nav_pill(current_theme_id == def.id))
-                    .on_press(Message::ThemeSelected(def.id.to_string()))
-                    .into(),
-            );
+            let card = button(
+                column![
+                    preview,
+                    text(format!("{}{}", def.name, tag)).size(12),
+                ]
+                .spacing(5),
+            )
+            .width(Length::FillPortion(1))
+            .padding(6)
+            .style(move |_theme, _status| button::Style {
+                background: Some(iced::Background::Color(theme::panel())),
+                text_color: theme::text(),
+                border: iced::Border {
+                    color: if selected {
+                        p.accent
+                    } else {
+                        theme::base()
+                    },
+                    width: if selected { 2.0 } else { 1.0 },
+                    radius: 8.0.into(),
+                },
+                ..button::Style::default()
+            })
+            .on_press(Message::ThemeSelected(def.id.to_string()));
+            cards = cards.push(card);
         }
-        let theme_box = self.settings_box("general-theme", "Theme", theme_rows);
+        let theme_box = self.settings_box(
+            "general-theme",
+            "Theme",
+            vec![
+                text("Applies the moment you pick — no save, no restart. The Remove/Rescan red never changes: it is a meaning, not a fashion.")
+                    .size(12)
+                    .color(theme::text_dim())
+                    .into(),
+                cards.into(),
+            ],
+        );
 
         let behavior = self.settings_box(
             "general-behavior",
@@ -7465,129 +7555,10 @@ impl App {
             ],
         );
 
-        // The Developer Console stages like every other
-        // value on the page now; its three states mirror
-        // Round 1's row (switch / no switch in game.xml /
-        // no game folder yet).
-        let console_row: Element<'_, Message> =
-            match (self.mod_manager.game_directory(), self.console_on) {
-                (Some(_), Some(on)) => checkbox(
-                    "Developer console (written to game.xml when the page saves)",
-                    on,
-                )
-                .on_toggle(|on| {
-                    Message::SettingsLaunchToggled(LaunchSetting::Console, on)
-                })
-                .into(),
-                (Some(_), None) => {
-                    text("Developer console: no game.xml console switch found in the profile folder.")
-                        .size(13)
-                        .into()
-                }
-                (None, _) => {
-                    text("Developer console: set the profile folder (Game Folders tab) to manage the console switch in game.xml.")
-                        .size(13)
-                        .into()
-                }
-            };
-        // The preview reads the staged values, the slot
-        // from its field (an unparseable slot previews as
-        // unset; the save itself refuses it).
-        let slot = self
-            .settings_launch_slot_input
-            .trim()
-            .parse::<u8>()
-            .ok()
-            .filter(|n| (1..=20).contains(n));
-        let preview = crate::config::launch_command_preview(
-            &crate::config::LaunchConfig {
-                slot,
-                ..self.settings_launch.clone()
-            },
-        );
-        let launch = self.settings_box(
-            "general-launch",
-            "Launch Configuration",
-            vec![
-                console_row,
-                row![
-                    text("Savegame slot (1–20, empty = unset):")
-                        .size(13)
-                        .width(300),
-                    text_input("", &self.settings_launch_slot_input)
-                        .style(theme::input_field())
-                        .on_input(Message::SettingsLaunchSlotChanged)
-                        .padding(8)
-                        .width(90),
-                ]
-                .spacing(8)
-                .into(),
-                checkbox(
-                    "Skip mod update dialog",
-                    self.settings_launch.skip_mod_update_dialog,
-                )
-                .on_toggle(|on| Message::SettingsLaunchToggled(
-                    LaunchSetting::SkipModUpdateDialog,
-                    on,
-                ))
-                .into(),
-                checkbox("Enable cheats", self.settings_launch.cheats)
-                    .on_toggle(|on| Message::SettingsLaunchToggled(
-                        LaunchSetting::Cheats,
-                        on,
-                    ))
-                    .into(),
-                checkbox("Auto-start the savegame", self.settings_launch.autostart)
-                    .on_toggle(|on| Message::SettingsLaunchToggled(
-                        LaunchSetting::AutoStart,
-                        on,
-                    ))
-                    .into(),
-                checkbox(
-                    "Skip start videos",
-                    self.settings_launch.skip_start_videos,
-                )
-                .on_toggle(|on| Message::SettingsLaunchToggled(
-                    LaunchSetting::SkipStartVideos,
-                    on,
-                ))
-                .into(),
-                text("Launch command preview:").size(13).into(),
-                row![
-                    text(preview).size(13).color(theme::text_dim()),
-                    button(text("Copy flags for Steam"))
-                        .style(theme::nav_pill(true))
-                        .on_press(Message::CopyLaunchFlags),
-                ]
-                .spacing(12)
-                .into(),
-                text("Playground never runs this command. The flags are yours to paste into Steam's Launch Options for FS25 (right-click the game, Properties, General, Launch Options). The Developer Console acts through game.xml when the page saves.")
-                    .size(12)
-                    .color(theme::text_dim())
-                    .into(),
-            ],
-        );
-
         column![
             theme_box,
-            updates,
             behavior,
-            launch,
-            self.settings_placeholder("general-appearance", "General"),
             self.settings_placeholder("general-graphics", "Graphics"),
-            self.settings_box(
-                "general-game-screens",
-                "Game Screens",
-                vec![
-                    text("Menu and loading screens for FS25: the Farmer Jay presets, your own art, and timestamped backups of the originals.")
-                        .size(13)
-                        .into(),
-                    row![button(text("Open Game Screens page"))
-                        .style(theme::nav_pill(true))
-                        .on_press(Message::TabSelected(Tab::GameScreens))]
-                    .into(),
-                ],
-            ),
         ]
         .spacing(10)
         .into()
@@ -7616,6 +7587,21 @@ impl App {
                     &self.game_install_dir_input,
                     FolderTarget::GameInstall,
                 ),
+                // Rescan lives with the folders it rescans
+                // (cosmetic round ST16, John, 2026-10-23):
+                // right side, under the Game install row,
+                // still wearing the danger red. The spacer
+                // matches its distance from the buttons above
+                // to the distance between the box's other
+                // button rows (John, live, 2026-10-23).
+                Space::with_height(17).into(),
+                row![
+                    Space::with_width(Length::Fill),
+                    button(text("Rescan folders"))
+                        .style(theme::danger_pill())
+                        .on_press(Message::Scan),
+                ]
+                .into(),
             ],
         );
         column![folders].spacing(10).into()
@@ -7781,7 +7767,110 @@ impl App {
             ],
         );
 
-        column![library_folder, layout, catalog, auto_fill]
+        // The Developer Console stages like every other
+        // value on the page now; its three states mirror
+        // Round 1's row (switch / no switch in game.xml /
+        // no game folder yet).
+        let console_row: Element<'_, Message> =
+            match (self.mod_manager.game_directory(), self.console_on) {
+                (Some(_), Some(on)) => checkbox(
+                    "Developer console (written to game.xml when the page saves)",
+                    on,
+                )
+                .on_toggle(|on| {
+                    Message::SettingsLaunchToggled(LaunchSetting::Console, on)
+                })
+                .into(),
+                (Some(_), None) => {
+                    text("Developer console: no game.xml console switch found in the profile folder.")
+                        .size(13)
+                        .into()
+                }
+                (None, _) => {
+                    text("Developer console: set the profile folder (Game Folders tab) to manage the console switch in game.xml.")
+                        .size(13)
+                        .into()
+                }
+            };
+        // The preview reads the staged values, the slot
+        // from its field (an unparseable slot previews as
+        // unset; the save itself refuses it).
+        let slot = self
+            .settings_launch_slot_input
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|n| (1..=20).contains(n));
+        let preview = crate::config::launch_command_preview(
+            &crate::config::LaunchConfig {
+                slot,
+                ..self.settings_launch.clone()
+            },
+        );
+        let launch = self.settings_box(
+            "general-launch",
+            "Launch Configuration",
+            vec![
+                console_row,
+                row![
+                    text("Savegame slot (1–20, empty = unset):")
+                        .size(13)
+                        .width(300),
+                    text_input("", &self.settings_launch_slot_input)
+                        .style(theme::input_field())
+                        .on_input(Message::SettingsLaunchSlotChanged)
+                        .padding(8)
+                        .width(90),
+                ]
+                .spacing(8)
+                .into(),
+                checkbox(
+                    "Skip mod update dialog",
+                    self.settings_launch.skip_mod_update_dialog,
+                )
+                .on_toggle(|on| Message::SettingsLaunchToggled(
+                    LaunchSetting::SkipModUpdateDialog,
+                    on,
+                ))
+                .into(),
+                checkbox("Enable cheats", self.settings_launch.cheats)
+                    .on_toggle(|on| Message::SettingsLaunchToggled(
+                        LaunchSetting::Cheats,
+                        on,
+                    ))
+                    .into(),
+                checkbox("Auto-start the savegame", self.settings_launch.autostart)
+                    .on_toggle(|on| Message::SettingsLaunchToggled(
+                        LaunchSetting::AutoStart,
+                        on,
+                    ))
+                    .into(),
+                checkbox(
+                    "Skip start videos",
+                    self.settings_launch.skip_start_videos,
+                )
+                .on_toggle(|on| Message::SettingsLaunchToggled(
+                    LaunchSetting::SkipStartVideos,
+                    on,
+                ))
+                .into(),
+                text("Launch command preview:").size(13).into(),
+                row![
+                    text(preview).size(13).color(theme::text_dim()),
+                    button(text("Copy flags for Steam"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::CopyLaunchFlags),
+                ]
+                .spacing(12)
+                .into(),
+                text("Playground never runs this command. The flags are yours to paste into Steam's Launch Options for FS25 (right-click the game, Properties, General, Launch Options). The Developer Console acts through game.xml when the page saves.")
+                    .size(12)
+                    .color(theme::text_dim())
+                    .into(),
+            ],
+        );
+
+        column![auto_fill, launch, catalog, layout, library_folder]
             .spacing(10)
             .into()
     }
@@ -7806,10 +7895,7 @@ impl App {
                     .into(),
             ],
         );
-        column![
-            github,
-            self.settings_placeholder("accounts-sharing", "Sharing"),
-        ]
+        column![github]
         .spacing(10)
         .into()
     }
@@ -7933,42 +8019,102 @@ impl App {
                     .into(),
             ],
         );
-        column![reread, downloads, fill_log].spacing(10).into()
+        let fill_line = match self.fill_task_registered {
+            Some(true) => "Scheduled fill: the Windows task \"Playground Update Fill\" is registered.",
+            Some(false) => {
+                "Scheduled fill: the Windows task \"Playground Update Fill\" is not registered."
+            }
+            None => {
+                "Scheduled fill: registration could not be checked here."
+            }
+        };
+        let updates = self.settings_box(
+            "general-updates",
+            "Updates",
+            vec![
+                checkbox(
+                    "Check for updates at start-up",
+                    self.settings_startup_check,
+                )
+                .on_toggle(Message::SettingsStartupCheckToggled)
+                .into(),
+                text("Runs the update check once when Playground starts. The Rescan button always runs it too.")
+                    .size(12)
+                    .color(theme::text_dim())
+                    .into(),
+                row![
+                    checkbox(
+                        "Playground self-update",
+                        self.settings_self_update,
+                    )
+                    .on_toggle(Message::SettingsSelfUpdateToggled),
+                    button(text("Check now"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::CheckAppUpdateNow),
+                ]
+                .spacing(8)
+                .into(),
+                text("When on, a newer published Playground is offered at start-up. Check now runs the same check right away.")
+                    .size(12)
+                    .color(theme::text_dim())
+                    .into(),
+                text(fill_line).size(13).into(),
+                text("The scheduled catalog fill (update.exe) runs daily at 06:00, 14:00 and 22:00.")
+                    .size(12)
+                    .color(theme::text_dim())
+                    .into(),
+            ],
+        );
+
+        column![updates, reread, downloads, fill_log]
+            .spacing(10)
+            .into()
     }
 
     /// About: the version, the two links, and the credit.
     fn settings_about_tab(&self) -> Element<'_, Message> {
-        let about = self.settings_box(
-            "about-main",
-            "About",
-            vec![
-                text(format!(
-                    "Playground v{}",
-                    env!("CARGO_PKG_VERSION")
+        // ST14 (cosmetic round, John, 2026-10-23): the
+        // About tab is a SINGLE CARD holding exactly four
+        // things, in this order — the logo, the links
+        // (website, then GitHub), the version line, and
+        // the copyright line. Nothing else rides the card.
+        let card = container(
+            column![
+                iced::widget::image(iced::widget::image::Handle::from_bytes(
+                    include_bytes!("../../assets/logo.png").to_vec(),
                 ))
-                .size(14)
-                .into(),
+                .filter_method(iced::widget::image::FilterMethod::Linear)
+                .width(480)
+                .height(480),
                 row![
+                    button(text("farmerjay.dev"))
+                        .style(theme::nav_pill(true))
+                        .on_press(Message::OpenUrl(
+                            "https://farmerjay.dev".to_string(),
+                        )),
                     button(text("GitHub — Jmilburn1/Playground"))
                         .style(theme::nav_pill(true))
                         .on_press(Message::OpenUrl(
                             "https://github.com/Jmilburn1/Playground"
                                 .to_string(),
                         )),
-                    button(text("farmerjay.dev"))
-                        .style(theme::nav_pill(true))
-                        .on_press(Message::OpenUrl(
-                            "https://farmerjay.dev".to_string(),
-                        )),
                 ]
-                .spacing(8)
-                .into(),
-                text("By Farmer Jay / Albert Einstein")
-                    .size(13)
-                    .into(),
-            ],
-        );
-        column![about].spacing(10).into()
+                .spacing(8),
+                text(format!(
+                    "Playground v{}",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .size(14),
+                text("© 2026 Farmer Jay.").size(13),
+            ]
+            .spacing(10)
+            .align_x(iced::alignment::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .align_x(iced::alignment::Alignment::Center)
+        .padding(14)
+        .style(wizard_section_box);
+        column![card].spacing(10).into()
     }
 
     /// The Library Layout page (Roadmap #2, Phase 4):
@@ -8353,7 +8499,7 @@ impl App {
         let all = self.mod_manager.get_mods();
         let cat = |name: &str| {
             all.iter()
-                .filter(|m| m.categories.iter().any(|c| c == name))
+                .filter(|m| m.categories.first().map_or(false, |c| c == name))
                 .count()
         };
         [
@@ -9126,30 +9272,97 @@ impl App {
 
         // The choice + its preview.
         let mut choose = column![text("Screens").size(15)].spacing(7);
+        // GS2 (cosmetic round, John, 2026-10-23): the
+        // options are preview CARDS — each shows its
+        // screen; click selects. Dark is selected when
+        // the page opens (GS1). Standard's preview is
+        // the live band when the stock screen is the
+        // active one; before any capture exists the card
+        // says so rather than faking a picture. Custom
+        // keeps its live composition preview below once
+        // an image is chosen.
+        let gs_card = |label: &'static str,
+                       preview: Option<iced::widget::image::Handle>,
+                       selected: bool,
+                       msg: Message| {
+            let face: Element<'_, Message> = match preview {
+                Some(handle) => iced::widget::image(handle)
+                    .width(Length::Fixed(200.0))
+                    .into(),
+                None => container(
+                    text("No capture yet").size(12).color(theme::text_dim()),
+                )
+                .width(Length::Fixed(200.0))
+                .height(Length::Fixed(63.0))
+                .center_x(200.0)
+                .center_y(63.0)
+                .style(|_| container::Style {
+                    background: Some(iced::Background::Color(theme::panel())),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..iced::Border::default()
+                    },
+                    ..container::Style::default()
+                })
+                .into(),
+            };
+            button(column![face, text(label).size(13)].spacing(5))
+                .padding(7)
+                .style(move |_theme, _status| button::Style {
+                    background: Some(iced::Background::Color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::panel()
+                    })),
+                    text_color: if selected {
+                        theme::text()
+                    } else {
+                        theme::text_dim()
+                    },
+                    border: iced::Border {
+                        radius: 8.0.into(),
+                        ..iced::Border::default()
+                    },
+                    ..button::Style::default()
+                })
+                .on_press(msg)
+        };
+        let standard_preview =
+            if self.gs_identity == Some(ActiveIdentity::Stock) {
+                self.gs_live_band.clone()
+            } else {
+                None
+            };
         choose = choose.push(
             row![
-                button(text("FS25 Standard"))
-                    .style(theme::nav_pill(
-                        self.gs_choice == GsChoice::Standard,
-                    ))
-                    .on_press(Message::GameScreensStandardSelected),
-                button(text("Farmer Jay Daylight"))
-                    .style(theme::nav_pill(
-                        self.gs_choice == GsChoice::Preset(GsPreset::Daylight),
-                    ))
-                    .on_press(Message::GameScreensPresetSelected(
-                        GsPreset::Daylight,
+                gs_card(
+                    "FS25 Standard",
+                    standard_preview,
+                    self.gs_choice == GsChoice::Standard,
+                    Message::GameScreensStandardSelected,
+                ),
+                gs_card(
+                    "Farmer Jay Daylight",
+                    Some(iced::widget::image::Handle::from_bytes(
+                        DAYLIGHT_MASTER.to_vec(),
                     )),
-                button(text("Farmer Jay Dark"))
-                    .style(theme::nav_pill(
-                        self.gs_choice == GsChoice::Preset(GsPreset::Dark),
-                    ))
-                    .on_press(Message::GameScreensPresetSelected(
-                        GsPreset::Dark,
+                    self.gs_choice == GsChoice::Preset(GsPreset::Daylight),
+                    Message::GameScreensPresetSelected(GsPreset::Daylight),
+                ),
+                gs_card(
+                    "Farmer Jay Dark",
+                    Some(iced::widget::image::Handle::from_bytes(
+                        DARK_MASTER.to_vec(),
                     )),
-                button(text("Custom image…"))
-                    .style(theme::nav_pill(self.gs_choice == GsChoice::Custom))
-                    .on_press(Message::GameScreensPickCustom),
+                    self.gs_choice == GsChoice::Preset(GsPreset::Dark),
+                    Message::GameScreensPresetSelected(GsPreset::Dark),
+                ),
+                gs_card(
+                    "Custom image…",
+                    self.gs_pending_band.clone(),
+                    self.gs_choice == GsChoice::Custom,
+                    Message::GameScreensPickCustom,
+                ),
             ]
             .spacing(8),
         );
@@ -9504,9 +9717,9 @@ impl App {
                                                 cap.handle.clone(),
                                             )
                                             .width(Length::Fixed(
-                                                22.0 * cap.units.min(3.0),
+                                                30.0 * cap.units.min(3.0),
                                             ))
-                                            .height(Length::Fixed(22.0))
+                                            .height(Length::Fixed(30.0))
                                             .content_fit(iced::ContentFit::Fill),
                                         );
                                     }
@@ -9636,7 +9849,7 @@ impl App {
         let all = self.mod_manager.get_mods();
         let count_cat = |name: &str| {
             all.iter()
-                .filter(|m| m.categories.iter().any(|c| c == name))
+                .filter(|m| m.categories.first().map_or(false, |c| c == name))
                 .count()
         };
         // The sidebar's menu wears the palette now (John,
@@ -9667,8 +9880,7 @@ impl App {
                 // (John, 2026-10-21) — supersedes the 2026-
                 // 10-18 all-grey ruling: in the palette the
                 // accent is quiet enough to mark the page
-                // without shouting, and Rescan (above) is
-                // told apart by wearing the warning red.
+                // without shouting.
                 .style(theme::nav_pill(self.current_tab == tab))
                 .on_press(Message::TabSelected(tab))
         };
@@ -9702,10 +9914,6 @@ impl App {
             // navigation — Mods was working overtime doing
             // Browse's job, so it holds the job officially
             // now, from its place under LIBRARY.
-            button(centered_label(text("Rescan").size(14)))
-                .width(Length::Fill)
-                .style(theme::danger_pill())
-                .on_press(Message::Scan),
             nav(
                 format!(
                     "Conflicts ({})",
@@ -9764,15 +9972,11 @@ impl App {
             // copyright footer pinned at the bottom.
             text(format!("Disk usage: {}", format_size(total_size))).size(12),
             Space::with_height(Length::Fill),
-            text("V1.6.9  © 2026 Farmer Jay.")
+            text(format!("V{}  © 2026 Farmer Jay.", env!("CARGO_PKG_VERSION")))
                 .size(11)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
             text("By Farmer Jay / Albert Einstein")
-                .size(12)
-                .width(Length::Fill)
-                .align_x(iced::Alignment::Center),
-            text("Farmer Jay's Muse AI Agent.")
                 .size(12)
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center),
@@ -10087,9 +10291,6 @@ impl App {
         // clear glass and dark art down there, so the pale
         // counts read cleanly with no plate behind them.
         let readout = column![
-            text(format!("Playground v{}", env!("CARGO_PKG_VERSION")))
-                .size(15)
-                .color(theme::text_dim()),
             progress_bar(0.0..=1.0, value)
                 .width(260)
                 .height(14)
@@ -10101,7 +10302,7 @@ impl App {
         let overlay = column![
             Space::with_height(Length::Fill),
             readout,
-            Space::with_height(18),
+            Space::with_height(14),
         ]
         .width(Length::Fill)
         .height(Length::Fill)
@@ -10311,11 +10512,9 @@ impl App {
                     a: self.status_alpha(),
                     ..theme::text()
                 }),
-            Space::with_width(Length::Fill),
-            text(format!("Favorites: {}", self.mod_manager.favorites_count())).size(13),
         ];
 
-        let window_bg = iced::Color::from_rgb(0.125, 0.133, 0.145);
+        let window_bg = theme::base();
         let base = column![
             Space::with_height(top_hole),
             content,

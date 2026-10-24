@@ -34,7 +34,12 @@ pub const UNCATEGORIZED: &str = "Uncategorized";
 /// category is the home).
 pub const DLC_CATEGORY: &str = "DLC's";
 
-/// The categories for the mod at `path`, sorted and deduplicated.
+/// The categories for the mod at `path`, in the order the mod
+/// itself declares them (store items in modDesc order),
+/// deduplicated. The FIRST entry is the mod's category —
+/// the only one the card, the Show: filter, and the
+/// Library Layout use (owner ruling, 2026-10-23: "only
+/// the first category").
 pub fn detect_categories(path: &Path, info: Option<&ModDescInfo>) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let Some(info) = info else {
@@ -56,8 +61,12 @@ pub fn detect_categories(path: &Path, info: Option<&ModDescInfo>) -> Vec<String>
         }
     }
 
-    found.sort();
-    found.dedup();
+    // Declaration order is the record (owner ruling,
+    // 2026-10-23): the first-listed category is THE
+    // category, so the list is deduplicated in place,
+    // never sorted.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|c| seen.insert(c.clone()));
     if found.is_empty() {
         if info.store_items.is_empty() && !info.has_map {
             vec![SCRIPTS.to_string()]
