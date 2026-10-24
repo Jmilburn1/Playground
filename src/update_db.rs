@@ -157,6 +157,14 @@ fn now_secs() -> u64 {
 /// so the downgrade block is arithmetic, not vigilance.
 /// Installed NEWER than the source is `ahead_blocked`:
 /// such a row must never be offered as an update.
+/// True when the row's recorded latest beats the
+/// version actually installed — the Other Links page's
+/// listing rule for sources whose pages the fill can
+/// still read (KingMods, owner 2026-10-24).
+pub fn update_waiting(row: &UpdateRow, installed: &str) -> bool {
+    status_of(installed, row.latest_version.as_deref()) == "update_available"
+}
+
 pub fn status_of(installed: &str, latest: Option<&str>) -> &'static str {
     match latest {
         None => "unknown",
@@ -1128,5 +1136,27 @@ mod tests {
             "fills land under the new name only"
         );
     }
-}
 
+    #[test]
+    fn update_waiting_needs_a_newer_latest() {
+        let mut row = UpdateRow {
+            file_id: None,
+            file_name: "FS25_X.zip".to_string(),
+            stem: "fs25_x".to_string(),
+            installed_version: "1.0.0.0".to_string(),
+            installed_size: 0,
+            locations: vec![],
+            source_kind: "kingmods".to_string(),
+            source_ref: Some("https://www.kingmods.net/en/fs25/mods/x".to_string()),
+            latest_version: Some("1.1.0.0".to_string()),
+            prev_latest_version: None,
+            download_url: None,
+            checked_at: 0,
+        };
+        assert!(update_waiting(&row, "1.0.0.0"));
+        assert!(!update_waiting(&row, "1.1.0.0"));
+        assert!(!update_waiting(&row, "1.2.0.0"));
+        row.latest_version = None;
+        assert!(!update_waiting(&row, "1.0.0.0"));
+    }
+}

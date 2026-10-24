@@ -38,6 +38,32 @@ pub enum SettingsTab {
     About,
 }
 
+/// The Downloads page's own tabs (owner, 2026-10-24):
+/// the session's download jobs, and Other Links — the
+/// manual sources (KingMods, itch.io) whose mods
+/// Playground lists with page links but never downloads
+/// itself. Modeled on SettingsTab above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadsTab {
+    Jobs,
+    OtherLinks,
+}
+
+/// One row of the Other Links page: a library mod whose
+/// home is a manual source, the versions the records
+/// know, and the page link the user clicks through to.
+/// Built fresh by the view from the update database and
+/// the catalog-other store; carries no behaviour.
+#[derive(Debug, Clone)]
+pub struct OtherLinkRow {
+    pub mod_id: String,
+    pub name: String,
+    pub file_name: String,
+    pub installed_version: String,
+    pub latest_version: Option<String>,
+    pub url: String,
+}
+
 /// Where one tracked mod download stands (owner, 2026-10-22:
 /// the Downloads section — "shows which mods are being
 /// downloaded"). The registry walks each job Queued ->
@@ -774,6 +800,9 @@ pub enum Message {
     /// Settings page (Round 2): switch the page's tab.
     /// Every tab stages into the same save.
     SettingsTabSelected(SettingsTab),
+    DownloadsTabSelected(DownloadsTab),
+    ImportItchFile(String),
+    ItchFilePicked(String, Option<PathBuf>),
     /// Settings page (Round 2): collapse or expand one of
     /// the page's boxes, by its stable id.
     SettingsToggleSection(String),
@@ -911,9 +940,6 @@ pub enum Message {
     /// Game Screens: restore one listed backup over the
     /// live files (the live files are captured first).
     GameScreensRestoreBackup(PathBuf),
-    /// KingMods manual path: open the mod's KingMods page
-    /// in the browser.
-    OpenKingModsPage(String),
     /// KingMods manual path: pick the file the user
     /// downloaded by hand for this mod's update.
     ImportKingModsFile(String),

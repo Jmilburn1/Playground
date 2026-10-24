@@ -21,10 +21,12 @@ use crate::ui::theme;
 use crate::update_db::{self, UpdateRow};
 use crate::ui::components::{
     format_size, mod_card, BrowseView, DownloadEvent, DownloadHistoryEntry,
-    DownloadJob, DownloadJobState, DownloadRegistry, DropdownTick, FolderTarget,
+    DownloadJob, DownloadJobState, DownloadRegistry, DownloadsTab, DropdownTick,
+    FolderTarget,
     LaunchSetting, LayoutEvent, LayoutRunOutcome, LoadEvent, LoadOutcome,
     LoadPhase, LogKind, LogLine, LogOutcome, Message, ScanOutcome,
-    SettingsTab, SourceList, Tab, UpdateDbPresentation, UpdateJudgement,
+    OtherLinkRow, SettingsTab, SourceList, Tab, UpdateDbPresentation,
+    UpdateJudgement,
 };
 use futures::SinkExt as _;
 use iced::widget::image::Handle as ImageHandle;
@@ -940,6 +942,9 @@ pub struct App {
     /// progress line reads the same job state. Session-only
     /// by design: the registry starts empty every launch.
     downloads: DownloadRegistry,
+    /// Which of the Downloads page's tabs is showing
+    /// (Jobs / Other Links, owner 2026-10-24).
+    downloads_tab: DownloadsTab,
     /// Start payloads for registered jobs that have not
     /// begun (queued, or the one about to start), by job id.
     pending_downloads: HashMap<u64, PendingDownload>,
@@ -1157,6 +1162,7 @@ impl App {
             layout_outcome: None,
             layout_error: None,
             downloads,
+            downloads_tab: DownloadsTab::Jobs,
             pending_downloads: HashMap::new(),
             app_update: None,
             app_update_installing: false,
@@ -1231,6 +1237,22 @@ impl App {
                 continue; // a live result from this session stands
             }
             let row = judgement.row;
+            if row.source_kind == "kingmods" {
+                // KingMods is a manual source (owner,
+                // 2026-10-24): its rows never become an
+                // install offer, and no download from
+                // KingMods is ever attempted. The fill
+                // still reads its pages, so the Downloads
+                // > Other Links page can list the mods
+                // with an update waiting, each with its
+                // page link to click through to. (itch.io
+                // rows need no such guard: the fill
+                // records no download URL for them, so
+                // they never form an offer either.)
+                self.update_status.remove(&id);
+                self.db_applied.insert(id.clone());
+                continue;
+            }
             match update_db::status_of(&version, row.latest_version.as_deref()) {
                 "update_available" => {
                     if let (Some(latest), Some(url)) =
@@ -3479,20 +3501,6 @@ impl App {
                 }
                 self.gs_reload();
             }
-            Message::OpenKingModsPage(id) => {
-                match self.kingmods_page_url(&id) {
-                    Some(url) => {
-                        if let Err(e) = open_url(&url) {
-                            self.status =
-                                format!("Could not open the KingMods page: {}", e);
-                        }
-                    }
-                    None => {
-                        self.status =
-                            "No KingMods page is recorded for this mod.".to_string();
-                    }
-                }
-            }
             Message::ImportKingModsFile(id) => {
                 return Task::perform(
                     async move {
@@ -3510,62 +3518,11 @@ impl App {
                 );
             }
             Message::KingModsFilePicked(id, picked) => {
-                let Some(picked) = picked else {
-                    return Task::none();
-                };
-                let Some(m) = self.mod_manager.get_mod(&id).cloned() else {
-                    return Task::none();
-                };
-                // Stage a copy under the funnel's own
-                // download name, beside the mod — the
-                // completion path deletes its input file
-                // when it lands, and that file must be our
-                // copy, never the user's download. (A
-                // download whose name differs from the
-                // mod's own is carried in under this staging
-                // name, so the funnel's checks meet the file
-                // they expect.)
-                let stem = ModManager::mod_stem(&m.path);
-                let staged = m
-                    .path
-                    .parent()
-                    .map(|p| p.join(format!(".playground-dl-{}.zip", stem)))
-                    .unwrap_or_else(|| PathBuf::from(".playground-dl.zip"));
-                if let Err(e) = std::fs::copy(&picked, &staged) {
-                    self.status = format!(
-                        "Could not stage {} for installing: {}",
-                        picked.display(),
-                        e
-                    );
-                    return Task::none();
-                }
-                // The job is the history entry: registered
-                // and started like any install's, with the
-                // manual import named in its source.
-                let version = match self.update_status.get(&id) {
-                    Some(UpdateState::Available(info)) => info.version.clone(),
-                    _ => self
-                        .db_rows
-                        .get(&stem)
-                        .and_then(|r| r.latest_version.clone())
-                        .unwrap_or_default(),
-                };
-                let job = self.downloads.register(
-                    id.clone(),
-                    m.name.clone(),
-                    m.file_name(),
-                    "KingMods (manual import)".to_string(),
-                    version,
+                return self.stage_manual_import(
+                    id,
+                    picked,
+                    "KingMods (manual import)",
                 );
-                self.downloads.start(job);
-                self.status = format!(
-                    "Installing the file you picked for {}…",
-                    m.name
-                );
-                // The staged copy rides the exact message a
-                // finished download lands with — the same
-                // funnel, the same bookkeeping, no fork.
-                return Task::done(Message::UpdateInstalled(id, Ok(staged)));
             }
             Message::DownloadEvent(event) => match event {
                 DownloadEvent::Progress {
@@ -4175,6 +4132,32 @@ impl App {
                         }
                     }
                 }
+            }
+            Message::DownloadsTabSelected(tab) => {
+                self.downloads_tab = tab;
+            }
+            Message::ImportItchFile(id) => {
+                return Task::perform(
+                    async move {
+                        let picked = rfd::AsyncFileDialog::new()
+                            .set_title(
+                                "Choose the file you downloaded from itch.io",
+                            )
+                            .add_filter("Mod archive", &["zip"])
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_path_buf());
+                        (id, picked)
+                    },
+                    |(id, picked)| Message::ItchFilePicked(id, picked),
+                );
+            }
+            Message::ItchFilePicked(id, picked) => {
+                return self.stage_manual_import(
+                    id,
+                    picked,
+                    "itch.io (manual import)",
+                );
             }
             Message::SettingsTabSelected(tab) => {
                 self.settings_tab = tab;
@@ -5223,6 +5206,12 @@ impl App {
                     .size(12),
                 );
                 let note = match update_db::status_of(&m.version, Some(latest.as_str())) {
+                    "update_available" if row.source_kind == "kingmods" => {
+                        "Update available — KingMods is manual: Downloads > Other Links lists it with its page link."
+                    }
+                    "update_available" if row.source_kind == "itch" => {
+                        "Update available — itch.io is manual: Downloads > Other Links lists it with its page link."
+                    }
                     "update_available" => {
                         "Update available (from the database)."
                     }
@@ -5345,9 +5334,6 @@ impl App {
                         .on_press(Message::InstallUpdate(m.id.clone())),
                 );
             }
-            if let Some(manual) = self.kingmods_manual_buttons(m) {
-                col = col.push(manual);
-            }
             if m.mod_type != crate::mod_manager::types::ModType::Zip {
                 col = col.push(
                     text("Update installs work on .zip mods; this is a folder mod.").size(12),
@@ -5374,9 +5360,6 @@ impl App {
                     .style(theme::nav_pill(true))
                     .on_press(Message::InstallUpdate(m.id.clone())),
             );
-            if let Some(manual) = self.kingmods_manual_buttons(m) {
-                col = col.push(manual);
-            }
             if m.mod_type != crate::mod_manager::types::ModType::Zip {
                 col = col.push(
                     text("Update installs work on .zip mods; this is a folder mod.").size(12),
@@ -7125,17 +7108,40 @@ impl App {
         col.into()
     }
 
-    /// Downloads: this session's mod downloads as tracked
-    /// jobs (owner, 2026-10-22 — "shows which mods are being
-    /// downloaded"). The Log Reader's scaffold: a title row
-    /// with the page's action pill at the right, job cards
-    /// in the suspects box's dress, the list in a scrollable
-    /// that fills the page. Live jobs (queued or working)
-    /// first with their real progress, then the finished
-    /// ones with their outcomes; a failure wears the Log
-    /// Reader's error color and keeps its reason.
+    /// Downloads: two tabs (owner, 2026-10-24) — Jobs,
+    /// this session's mod downloads as tracked jobs, and
+    /// Other Links, the manual sources' page. The tab
+    /// strip follows the Settings page's pattern.
     fn downloads_view(&self) -> Element<'_, Message> {
-        let mut header = row![text("Downloads").size(17)].spacing(8);
+        let tab_button = |tab: DownloadsTab, label: &str| {
+            button(text(label.to_string()))
+                .style(theme::nav_pill(self.downloads_tab == tab))
+                .on_press(Message::DownloadsTabSelected(tab))
+        };
+        let tabs = row![
+            tab_button(DownloadsTab::Jobs, "Downloads"),
+            tab_button(DownloadsTab::OtherLinks, "Other Links"),
+        ]
+        .spacing(6);
+        let content: Element<'_, Message> = match self.downloads_tab {
+            DownloadsTab::Jobs => self.downloads_jobs(),
+            DownloadsTab::OtherLinks => self.other_links_view(),
+        };
+        column![text("Downloads").size(20), tabs, content]
+            .spacing(8)
+            .into()
+    }
+
+    /// The Jobs tab: every mod download this session as a
+    /// tracked job (owner, 2026-10-22 — "shows which mods
+    /// are being downloaded"). Job cards in the suspects
+    /// box's dress, the list in a scrollable that fills
+    /// the page. Live jobs (queued or working) first with
+    /// their real progress, then the finished ones with
+    /// their outcomes; a failure wears the Log Reader's
+    /// error color and keeps its reason.
+    fn downloads_jobs(&self) -> Element<'_, Message> {
+        let mut header = row![].spacing(8);
         if self.downloads.has_finished() {
             header = header
                 .push(Space::with_width(Length::Fill))
@@ -7262,6 +7268,190 @@ impl App {
                 .height(Length::Fill),
         );
         col.into()
+    }
+
+    /// The Other Links rows (owner, 2026-10-24), in two
+    /// separated sections. KingMods: the mods with an
+    /// update waiting — the fill still reads KingMods
+    /// pages, so the judgement is real — judged against
+    /// the version actually installed. itch.io: EVERY
+    /// library mod whose home is itch — its page reads
+    /// are failing (owner, 2026-10-24), so no update
+    /// judgement exists to filter by; the section is
+    /// the click-through checklist itself. Rows come
+    /// from the update database first, then the
+    /// catalog-other store for mods a fill hasn't
+    /// recorded yet (itch only: a KingMods row with no
+    /// judged latest has no update waiting by rule).
+    fn other_link_rows(&self) -> (Vec<OtherLinkRow>, Vec<OtherLinkRow>) {
+        let mods = self.mod_manager.get_mods();
+        let mut by_stem: HashMap<String, &Mod> = HashMap::new();
+        for m in mods {
+            let stem = ModManager::mod_stem(&m.path);
+            let replace = match by_stem.get(&stem) {
+                None => true,
+                Some(cur) => {
+                    cur.state != ModState::Active && m.state == ModState::Active
+                }
+            };
+            if replace {
+                by_stem.insert(stem, m);
+            }
+        }
+        let mut kingmods: Vec<OtherLinkRow> = Vec::new();
+        let mut itch: Vec<OtherLinkRow> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (stem, row) in &self.db_rows {
+            let Some(m) = by_stem.get(stem) else {
+                continue;
+            };
+            let Some(url) = row.source_ref.clone() else {
+                continue;
+            };
+            match row.source_kind.as_str() {
+                "kingmods" => {
+                    seen.insert(stem.clone());
+                    if update_db::update_waiting(row, &m.version) {
+                        kingmods.push(OtherLinkRow {
+                            mod_id: m.id.clone(),
+                            name: m.name.clone(),
+                            file_name: row.file_name.clone(),
+                            installed_version: m.version.clone(),
+                            latest_version: row.latest_version.clone(),
+                            url,
+                        });
+                    }
+                }
+                "itch" => {
+                    seen.insert(stem.clone());
+                    itch.push(OtherLinkRow {
+                        mod_id: m.id.clone(),
+                        name: m.name.clone(),
+                        file_name: row.file_name.clone(),
+                        installed_version: m.version.clone(),
+                        latest_version: row.latest_version.clone(),
+                        url,
+                    });
+                }
+                _ => {}
+            }
+        }
+        for (stem, m) in &by_stem {
+            if seen.contains(stem) {
+                continue;
+            }
+            if let Some(other) = self.mod_manager.other_row(stem) {
+                if other.source_kind == "itch" {
+                    itch.push(OtherLinkRow {
+                        mod_id: m.id.clone(),
+                        name: m.name.clone(),
+                        file_name: other.file_name.clone(),
+                        installed_version: m.version.clone(),
+                        latest_version: None,
+                        url: other.source_ref.clone(),
+                    });
+                }
+            }
+        }
+        let by_name = |a: &OtherLinkRow, b: &OtherLinkRow| {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        };
+        kingmods.sort_by(by_name);
+        itch.sort_by(by_name);
+        (kingmods, itch)
+    }
+
+    /// The Other Links tab (owner, 2026-10-24): the
+    /// manual sources, KingMods and itch.io in their own
+    /// separated sections. Each row prints the mod's
+    /// actual page link as text; clicking it opens the
+    /// page in the browser. Playground never downloads
+    /// from either source — the file the user grabs
+    /// there comes back through the row's Import, the
+    /// same funnel the details panel's KingMods path
+    /// has always used. ModHub and GitHub are untouched:
+    /// they still check and offer installs as before.
+    fn other_links_view(&self) -> Element<'_, Message> {
+        let (kingmods, itch) = self.other_link_rows();
+        let card = |r: &OtherLinkRow, import: Message| -> Element<'_, Message> {
+            let version_line = match &r.latest_version {
+                Some(latest) => format!(
+                    "{} · installed v{} → latest v{}",
+                    r.file_name, r.installed_version, latest
+                ),
+                None => format!(
+                    "{} · installed v{}",
+                    r.file_name, r.installed_version
+                ),
+            };
+            let inner = column![
+                text(r.name.clone()).size(14),
+                text(version_line).size(12),
+                row![
+                    button(text(r.url.clone()).size(12))
+                        .style(theme::nav_pill(false))
+                        .on_press(Message::OpenUrl(r.url.clone())),
+                    button(text("Import downloaded file"))
+                        .style(theme::nav_pill(true))
+                        .on_press(import),
+                ]
+                .spacing(6),
+            ]
+            .spacing(3);
+            container(inner)
+                .padding(8)
+                .width(Length::Fill)
+                .style(|_| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgb(
+                        0.13, 0.14, 0.16,
+                    ))),
+                    border: iced::Border {
+                        color: iced::Color::from_rgb(0.30, 0.31, 0.34),
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..container::Style::default()
+                })
+                .into()
+        };
+        let mut list = column![].spacing(8);
+        list = list.push(
+            text("KingMods and itch.io are manual sources: Playground never downloads from them. Click a link to open the mod's page, download the file there, then Import it on its row here.")
+                .size(12),
+        );
+        list = list.push(
+            text(format!(
+                "KingMods — {} with an update waiting",
+                kingmods.len()
+            ))
+            .size(15),
+        );
+        if kingmods.is_empty() {
+            list = list.push(text("No KingMods updates are waiting.").size(12));
+        }
+        for r in &kingmods {
+            list = list.push(card(
+                r,
+                Message::ImportKingModsFile(r.mod_id.clone()),
+            ));
+        }
+        list = list.push(
+            text(format!("itch.io — {} linked mods", itch.len())).size(15),
+        );
+        list = list.push(
+            text("itch.io page reads are failing, so every itch.io mod is listed — click through to check for a newer version.")
+                .size(12),
+        );
+        if itch.is_empty() {
+            list = list.push(text("No itch.io mods are linked.").size(12));
+        }
+        for r in &itch {
+            list = list.push(card(r, Message::ImportItchFile(r.mod_id.clone())));
+        }
+        page_scroll(list)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// Settings (Round 2, owner 2026-10-22): the tabbed
@@ -8842,58 +9032,81 @@ impl App {
             .collect()
     }
 
-    /// A KingMods-sourced mod's page URL: the update
-    /// offer's repo (for a KingMods offer the repo IS the
-    /// mod's page), falling back to the database row's
-    /// recorded source reference.
-    fn kingmods_page_url(&self, id: &str) -> Option<String> {
-        if let Some(UpdateState::Available(info)) = self.update_status.get(id) {
-            if info.repo.starts_with("http") {
-                return Some(info.repo.clone());
+    /// The manual-import funnel (owner, 2026-10-22 for
+    /// KingMods; shared with the Other Links page's
+    /// itch.io rows, 2026-10-24): stage a copy of the
+    /// file the user downloaded by hand under the
+    /// funnel's own download name, beside the mod — the
+    /// completion path deletes its input file when it
+    /// lands, and that file must be our copy, never the
+    /// user's download. The job is registered and
+    /// started like any install's, with the manual
+    /// source named in it; the staged copy then rides
+    /// the exact message a finished download lands
+    /// with — the same funnel, the same bookkeeping,
+    /// no fork.
+    fn stage_manual_import(
+        &mut self,
+        id: String,
+        picked: Option<PathBuf>,
+        source_label: &str,
+    ) -> Task<Message> {
+            let Some(picked) = picked else {
+                return Task::none();
+            };
+            let Some(m) = self.mod_manager.get_mod(&id).cloned() else {
+                return Task::none();
+            };
+            // Stage a copy under the funnel's own
+            // download name, beside the mod — the
+            // completion path deletes its input file
+            // when it lands, and that file must be our
+            // copy, never the user's download. (A
+            // download whose name differs from the
+            // mod's own is carried in under this staging
+            // name, so the funnel's checks meet the file
+            // they expect.)
+            let stem = ModManager::mod_stem(&m.path);
+            let staged = m
+                .path
+                .parent()
+                .map(|p| p.join(format!(".playground-dl-{}.zip", stem)))
+                .unwrap_or_else(|| PathBuf::from(".playground-dl.zip"));
+            if let Err(e) = std::fs::copy(&picked, &staged) {
+                self.status = format!(
+                    "Could not stage {} for installing: {}",
+                    picked.display(),
+                    e
+                );
+                return Task::none();
             }
-        }
-        let m = self.mod_manager.get_mod(id)?;
-        let stem = ModManager::mod_stem(&m.path);
-        let row = self.db_rows.get(&stem)?;
-        if row.source_kind == "kingmods" {
-            row.source_ref
-                .clone()
-                .filter(|u| u.starts_with("http"))
-        } else {
-            None
-        }
-    }
-
-    /// The KingMods manual path's two buttons, for the
-    /// details panel: shown only for a KingMods-sourced
-    /// mod with an update on offer (or a failed attempt
-    /// behind it). Every other source's rows are untouched.
-    fn kingmods_manual_buttons(&self, m: &Mod) -> Option<Element<'_, Message>> {
-        let stem = ModManager::mod_stem(&m.path);
-        let row = self.db_rows.get(&stem)?;
-        if row.source_kind != "kingmods" {
-            return None;
-        }
-        match self.update_status.get(&m.id) {
-            Some(UpdateState::Available(_)) | Some(UpdateState::Failed(_)) => {}
-            _ => return None,
-        }
-        Some(
-            column![
-                text("KingMods' own download is refused by the site's checks — the manual path:")
-                    .size(12),
-                button(centered_label(text("Open KingMods page")))
-                    .width(Length::Fill)
-                    .style(theme::nav_pill(true))
-                    .on_press(Message::OpenKingModsPage(m.id.clone())),
-                button(centered_label(text("Import downloaded file...")))
-                    .width(Length::Fill)
-                    .style(theme::nav_pill(true))
-                    .on_press(Message::ImportKingModsFile(m.id.clone())),
-            ]
-            .spacing(6)
-            .into(),
-        )
+            // The job is the history entry: registered
+            // and started like any install's, with the
+            // manual import named in its source.
+            let version = match self.update_status.get(&id) {
+                Some(UpdateState::Available(info)) => info.version.clone(),
+                _ => self
+                    .db_rows
+                    .get(&stem)
+                    .and_then(|r| r.latest_version.clone())
+                    .unwrap_or_default(),
+            };
+            let job = self.downloads.register(
+                id.clone(),
+                m.name.clone(),
+                m.file_name(),
+                source_label.to_string(),
+                version,
+            );
+            self.downloads.start(job);
+            self.status = format!(
+                "Installing the file you picked for {}…",
+                m.name
+            );
+            // The staged copy rides the exact message a
+            // finished download lands with — the same
+            // funnel, the same bookkeeping, no fork.
+            Task::done(Message::UpdateInstalled(id, Ok(staged)))
     }
 
     /// The Keybindings page's Purge box: the two-step
