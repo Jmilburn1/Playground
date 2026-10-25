@@ -682,15 +682,6 @@ pub struct App {
     /// opened — their settle offsets decay from these.
     details_opened_at: std::time::Instant,
     menu_opened_at: std::time::Instant,
-    /// Smooth scrolling (feel pass part 2): the grid's
-    /// eased offset. grid_offset stays the target the
-    /// scrollable reports; grid_shown is what renders,
-    /// gliding toward the target while the clock issues
-    /// the matching scroll_to. grid_self_scroll marks
-    /// the echo of our own scroll_to so it is never
-    /// mistaken for the user's own scroll.
-    grid_shown: f32,
-    grid_self_scroll: bool,
     conflicts: Vec<Conflict>,
     icons: HashMap<String, ImageHandle>,
     active_dir_input: String,
@@ -1035,8 +1026,6 @@ impl App {
             status_changed_at: std::time::Instant::now(),
             details_opened_at: std::time::Instant::now(),
             menu_opened_at: std::time::Instant::now(),
-            grid_shown: 0.0,
-            grid_self_scroll: false,
             conflicts: Vec::new(),
             icons: HashMap::new(),
             active_dir_input,
@@ -3779,8 +3768,6 @@ impl App {
                 self.show_menu_open = false;
                 self.search_query = query;
                 self.grid_offset = 0.0;
-                self.grid_shown = 0.0;
-                self.grid_self_scroll = false;
                 return iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("grid"),
                     iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
@@ -3792,8 +3779,6 @@ impl App {
                 self.view_filter = view;
                 self.favorites_only = false;
                 self.grid_offset = 0.0;
-                self.grid_shown = 0.0;
-                self.grid_self_scroll = false;
                 return iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("grid"),
                     iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
@@ -3849,8 +3834,6 @@ impl App {
                 self.show_menu_open = false;
                 self.view_filter = view;
                 self.grid_offset = 0.0;
-                self.grid_shown = 0.0;
-                self.grid_self_scroll = false;
                 return iced::widget::scrollable::scroll_to(
                     iced::widget::scrollable::Id::new("grid"),
                     iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
@@ -4035,34 +4018,12 @@ impl App {
                 }
                 self.eased_bars
                     .retain(|k, _| k == "layout" || live_keys.contains(k));
-                // Smooth scrolling (part 2): the rendered
-                // offset glides a step toward the target
-                // the scrollable reported, and the
-                // scrollable is moved to match — its echo
-                // comes back flagged, never a new target.
-                let mut grid_scroll_task = None;
-                let grid_diff = self.grid_offset - self.grid_shown;
-                if grid_diff.abs() > 0.5 {
-                    self.grid_shown += grid_diff * 0.35;
-                    if (self.grid_offset - self.grid_shown).abs() <= 0.5 {
-                        self.grid_shown = self.grid_offset;
-                    }
-                    self.grid_self_scroll = true;
-                    grid_scroll_task = Some(iced::widget::scrollable::scroll_to(
-                        iced::widget::scrollable::Id::new("grid"),
-                        iced::widget::scrollable::AbsoluteOffset {
-                            x: 0.0,
-                            y: self.grid_shown,
-                        },
-                    ));
-                }
                 // The clock lives while anything travels
                 // or a job runs (the pulse needs it too).
                 if traveling
                     || !self.switch_anims.is_empty()
                     || self.layout_running.is_some()
                     || self.downloads.live_count() > 0
-                    || grid_scroll_task.is_some()
                     || self.status_changed_at.elapsed()
                         < std::time::Duration::from_millis(220)
                     || self.details_opened_at.elapsed()
@@ -4071,9 +4032,6 @@ impl App {
                         < std::time::Duration::from_millis(160)
                 {
                     self.anim_until = now + ANIM_TAIL;
-                }
-                if let Some(task) = grid_scroll_task {
-                    return task;
                 }
             }
             Message::CardHover(id) => {
@@ -4618,46 +4576,15 @@ impl App {
                 }
             }
             Message::GridScrolled(viewport) => {
-                let y = viewport.absolute_offset().y;
+                // Plain tracking only (owner, 2026-10-25):
+                // the feel pass's smooth-scroll easing is
+                // removed — the grid scrolls exactly where
+                // the wheel and the scrollbar put it, the
+                // way it did before. The offset and the
+                // viewport height still feed the windowed
+                // grid build in browse_view.
+                self.grid_offset = viewport.absolute_offset().y;
                 self.grid_view_h = viewport.bounds().height;
-                if self.grid_self_scroll {
-                    // The echo of the clock's own scroll_to:
-                    // it confirms where the eased rendering
-                    // already is, and must not move the
-                    // target (smooth scrolling, part 2).
-                    self.grid_self_scroll = false;
-                    self.grid_shown = y;
-                } else {
-                    self.grid_offset = y;
-                    let diff = self.grid_offset - self.grid_shown;
-                    // A jump of most of the viewport — a
-                    // scrollbar haul, a page leap — snaps;
-                    // easing it would fight the hand on the
-                    // bar. Ordinary wheel travel glides: the
-                    // first eased step is issued right here,
-                    // before the next frame can paint the
-                    // un-eased position the wheel reported.
-                    let snap = (self.grid_view_h * 0.75).max(CARD_H + GRID_SPACING);
-                    if diff.abs() > snap {
-                        self.grid_shown = self.grid_offset;
-                    } else if diff.abs() > 0.5 {
-                        self.grid_shown += diff * 0.35;
-                        if (self.grid_offset - self.grid_shown).abs() <= 0.5 {
-                            self.grid_shown = self.grid_offset;
-                        }
-                        self.grid_self_scroll = true;
-                        self.kick_anim();
-                        return iced::widget::scrollable::scroll_to(
-                            iced::widget::scrollable::Id::new("grid"),
-                            iced::widget::scrollable::AbsoluteOffset {
-                                x: 0.0,
-                                y: self.grid_shown,
-                            },
-                        );
-                    } else {
-                        self.grid_shown = self.grid_offset;
-                    }
-                }
             }
         }
 
@@ -4909,12 +4836,10 @@ impl App {
                 (self.window_size.height - 216.0).max(CARD_H)
             };
             const BUFFER_ROWS: usize = 3;
-            // The window renders from the EASED offset
-            // (smooth scrolling, part 2); the scrollable
-            // itself is stepped to the same place by the
-            // animation clock, so window and scrollbar
-            // agree frame by frame.
-            let first_row = ((self.grid_shown / pitch).floor() as usize)
+            // The window renders from the offset the
+            // scrollable itself reports — no easing
+            // between the hand and the grid.
+            let first_row = ((self.grid_offset / pitch).floor() as usize)
                 .saturating_sub(BUFFER_ROWS)
                 .min(rows_total);
             let visible_rows = (view_h / pitch).ceil() as usize + 1;
@@ -10845,7 +10770,6 @@ impl App {
             || !self.switch_anims.is_empty()
             || self.status != self.status_seen
             || self.status_changed_at.elapsed() < std::time::Duration::from_millis(220)
-            || (self.grid_offset - self.grid_shown).abs() > 0.5
         {
             subs.push(iced::time::every(ANIM_TICK).map(|_| Message::AnimTick));
         }
